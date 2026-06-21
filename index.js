@@ -332,6 +332,13 @@ cron.schedule('0 0 * * *', () => {
   console.log('vendasDoDia resetado');
 }, { timezone: 'America/Sao_Paulo' });
 
+const LEMBRETE_SEMANAL = '📸 *FECHAMENTO SEMANAL – 015 PODS*\nÉ terça-feira! Hora de atualizar as fotos do estoque.\n\nPor favor, envie a foto de cada modelo em estoque e depois mande /estoque para conferir a lista.';
+
+cron.schedule('0 10 * * 2', async () => {
+  try { await sendTelegram(CHAT_GROUP_ID, LEMBRETE_SEMANAL); }
+  catch (err) { console.error('Erro no lembrete semanal:', err); }
+}, { timezone: 'America/Sao_Paulo' });
+
 const KEEPALIVE_URL = 'https://zero15pods-bot.onrender.com/ping';
 
 cron.schedule('*/10 0-2,10-23 * * *', async () => {
