@@ -26,13 +26,42 @@ async function getSheets() {
   return sheetsClient;
 }
 
+function splitMessage(text, max = 3800) {
+  if (text.length <= max) return [text];
+  const parts = [];
+  let buf = '';
+  for (const line of text.split('\n')) {
+    if ((buf + '\n' + line).length > max) {
+      parts.push(buf);
+      buf = line;
+    } else {
+      buf = buf ? buf + '\n' + line : line;
+    }
+  }
+  if (buf) parts.push(buf);
+  return parts;
+}
+
+function escapeMd(s) {
+  return (s || '').toString().replace(/([_*`\[\]])/g, '\\$1');
+}
+
 async function sendTelegram(chatId, text) {
   const fetch = (await import('node-fetch')).default;
-  await fetch(`${TELEGRAM_API}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' }),
-  });
+  for (const chunk of splitMessage(text)) {
+    const resp = await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: chunk, parse_mode: 'Markdown' }),
+    });
+    if (!resp.ok) {
+      await fetch(`${TELEGRAM_API}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text: chunk }),
+      });
+    }
+  }
 }
 
 async function readEstoque() {
@@ -128,11 +157,11 @@ async function handleEntrada(chatId, desc, qtd) {
   await sendTelegram(chatId, `✅ *Entrada registrada!*\n📦 ${p.modelo} – ${p.sabor}\n➕ Entrou: *${qtd}*\n📊 Total agora: *${novoTotal}*`);
 }
 
-function agruparPorModelo(produtos) {
+function totaisPorModelo(produtos) {
   const map = new Map();
   for (const p of produtos) {
-    if (!map.has(p.modelo)) map.set(p.modelo, []);
-    map.get(p.modelo).push(p);
+    const modelo = p.modelo || '(sem modelo)';
+    map.set(modelo, (map.get(modelo) || 0) + p.qtd);
   }
   return map;
 }
@@ -140,18 +169,17 @@ function agruparPorModelo(produtos) {
 async function handleEstoque(chatId) {
   const produtos = await readEstoque();
   if (!produtos.length) { await sendTelegram(chatId, '📦 Planilha vazia.'); return; }
-  const grupos = agruparPorModelo(produtos);
-  const linhas = ['📦 *Estoque atual*', ''];
-  for (const [modelo, itens] of grupos) {
-    const total = itens.reduce((s, i) => s + i.qtd, 0);
-    linhas.push(`*${modelo}* — total ${total}`);
-    for (const i of itens) {
-      const ico = i.qtd <= 0 ? '🔴' : i.qtd === 1 ? '🟡' : '🟢';
-      linhas.push(`  ${ico} ${i.sabor}: ${i.qtd}`);
-    }
-    linhas.push('');
+  const totais = totaisPorModelo(produtos);
+  const ordenado = [...totais.entries()].sort((a, b) => b[1] - a[1]);
+  const linhas = ['📦 *Estoque atual* (por modelo)', ''];
+  let totalGeral = 0;
+  for (const [modelo, total] of ordenado) {
+    const ico = total <= 0 ? '🔴' : total <= 5 ? '🟡' : '🟢';
+    linhas.push(`${ico} *${escapeMd(modelo)}*: ${total}`);
+    totalGeral += total;
   }
-  await sendTelegram(chatId, linhas.join('\n').trim());
+  linhas.push('', `🧮 Total geral: *${totalGeral}*`);
+  await sendTelegram(chatId, linhas.join('\n'));
 }
 
 async function handleZerados(chatId) {
