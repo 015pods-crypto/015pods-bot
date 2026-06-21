@@ -79,13 +79,18 @@ async function readEstoque() {
   })).filter(p => p.modelo || p.sabor);
 }
 
-async function updateQtd(rowIndex, qtd) {
+async function batchUpdateQtd(updates) {
+  if (!updates.length) return;
   const sheets = await getSheets();
-  await sheets.spreadsheets.values.update({
+  await sheets.spreadsheets.values.batchUpdate({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET_NAME}!C${rowIndex}`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [[qtd]] },
+    requestBody: {
+      valueInputOption: 'USER_ENTERED',
+      data: updates.map(({ rowIndex, qtd }) => ({
+        range: `${SHEET_NAME}!C${rowIndex}`,
+        values: [[qtd]],
+      })),
+    },
   });
 }
 
@@ -128,33 +133,99 @@ function findProduto(produtos, desc) {
   return best;
 }
 
-async function handleBaixa(chatId, desc, qtd) {
-  const produtos = await readEstoque();
-  const p = findProduto(produtos, desc);
-  if (!p) {
-    await sendTelegram(chatId, `❌ Produto não encontrado: "${desc}"`);
-    return;
+function parseMovimentoLine(line) {
+  const raw = line.trim();
+  if (!raw) return null;
+  const c = raw.charAt(0);
+  if (c === '-') {
+    const m = raw.match(/^-(\d+)\s+(.+)$/) || raw.match(/^-(.+)$/);
+    if (!m) return null;
+    const qtd = m[2] ? parseInt(m[1], 10) : 1;
+    const desc = m[2] ? m[2].trim() : m[1].trim();
+    if (!desc || !qtd || qtd <= 0) return { op: 'baixa', invalid: true, raw };
+    return { op: 'baixa', qtd, desc, raw };
   }
-  if (p.qtd <= 0) {
-    await sendTelegram(chatId, `⚠️ *${p.modelo} – ${p.sabor}* já está com estoque zerado.`);
-    return;
+  if (c === '+') {
+    const m = raw.match(/^\+(\d+)\s+(.+)$/);
+    if (!m) return { op: 'entrada', invalid: true, raw };
+    const qtd = parseInt(m[1], 10);
+    const desc = m[2].trim();
+    if (!desc || !qtd || qtd <= 0) return { op: 'entrada', invalid: true, raw };
+    return { op: 'entrada', qtd, desc, raw };
   }
-  const novoTotal = p.qtd - qtd;
-  await updateQtd(p.rowIndex, novoTotal);
-  const aviso = novoTotal <= 0 ? '\n🔴 _Estoque zerado!_' : novoTotal === 1 ? '\n🟡 _Estoque baixo!_' : '';
-  await sendTelegram(chatId, `✅ *Baixa registrada!*\n📦 ${p.modelo} – ${p.sabor}\n➖ Saiu: *${qtd}*\n📊 Restante: *${Math.max(novoTotal, 0)}*${aviso}`);
+  return null;
 }
 
-async function handleEntrada(chatId, desc, qtd) {
-  const produtos = await readEstoque();
-  const p = findProduto(produtos, desc);
-  if (!p) {
-    await sendTelegram(chatId, `❌ Produto não encontrado: "${desc}"`);
-    return;
+function buildResumoSingle(r) {
+  if (!r.ok) return `❌ ${r.msg}`;
+  if (r.op === 'baixa') {
+    const aviso = r.restante <= 0 ? '\n🔴 _Estoque zerado!_' : r.restante === 1 ? '\n🟡 _Estoque baixo!_' : '';
+    return `✅ *Baixa registrada!*\n📦 ${r.modelo} – ${r.sabor}\n➖ Saiu: *${r.qtd}*\n📊 Restante: *${r.restante}*${aviso}`;
   }
-  const novoTotal = p.qtd + qtd;
-  await updateQtd(p.rowIndex, novoTotal);
-  await sendTelegram(chatId, `✅ *Entrada registrada!*\n📦 ${p.modelo} – ${p.sabor}\n➕ Entrou: *${qtd}*\n📊 Total agora: *${novoTotal}*`);
+  return `✅ *Entrada registrada!*\n📦 ${r.modelo} – ${r.sabor}\n➕ Entrou: *${r.qtd}*\n📊 Total agora: *${r.restante}*`;
+}
+
+function buildResumoMulti(results) {
+  const baixas = results.filter(r => r.ok && r.op === 'baixa');
+  const entradas = results.filter(r => r.ok && r.op === 'entrada');
+  const erros = results.filter(r => !r.ok);
+  const out = [];
+  if (baixas.length) {
+    out.push('✅ *Baixas registradas:*');
+    for (const r of baixas) out.push(`📦 ${r.modelo} – ${r.sabor}: -${r.qtd} (restante: ${r.restante})`);
+  }
+  if (entradas.length) {
+    if (out.length) out.push('');
+    out.push('✅ *Entradas registradas:*');
+    for (const r of entradas) out.push(`📦 ${r.modelo} – ${r.sabor}: +${r.qtd} (total: ${r.restante})`);
+  }
+  if (erros.length) {
+    if (out.length) out.push('');
+    out.push('❌ *Não processados:*');
+    for (const r of erros) out.push(`• ${r.msg}`);
+  }
+  return out.join('\n');
+}
+
+async function handleMovimentos(chatId, lines) {
+  const parsed = lines.map(parseMovimentoLine).filter(Boolean);
+  if (!parsed.length) return;
+
+  const produtos = await readEstoque();
+  const updates = [];
+  const results = [];
+
+  for (const item of parsed) {
+    if (item.invalid) {
+      const exemplo = item.op === 'entrada' ? '+1 Ignite 5500 Grape Ice' : '-1 Ignite 5500 Grape Ice';
+      results.push({ op: item.op, ok: false, msg: `Formato inválido: \`${item.raw}\` — use \`${exemplo}\`` });
+      continue;
+    }
+    const p = findProduto(produtos, item.desc);
+    if (!p) {
+      results.push({ op: item.op, ok: false, msg: `Produto não encontrado: "${item.desc}"` });
+      continue;
+    }
+    if (item.op === 'baixa') {
+      if (p.qtd <= 0) {
+        results.push({ op: 'baixa', ok: false, msg: `${p.modelo} – ${p.sabor} já está zerado` });
+        continue;
+      }
+      const novo = p.qtd - item.qtd;
+      p.qtd = novo;
+      updates.push({ rowIndex: p.rowIndex, qtd: novo });
+      results.push({ op: 'baixa', ok: true, modelo: p.modelo, sabor: p.sabor, qtd: item.qtd, restante: Math.max(novo, 0) });
+    } else {
+      const novo = p.qtd + item.qtd;
+      p.qtd = novo;
+      updates.push({ rowIndex: p.rowIndex, qtd: novo });
+      results.push({ op: 'entrada', ok: true, modelo: p.modelo, sabor: p.sabor, qtd: item.qtd, restante: novo });
+    }
+  }
+
+  await batchUpdateQtd(updates);
+  const msg = results.length === 1 ? buildResumoSingle(results[0]) : buildResumoMulti(results);
+  await sendTelegram(chatId, msg);
 }
 
 function totaisPorModelo(produtos) {
@@ -235,26 +306,13 @@ app.post('/webhook', async (req, res) => {
     if (processedIds.size > 1000) processedIds.clear();
 
     const chatId = msg.chat.id;
-    const text = (msg.text || '').trim();
+    const text = (msg.text || msg.caption || '').trim();
     if (!text) return;
-    const cmd = text.split(' ')[0].toLowerCase().split('@')[0];
+    const cmd = text.split(/\s+/)[0].toLowerCase().split('@')[0];
 
-    if (text.charAt(0) === '-') {
-      const m = text.match(/^-(\d+)\s+(.+)$/) || text.match(/^-(.+)$/);
-      if (!m) return;
-      const qtd = m[2] ? parseInt(m[1], 10) : 1;
-      const desc = m[2] ? m[2].trim() : m[1].trim();
-      await handleBaixa(chatId, desc, qtd);
-      return;
-    }
-
-    if (text.charAt(0) === '+') {
-      const m = text.match(/^\+(\d+)\s+(.+)$/);
-      if (!m) { await sendTelegram(chatId, '❌ Use: `+1 Ignite 5500 Grape Ice`'); return; }
-      const qtd = parseInt(m[1], 10);
-      const desc = m[2].trim();
-      await handleEntrada(chatId, desc, qtd);
-      return;
+    if (text.charAt(0) === '-' || text.charAt(0) === '+') {
+      const movLines = text.split('\n').map(l => l.trim()).filter(l => l.startsWith('-') || l.startsWith('+'));
+      if (movLines.length) { await handleMovimentos(chatId, movLines); return; }
     }
 
     if (cmd === '/start' || cmd === '/ajuda') { await sendTelegram(chatId, AJUDA); return; }
