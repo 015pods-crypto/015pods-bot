@@ -298,6 +298,7 @@ const vendasDoDia = {};
 function registrarVenda(modelo, qtd) {
   const key = modelo || '(sem modelo)';
   vendasDoDia[key] = (vendasDoDia[key] || 0) + qtd;
+  console.log(`[venda] +${qtd} ${key} | total dia: ${vendasDoDia[key]} | vendasDoDia=${JSON.stringify(vendasDoDia)}`);
 }
 
 function resetVendasDoDia() {
