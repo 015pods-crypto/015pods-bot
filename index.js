@@ -332,6 +332,18 @@ cron.schedule('0 0 * * *', () => {
   console.log('vendasDoDia resetado');
 }, { timezone: 'America/Sao_Paulo' });
 
+const KEEPALIVE_URL = 'https://zero15pods-bot.onrender.com/ping';
+
+cron.schedule('*/10 0-2,10-23 * * *', async () => {
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const resp = await fetch(KEEPALIVE_URL);
+    console.log(`keepalive ${KEEPALIVE_URL} -> ${resp.status}`);
+  } catch (err) {
+    console.error('Erro no keepalive:', err.message);
+  }
+}, { timezone: 'America/Sao_Paulo' });
+
 const processedIds = new Set();
 
 app.post('/webhook', async (req, res) => {
@@ -371,6 +383,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('015 Pods Bot online!'));
+app.get('/ping', (req, res) => res.status(200).send('OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Bot rodando na porta ${PORT}`));
