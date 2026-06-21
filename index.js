@@ -1,5 +1,6 @@
 const express = require('express');
 const { google } = require('googleapis');
+const cron = require('node-cron');
 
 const app = express();
 app.use(express.json());
@@ -214,6 +215,7 @@ async function handleMovimentos(chatId, lines) {
       const novo = p.qtd - item.qtd;
       p.qtd = novo;
       updates.push({ rowIndex: p.rowIndex, qtd: novo });
+      registrarVenda(p.modelo, item.qtd);
       results.push({ op: 'baixa', ok: true, modelo: p.modelo, sabor: p.sabor, qtd: item.qtd, restante: Math.max(novo, 0) });
     } else {
       const novo = p.qtd + item.qtd;
@@ -290,6 +292,45 @@ async function handleRelatorio(chatId) {
 }
 
 const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n\n➖ *Baixa:* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada:* `+1 Ignite 5500 Grape Ice`';
+
+const vendasDoDia = {};
+
+function registrarVenda(modelo, qtd) {
+  const key = modelo || '(sem modelo)';
+  vendasDoDia[key] = (vendasDoDia[key] || 0) + qtd;
+}
+
+function resetVendasDoDia() {
+  for (const k of Object.keys(vendasDoDia)) delete vendasDoDia[k];
+}
+
+async function enviarResumoVendas() {
+  const data = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+  const entries = Object.entries(vendasDoDia).sort((a, b) => b[1] - a[1]);
+  const linhas = ['📊 *RESUMO DE VENDAS – 015 PODS*', data, ''];
+  if (!entries.length) {
+    linhas.push('Nenhuma venda registrada hoje.');
+  } else {
+    linhas.push('Saídas do dia:');
+    let total = 0;
+    for (const [modelo, qtd] of entries) {
+      linhas.push(`📦 ${escapeMd(modelo)} — ${qtd} un`);
+      total += qtd;
+    }
+    linhas.push('', `Total: *${total}* unidades saíram hoje`);
+  }
+  await sendTelegram(CHAT_GROUP_ID, linhas.join('\n'));
+}
+
+cron.schedule('50 23 * * *', async () => {
+  try { await enviarResumoVendas(); }
+  catch (err) { console.error('Erro no resumo de vendas:', err); }
+}, { timezone: 'America/Sao_Paulo' });
+
+cron.schedule('0 0 * * *', () => {
+  resetVendasDoDia();
+  console.log('vendasDoDia resetado');
+}, { timezone: 'America/Sao_Paulo' });
 
 const processedIds = new Set();
 
