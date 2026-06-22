@@ -110,28 +110,41 @@ function tokens(str) {
   return normalize(str).split(' ').filter(Boolean);
 }
 
-function scoreMatch(queryTokens, produto) {
-  const haystack = normalize(`${produto.modelo} ${produto.sabor}`);
-  const haySet = new Set(tokens(haystack));
-  let hits = 0;
-  for (const t of queryTokens) {
-    if (haySet.has(t)) { hits += 1; continue; }
-    if (haystack.includes(t)) hits += 0.5;
-  }
-  return hits;
-}
-
+// Retorna { produto } se achou exatamente um, { ambiguous: true } se houver
+// empate entre vários, ou null se não encontrou nada.
 function findProduto(produtos, desc) {
+  const qNorm = normalize(desc);
   const qTokens = tokens(desc);
   if (!qTokens.length) return null;
-  let best = null;
-  let bestScore = 0;
+
+  // 1) MATCH EXATO — o sabor (ou nome completo) bate exatamente com o input.
+  const exatos = produtos.filter(p => {
+    const sabor = normalize(p.sabor);
+    const full = normalize(`${p.modelo} ${p.sabor}`);
+    return sabor === qNorm || full === qNorm;
+  });
+  if (exatos.length === 1) return { produto: exatos[0] };
+  if (exatos.length > 1) return { ambiguous: true };
+
+  // 2) MATCH PARCIAL — só se não houve match exato. Exige que TODAS as
+  // palavras do input estejam no nome do produto (modelo + sabor).
+  const parciais = [];
   for (const p of produtos) {
-    const s = scoreMatch(qTokens, p);
-    if (s > bestScore) { bestScore = s; best = p; }
+    const haySet = new Set(tokens(`${p.modelo} ${p.sabor}`));
+    const todasPresentes = qTokens.every(t => haySet.has(t));
+    if (todasPresentes) {
+      // Menos palavras "extras" = match mais específico = score maior.
+      const score = qTokens.length - (haySet.size - qTokens.length);
+      parciais.push({ produto: p, score });
+    }
   }
-  if (!best || bestScore < Math.max(1, qTokens.length * 0.5)) return null;
-  return best;
+  if (!parciais.length) return null;
+
+  const melhorScore = Math.max(...parciais.map(p => p.score));
+  const topo = parciais.filter(p => p.score === melhorScore);
+  // 3) Ambiguidade — mais de um produto com o mesmo score máximo.
+  if (topo.length > 1) return { ambiguous: true };
+  return { produto: topo[0].produto };
 }
 
 function parseMovimentoLine(line) {
@@ -202,11 +215,16 @@ async function handleMovimentos(chatId, lines) {
       results.push({ op: item.op, ok: false, msg: `Formato inválido: \`${item.raw}\` — use \`${exemplo}\`` });
       continue;
     }
-    const p = findProduto(produtos, item.desc);
-    if (!p) {
+    const match = findProduto(produtos, item.desc);
+    if (match && match.ambiguous) {
+      results.push({ op: item.op, ok: false, msg: `Produto ambíguo: encontrei mais de um match para "${item.desc}". Seja mais específico.` });
+      continue;
+    }
+    if (!match) {
       results.push({ op: item.op, ok: false, msg: `Produto não encontrado: "${item.desc}"` });
       continue;
     }
+    const p = match.produto;
     if (item.op === 'baixa') {
       if (p.qtd <= 0) {
         results.push({ op: 'baixa', ok: false, msg: `${p.modelo} – ${p.sabor} já está zerado` });
