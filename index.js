@@ -100,7 +100,7 @@ function normalize(str) {
     .toString()
     .toLowerCase()
     .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -201,10 +201,26 @@ function buildResumoMulti(results) {
   return out.join('\n');
 }
 
+// Mutex simples em memória: serializa as operações de leitura+escrita do
+// estoque. Sem isto, duas mensagens quase simultâneas leem a planilha antes de
+// a primeira terminar de gravar, e a segunda sobrescreve a alteração (race
+// condition que fazia o estoque "voltar" ao valor anterior). withEstoqueLock
+// encadeia as operações para que rodem uma de cada vez, em ordem de chegada.
+let estoqueLock = Promise.resolve();
+function withEstoqueLock(fn) {
+  const result = estoqueLock.then(fn, fn);
+  // Mantém a fila viva mesmo que uma operação falhe.
+  estoqueLock = result.then(() => {}, () => {});
+  return result;
+}
+
 async function handleMovimentos(chatId, lines) {
   const parsed = lines.map(parseMovimentoLine).filter(Boolean);
   if (!parsed.length) return;
 
+  // Tudo entre o readEstoque e o batchUpdateQtd precisa ser atômico em relação
+  // a outras movimentações, por isso roda dentro do lock.
+  const results = await withEstoqueLock(async () => {
   const produtos = await readEstoque();
   const updates = [];
   const results = [];
@@ -244,6 +260,9 @@ async function handleMovimentos(chatId, lines) {
   }
 
   await batchUpdateQtd(updates);
+  return results;
+  });
+
   const msg = results.length === 1 ? buildResumoSingle(results[0]) : buildResumoMulti(results);
   await sendTelegram(chatId, msg);
 }
