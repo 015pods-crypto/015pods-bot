@@ -1,30 +1,44 @@
 const express = require('express');
-const { google } = require('googleapis');
 const cron = require('node-cron');
 
 const app = express();
 app.use(express.json());
 
 const TELEGRAM_TOKEN = '8656191252:AAEYGvtP8lwHASzW-QZExYGkr2nArigm1ec';
-const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
-const SPREADSHEET_ID = '15eKhLTOovsix8Ep4nWVnh6UCBMstswLQDUfA9hDuII4';
-const SHEET_NAME = 'Página1';
+// Base da API do Telegram sobrescrevível por env (usado só em teste local para
+// capturar as mensagens em vez de enviá-las de verdade); default = produção.
+const TELEGRAM_API_BASE = process.env.TELEGRAM_API_BASE || 'https://api.telegram.org';
+const TELEGRAM_API = `${TELEGRAM_API_BASE}/bot${TELEGRAM_TOKEN}`;
 const CHAT_GROUP_ID = '-4938589018';
-const DATA_RANGE = `${SHEET_NAME}!A2:C`;
 
-let sheetsClient = null;
+// Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
+//   bot_ler_estoque       -> leitura (comandos /estoque, /zerados, etc.)
+//   bot_movimentar_estoque -> baixa/entrada (mensagens - / +)
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const BOT_SYNC_TOKEN = process.env.BOT_SYNC_TOKEN;
 
-async function getSheets() {
-  if (sheetsClient) return sheetsClient;
-  const raw = process.env.GOOGLE_CREDENTIALS_JSON;
-  if (!raw) throw new Error('GOOGLE_CREDENTIALS_JSON não definido');
-  const credentials = JSON.parse(raw);
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+async function callRpc(fn, body) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error('SUPABASE_URL/SUPABASE_ANON_KEY não definidos');
+  if (!BOT_SYNC_TOKEN) throw new Error('BOT_SYNC_TOKEN não definido');
+  const fetch = (await import('node-fetch')).default;
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fn}`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
   });
-  sheetsClient = google.sheets({ version: 'v4', auth: await auth.getClient() });
-  return sheetsClient;
+  const texto = await resp.text();
+  let data = null;
+  try { data = texto ? JSON.parse(texto) : null; } catch (_) { /* resposta não-JSON */ }
+  if (!resp.ok) {
+    const detalhe = data && (data.message || data.error) ? (data.message || data.error) : texto.slice(0, 200);
+    throw new Error(`Supabase ${fn} HTTP ${resp.status}: ${detalhe}`);
+  }
+  return data;
 }
 
 function splitMessage(text, max = 3800) {
@@ -65,86 +79,22 @@ async function sendTelegram(chatId, text) {
   }
 }
 
+// Lê o estoque da RPC bot_ler_estoque (retorno agrupado por modelo) e achata
+// para a lista { modelo, sabor, qtd } que os handlers de leitura consomem.
 async function readEstoque() {
-  const sheets = await getSheets();
-  const resp = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: DATA_RANGE,
-  });
-  const rows = resp.data.values || [];
-  return rows.map((row, idx) => ({
-    rowIndex: idx + 2,
-    modelo: (row[0] || '').toString().trim(),
-    sabor: (row[1] || '').toString().trim(),
-    qtd: parseInt(row[2], 10) || 0,
-  })).filter(p => p.modelo || p.sabor);
-}
-
-async function batchUpdateQtd(updates) {
-  if (!updates.length) return;
-  const sheets = await getSheets();
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId: SPREADSHEET_ID,
-    requestBody: {
-      valueInputOption: 'USER_ENTERED',
-      data: updates.map(({ rowIndex, qtd }) => ({
-        range: `${SHEET_NAME}!C${rowIndex}`,
-        values: [[qtd]],
-      })),
-    },
-  });
-}
-
-function normalize(str) {
-  return (str || '')
-    .toString()
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function tokens(str) {
-  return normalize(str).split(' ').filter(Boolean);
-}
-
-// Retorna { produto } se achou exatamente um, { ambiguous: true } se houver
-// empate entre vários, ou null se não encontrou nada.
-function findProduto(produtos, desc) {
-  const qNorm = normalize(desc);
-  const qTokens = tokens(desc);
-  if (!qTokens.length) return null;
-
-  // 1) MATCH EXATO — o sabor (ou nome completo) bate exatamente com o input.
-  const exatos = produtos.filter(p => {
-    const sabor = normalize(p.sabor);
-    const full = normalize(`${p.modelo} ${p.sabor}`);
-    return sabor === qNorm || full === qNorm;
-  });
-  if (exatos.length === 1) return { produto: exatos[0] };
-  if (exatos.length > 1) return { ambiguous: true };
-
-  // 2) MATCH PARCIAL — só se não houve match exato. Exige que TODAS as
-  // palavras do input estejam no nome do produto (modelo + sabor).
-  const parciais = [];
-  for (const p of produtos) {
-    const haySet = new Set(tokens(`${p.modelo} ${p.sabor}`));
-    const todasPresentes = qTokens.every(t => haySet.has(t));
-    if (todasPresentes) {
-      // Menos palavras "extras" = match mais específico = score maior.
-      const score = qTokens.length - (haySet.size - qTokens.length);
-      parciais.push({ produto: p, score });
+  const data = await callRpc('bot_ler_estoque', { p_token: BOT_SYNC_TOKEN });
+  const produtos = [];
+  for (const grupo of data || []) {
+    const modelo = (grupo.modelo || '').toString().trim();
+    for (const s of grupo.sabores || []) {
+      produtos.push({
+        modelo,
+        sabor: (s.sabor || '').toString().trim(),
+        qtd: parseInt(s.qty, 10) || 0,
+      });
     }
   }
-  if (!parciais.length) return null;
-
-  const melhorScore = Math.max(...parciais.map(p => p.score));
-  const topo = parciais.filter(p => p.score === melhorScore);
-  // 3) Ambiguidade — mais de um produto com o mesmo score máximo.
-  if (topo.length > 1) return { ambiguous: true };
-  return { produto: topo[0].produto };
+  return produtos.filter(p => p.modelo || p.sabor);
 }
 
 function parseMovimentoLine(line) {
@@ -201,67 +151,93 @@ function buildResumoMulti(results) {
   return out.join('\n');
 }
 
-// Mutex simples em memória: serializa as operações de leitura+escrita do
-// estoque. Sem isto, duas mensagens quase simultâneas leem a planilha antes de
-// a primeira terminar de gravar, e a segunda sobrescreve a alteração (race
-// condition que fazia o estoque "voltar" ao valor anterior). withEstoqueLock
-// encadeia as operações para que rodem uma de cada vez, em ordem de chegada.
-let estoqueLock = Promise.resolve();
-function withEstoqueLock(fn) {
-  const result = estoqueLock.then(fn, fn);
-  // Mantém a fila viva mesmo que uma operação falhe.
-  estoqueLock = result.then(() => {}, () => {});
-  return result;
+// Converte um item de `resultados[]` da RPC bot_movimentar_estoque no formato
+// { ok, op, modelo, sabor, qtd, restante } / { ok:false, op, msg } que os
+// builders de resposta (buildResumoSingle/Multi) consomem. `opFallback` é a
+// operação que o usuário digitou (baixa/entrada), usada quando o resultado de
+// erro não traz a direção.
+function mapResultado(r, opFallback) {
+  const status = r && r.status;
+  const input = (r && r.input) || '(item)';
+
+  if (status === 'ok') {
+    const op = r.direction === 'entrada' ? 'entrada' : 'baixa';
+    return { ok: true, op, modelo: r.model, sabor: r.flavor, qtd: r.qty, restante: r.stock_after };
+  }
+  if (status === 'nao_encontrado') {
+    return { ok: false, op: opFallback, msg: `Produto não encontrado: "${input}"` };
+  }
+  if (status === 'ambiguo') {
+    // A RPC pode devolver a lista de candidatos sob nomes diferentes; tenta os
+    // mais prováveis e monta a lista de matches quando existir.
+    const matches = r.matches || r.opcoes || r.candidatos || r.candidates || [];
+    let msg = `Produto ambíguo: encontrei mais de um match para "${input}". Seja mais específico.`;
+    if (Array.isArray(matches) && matches.length) {
+      const lista = matches.map(m => {
+        if (typeof m === 'string') return m;
+        const mod = m.model || m.modelo || '';
+        const fla = m.flavor || m.sabor || '';
+        return `${mod} – ${fla}`.trim().replace(/^–\s*/, '');
+      });
+      msg += '\n' + lista.map(x => `• ${x}`).join('\n');
+    }
+    return { ok: false, op: opFallback, msg };
+  }
+  if (status === 'qtd_invalida') {
+    return { ok: false, op: opFallback, msg: `Quantidade inválida para "${input}"` };
+  }
+  if (status === 'estoque_insuficiente') {
+    const nome = (r.model || r.flavor) ? `${r.model} – ${r.flavor}` : `"${input}"`;
+    const tem = r.stock_before != null ? r.stock_before : 0;
+    const msg = tem <= 0
+      ? `${nome} já está zerado`
+      : `${nome} sem estoque suficiente (tem ${tem}, pediu ${r.qty})`;
+    return { ok: false, op: opFallback, msg };
+  }
+  return { ok: false, op: opFallback, msg: `Não processado: "${input}" (${status || 'sem status'})` };
 }
 
-async function handleMovimentos(chatId, lines) {
+async function handleMovimentos(chatId, lines, messageId) {
   const parsed = lines.map(parseMovimentoLine).filter(Boolean);
   if (!parsed.length) return;
 
-  // Tudo entre o readEstoque e o batchUpdateQtd precisa ser atômico em relação
-  // a outras movimentações, por isso roda dentro do lock.
-  const results = await withEstoqueLock(async () => {
-  const produtos = await readEstoque();
-  const updates = [];
-  const results = [];
-
+  // Linhas que o parser entendeu viram itens { produto, qty } para a RPC; qty
+  // negativo = baixa, positivo = entrada. Linhas com formato inválido (sem dar
+  // pra extrair produto/qtd) são respondidas localmente, sem ir à RPC.
+  const items = [];
+  const plan = [];
   for (const item of parsed) {
     if (item.invalid) {
-      const exemplo = item.op === 'entrada' ? '+1 Ignite 5500 Grape Ice' : '-1 Ignite 5500 Grape Ice';
-      results.push({ op: item.op, ok: false, msg: `Formato inválido: \`${item.raw}\` — use \`${exemplo}\`` });
-      continue;
-    }
-    const match = findProduto(produtos, item.desc);
-    if (match && match.ambiguous) {
-      results.push({ op: item.op, ok: false, msg: `Produto ambíguo: encontrei mais de um match para "${item.desc}". Seja mais específico.` });
-      continue;
-    }
-    if (!match) {
-      results.push({ op: item.op, ok: false, msg: `Produto não encontrado: "${item.desc}"` });
-      continue;
-    }
-    const p = match.produto;
-    if (item.op === 'baixa') {
-      if (p.qtd <= 0) {
-        results.push({ op: 'baixa', ok: false, msg: `${p.modelo} – ${p.sabor} já está zerado` });
-        continue;
-      }
-      const novo = p.qtd - item.qtd;
-      p.qtd = novo;
-      updates.push({ rowIndex: p.rowIndex, qtd: novo });
-      registrarVenda(p.modelo, item.qtd);
-      results.push({ op: 'baixa', ok: true, modelo: p.modelo, sabor: p.sabor, qtd: item.qtd, restante: Math.max(novo, 0) });
+      plan.push({ invalid: true, op: item.op, raw: item.raw });
     } else {
-      const novo = p.qtd + item.qtd;
-      p.qtd = novo;
-      updates.push({ rowIndex: p.rowIndex, qtd: novo });
-      results.push({ op: 'entrada', ok: true, modelo: p.modelo, sabor: p.sabor, qtd: item.qtd, restante: novo });
+      plan.push({ op: item.op, itemIndex: items.length });
+      items.push({ produto: item.desc, qty: item.op === 'baixa' ? -item.qtd : item.qtd });
     }
   }
 
-  await batchUpdateQtd(updates);
-  return results;
-  });
+  let resultados = [];
+  if (items.length) {
+    const data = await callRpc('bot_movimentar_estoque', {
+      p_token: BOT_SYNC_TOKEN,
+      p_items: items,
+      p_meta: { chat_id: chatId, message_id: messageId },
+    });
+    resultados = (data && data.resultados) || [];
+  }
+
+  const results = [];
+  for (const p of plan) {
+    if (p.invalid) {
+      const exemplo = p.op === 'entrada' ? '+1 Ignite 5500 Grape Ice' : '-1 Ignite 5500 Grape Ice';
+      results.push({ op: p.op, ok: false, msg: `Formato inválido: \`${p.raw}\` — use \`${exemplo}\`` });
+      continue;
+    }
+    const mapped = mapResultado(resultados[p.itemIndex], p.op);
+    // Mantém o resumo diário de vendas (cron 23:50) funcionando: cada baixa ok
+    // é registrada por modelo, como era feito na lógica antiga da planilha.
+    if (mapped.ok && mapped.op === 'baixa') registrarVenda(mapped.modelo, mapped.qtd);
+    results.push(mapped);
+  }
 
   const msg = results.length === 1 ? buildResumoSingle(results[0]) : buildResumoMulti(results);
   await sendTelegram(chatId, msg);
@@ -278,7 +254,7 @@ function totaisPorModelo(produtos) {
 
 async function handleEstoque(chatId) {
   const produtos = await readEstoque();
-  if (!produtos.length) { await sendTelegram(chatId, '📦 Planilha vazia.'); return; }
+  if (!produtos.length) { await sendTelegram(chatId, '📦 Estoque vazio.'); return; }
   const totais = totaisPorModelo(produtos);
   const ordenado = [...totais.entries()].sort((a, b) => b[1] - a[1]);
   const linhas = ['📦 *Estoque atual* (por modelo)', ''];
@@ -410,7 +386,7 @@ app.post('/webhook', async (req, res) => {
 
     if (text.charAt(0) === '-' || text.charAt(0) === '+') {
       const movLines = text.split('\n').map(l => l.trim()).filter(l => l.startsWith('-') || l.startsWith('+'));
-      if (movLines.length) { await handleMovimentos(chatId, movLines); return; }
+      if (movLines.length) { await handleMovimentos(chatId, movLines, msg.message_id); return; }
     }
 
     if (cmd === '/start' || cmd === '/ajuda') { await sendTelegram(chatId, AJUDA); return; }
@@ -430,5 +406,23 @@ app.post('/webhook', async (req, res) => {
 app.get('/', (req, res) => res.send('015 Pods Bot online!'));
 app.get('/ping', (req, res) => res.status(200).send('OK'));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Bot rodando na porta ${PORT}`));
+// Só sobe o servidor quando executado direto (node index.js). Quando importado
+// por um teste, expõe as funções internas sem iniciar o listener.
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`Bot rodando na porta ${PORT}`));
+}
+
+module.exports = {
+  app,
+  readEstoque,
+  handleEstoque,
+  handleZerados,
+  handleBaixo,
+  handleRelatorio,
+  handleMovimentos,
+  parseMovimentoLine,
+  mapResultado,
+  buildResumoSingle,
+  buildResumoMulti,
+};
