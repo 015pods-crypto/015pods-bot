@@ -304,7 +304,28 @@ async function handleRelatorio(chatId) {
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n\n➖ *Baixa:* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada:* `+1 Ignite 5500 Grape Ice`';
+// Reposição: quanto ENTROU por modelo nos últimos 30 min (RPC bot_resumo_reposicao).
+// Só leitura. O retorno já vem ordenado por total desc.
+async function handleReposicao(chatId) {
+  const dados = await callRpc('bot_resumo_reposicao', { p_token: BOT_SYNC_TOKEN, p_minutos: 30 });
+  const itens = Array.isArray(dados) ? dados : [];
+  if (!itens.length) {
+    await sendTelegram(chatId, 'Nenhuma reposição nos últimos 30 minutos.');
+    return;
+  }
+  const linhas = ['📦 *REPOSIÇÃO (últimos 30 min)*', ''];
+  let totalGeral = 0;
+  for (const it of itens) {
+    // exibição sem o sufixo entre parênteses (só aqui; outros comandos mantêm o nome completo)
+    const modelo = (it.modelo || '').replace(/\s*\(.*?\)\s*$/, '');
+    linhas.push(`- ${escapeMd(modelo)}: +${it.total}`);
+    totalGeral += Number(it.total) || 0;
+  }
+  linhas.push('', `*Total geral: +${totalGeral} unidades*`);
+  await sendTelegram(chatId, linhas.join('\n'));
+}
+
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n♻️ */reposicao* — Reposição (30 min)\n\n➖ *Baixa:* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada:* `+1 Ignite 5500 Grape Ice`';
 
 const vendasDoDia = {};
 
@@ -394,6 +415,7 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/zerados') { await handleZerados(chatId); return; }
     if (cmd === '/baixo') { await handleBaixo(chatId); return; }
     if (cmd === '/relatorio') { await handleRelatorio(chatId); return; }
+    if (cmd === '/reposicao') { await handleReposicao(chatId); return; }
   } catch (err) {
     console.error(err);
     try {
@@ -420,6 +442,7 @@ module.exports = {
   handleZerados,
   handleBaixo,
   handleRelatorio,
+  handleReposicao,
   handleMovimentos,
   parseMovimentoLine,
   mapResultado,
