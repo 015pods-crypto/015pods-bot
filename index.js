@@ -4,12 +4,19 @@ const cron = require('node-cron');
 const app = express();
 app.use(express.json());
 
-const TELEGRAM_TOKEN = '8656191252:AAEYGvtP8lwHASzW-QZExYGkr2nArigm1ec';
+// Token do bot vem SÓ de env var (nada hardcoded no repo — que é público).
+// Sem a env, o servidor NÃO sobe: checagem no bloco main, no fim do arquivo.
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 // Base da API do Telegram sobrescrevível por env (usado só em teste local para
 // capturar as mensagens em vez de enviá-las de verdade); default = produção.
 const TELEGRAM_API_BASE = process.env.TELEGRAM_API_BASE || 'https://api.telegram.org';
 const TELEGRAM_API = `${TELEGRAM_API_BASE}/bot${TELEGRAM_TOKEN}`;
-const CHAT_GROUP_ID = '-4938589018';
+// Dois grupos: VENDAS (só baixas -) e REPOSIÇÃO (só entradas +). IDs vêm de env
+// vars do Render; os defaults são os grupos reais (não são segredo).
+const VENDAS_CHAT_ID = String(process.env.VENDAS_CHAT_ID || '-4938589018');
+const REPOSICAO_CHAT_ID = String(process.env.REPOSICAO_CHAT_ID || '-5332904723');
+// Privado do Lucas: comandos de consulta também funcionam no DM dele.
+const LUCAS_USER_ID = String(process.env.LUCAS_USER_ID || '5984124812');
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
 //   bot_ler_estoque       -> leitura (comandos /estoque, /zerados, etc.)
@@ -118,6 +125,17 @@ function parseMovimentoLine(line) {
     return { op: 'entrada', qtd, desc, raw };
   }
   return null;
+}
+
+// Grupo de REPOSIÇÃO aceita linha SEM prefixo como entrada: "Elfbar 40000 ice king 5"
+// = +5. Só vira entrada se a linha terminar com número — o resto é conversa (ignora).
+function parseLinhaReposicaoSemPrefixo(line) {
+  const m = line.trim().match(/^([^+\-/].*?)\s+(\d+)$/);
+  if (!m) return null;
+  const desc = m[1].trim();
+  const qtd = parseInt(m[2], 10);
+  if (!desc || !qtd || qtd <= 0) return null;
+  return `+${qtd} ${desc}`;
 }
 
 function buildResumoSingle(r) {
@@ -325,7 +343,45 @@ async function handleReposicao(chatId) {
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n♻️ */reposicao* — Reposição (30 min)\n\n➖ *Baixa:* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada:* `+1 Ignite 5500 Grape Ice`';
+// Número em formato brasileiro (vírgula decimal).
+function fmtBR(n, dec = 2) {
+  return Number(n ?? 0).toLocaleString('pt-BR', {
+    minimumFractionDigits: dec,
+    maximumFractionDigits: dec,
+  });
+}
+
+// Texto do /comissao — também é reaproveitado no bloco final do resumo diário.
+// Nunca lança: erro da RPC vira mensagem amigável.
+async function textoComissao() {
+  let d;
+  try {
+    d = await callRpc('bot_comissao', { p_token: BOT_SYNC_TOKEN });
+  } catch (err) {
+    console.error('comissao:', err.message);
+    return '⚠️ Erro ao consultar comissão.';
+  }
+  if (!d || d.ok === false) return '⚠️ Erro ao consultar comissão.';
+  const linhas = [
+    `📊 *Comissão — ${escapeMd(String(d.mes ?? ''))}*`,
+    `Hoje: *${d.unidades_hoje ?? 0}* produtos`,
+    `Acumulado: *${d.unidades_mes ?? 0}* produtos`,
+    `Faixa atual: R$ ${fmtBR(d.taxa_atual)}/produto`,
+    `💰 Comissão: *R$ ${fmtBR(d.comissao)}*`,
+  ];
+  if (d.faltam_para_proxima == null) {
+    linhas.push('🏆 Faixa máxima atingida!');
+  } else {
+    linhas.push(`🎯 Faltam *${d.faltam_para_proxima}* p/ faixa de R$ ${fmtBR(d.proxima_taxa)}`);
+  }
+  return linhas.join('\n');
+}
+
+async function handleComissao(chatId) {
+  await sendTelegram(chatId, await textoComissao());
+}
+
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`';
 
 const vendasDoDia = {};
 
@@ -354,10 +410,12 @@ async function enviarResumoVendas() {
     }
     linhas.push('', `Total: *${total}* unidades saíram hoje`);
   }
-  await sendTelegram(CHAT_GROUP_ID, linhas.join('\n'));
+  // Bloco final: mesmo conteúdo do /comissao (textoComissao nunca lança).
+  linhas.push('', await textoComissao());
+  await sendTelegram(VENDAS_CHAT_ID, linhas.join('\n'));
 }
 
-cron.schedule('50 23 * * *', async () => {
+cron.schedule('59 23 * * *', async () => {
   try { await enviarResumoVendas(); }
   catch (err) { console.error('Erro no resumo de vendas:', err); }
 }, { timezone: 'America/Sao_Paulo' });
@@ -370,7 +428,7 @@ cron.schedule('0 0 * * *', () => {
 const LEMBRETE_SEMANAL = '📸 *FECHAMENTO SEMANAL – 015 PODS*\nÉ terça-feira! Hora de atualizar as fotos do estoque.\n\nPor favor, envie a foto de cada modelo em estoque e depois mande /estoque para conferir a lista.';
 
 cron.schedule('0 10 * * 2', async () => {
-  try { await sendTelegram(CHAT_GROUP_ID, LEMBRETE_SEMANAL); }
+  try { await sendTelegram(VENDAS_CHAT_ID, LEMBRETE_SEMANAL); }
   catch (err) { console.error('Erro no lembrete semanal:', err); }
 }, { timezone: 'America/Sao_Paulo' });
 
@@ -405,9 +463,42 @@ app.post('/webhook', async (req, res) => {
     if (!text) return;
     const cmd = text.split(/\s+/)[0].toLowerCase().split('@')[0];
 
+    // Só os dois grupos e o privado do Lucas são atendidos; o resto é ignorado.
+    const chatKey = String(chatId);
+    const isVendas = chatKey === VENDAS_CHAT_ID;
+    const isReposicao = chatKey === REPOSICAO_CHAT_ID;
+    const isPrivadoLucas =
+      msg.chat.type === 'private' && String(msg.from && msg.from.id) === LUCAS_USER_ID;
+    if (!isVendas && !isReposicao && !isPrivadoLucas) return;
+
+    // Movimentos com prefixo: cada grupo aceita só o seu sinal.
+    //   VENDAS: só baixa (-). REPOSIÇÃO: só entrada (+). Privado: os dois.
     if (text.charAt(0) === '-' || text.charAt(0) === '+') {
-      const movLines = text.split('\n').map(l => l.trim()).filter(l => l.startsWith('-') || l.startsWith('+'));
-      if (movLines.length) { await handleMovimentos(chatId, movLines, msg.message_id); return; }
+      const linhas = text.split('\n').map(l => l.trim());
+      const baixas = linhas.filter(l => l.startsWith('-'));
+      const entradas = linhas.filter(l => l.startsWith('+'));
+
+      if (isVendas && entradas.length) {
+        await sendTelegram(chatId, '➕ Reposição é no grupo de reposição. Aqui só venda (-).');
+      }
+      if (isReposicao && baixas.length) {
+        await sendTelegram(chatId, '➖ Venda é no grupo de vendas. Aqui só reposição (+).');
+      }
+
+      const permitidas = isVendas ? baixas : isReposicao ? entradas : [...baixas, ...entradas];
+      if (permitidas.length) await handleMovimentos(chatId, permitidas, msg.message_id);
+      return;
+    }
+
+    // Reposição: linha SEM prefixo que termina em número também é entrada
+    // ("Elfbar 40000 ice king 5" = +5). Conversa normal é ignorada.
+    if (isReposicao && !cmd.startsWith('/')) {
+      const sintetizadas = text
+        .split('\n')
+        .map(parseLinhaReposicaoSemPrefixo)
+        .filter(Boolean);
+      if (sintetizadas.length) await handleMovimentos(chatId, sintetizadas, msg.message_id);
+      return;
     }
 
     if (cmd === '/start' || cmd === '/ajuda') { await sendTelegram(chatId, AJUDA); return; }
@@ -416,6 +507,7 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/baixo') { await handleBaixo(chatId); return; }
     if (cmd === '/relatorio') { await handleRelatorio(chatId); return; }
     if (cmd === '/reposicao') { await handleReposicao(chatId); return; }
+    if (cmd === '/comissao') { await handleComissao(chatId); return; }
   } catch (err) {
     console.error(err);
     try {
@@ -431,6 +523,10 @@ app.get('/ping', (req, res) => res.status(200).send('OK'));
 // Só sobe o servidor quando executado direto (node index.js). Quando importado
 // por um teste, expõe as funções internas sem iniciar o listener.
 if (require.main === module) {
+  if (!TELEGRAM_TOKEN) {
+    console.error('ERRO: env var TELEGRAM_TOKEN não definida (Render > Environment). O bot não sobe sem ela.');
+    process.exit(1);
+  }
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`Bot rodando na porta ${PORT}`));
 }
@@ -443,8 +539,12 @@ module.exports = {
   handleBaixo,
   handleRelatorio,
   handleReposicao,
+  handleComissao,
+  textoComissao,
   handleMovimentos,
   parseMovimentoLine,
+  parseLinhaReposicaoSemPrefixo,
+  enviarResumoVendas,
   mapResultado,
   buildResumoSingle,
   buildResumoMulti,
