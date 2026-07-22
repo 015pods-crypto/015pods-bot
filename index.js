@@ -351,17 +351,20 @@ function fmtBR(n, dec = 2) {
   });
 }
 
-// Texto do /comissao — também é reaproveitado no bloco final do resumo diário.
-// Nunca lança: erro da RPC vira mensagem amigável.
-async function textoComissao() {
-  let d;
+// Busca os dados da RPC bot_comissao. Nunca lança: erro vira null.
+// `mes` é o período ("20/07 → 19/08"); `fecha_hoje` = último dia do período.
+async function dadosComissao() {
   try {
-    d = await callRpc('bot_comissao', { p_token: BOT_SYNC_TOKEN });
+    const d = await callRpc('bot_comissao', { p_token: BOT_SYNC_TOKEN });
+    return d && d.ok !== false ? d : null;
   } catch (err) {
     console.error('comissao:', err.message);
-    return '⚠️ Erro ao consultar comissão.';
+    return null;
   }
-  if (!d || d.ok === false) return '⚠️ Erro ao consultar comissão.';
+}
+
+// Formato padrão (usado pelo /comissao e pelo relatório em dias normais).
+function formatComissao(d) {
   const linhas = [
     `📊 *Comissão — ${escapeMd(String(d.mes ?? ''))}*`,
     `Hoje: *${d.unidades_hoje ?? 0}* produtos`,
@@ -375,6 +378,29 @@ async function textoComissao() {
     linhas.push(`🎯 Faltam *${d.faltam_para_proxima}* p/ faixa de R$ ${fmtBR(d.proxima_taxa)}`);
   }
   return linhas.join('\n');
+}
+
+// Texto do /comissao (formato padrão, sempre).
+async function textoComissao() {
+  const d = await dadosComissao();
+  return d ? formatComissao(d) : '⚠️ Erro ao consultar comissão.';
+}
+
+// Bloco do resumo diário: no último dia do período (fecha_hoje=true) vira
+// cabeçalho de FECHAMENTO; nos demais dias é o formato padrão.
+async function textoComissaoRelatorio() {
+  const d = await dadosComissao();
+  if (!d) return '⚠️ Erro ao consultar comissão.';
+  if (d.fecha_hoje) {
+    return [
+      `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`,
+      `Total: *${d.unidades_mes ?? 0}* produtos`,
+      `Faixa final: R$ ${fmtBR(d.taxa_atual)}/produto`,
+      `💰 Comissão a pagar: *R$ ${fmtBR(d.comissao)}*`,
+      '_(amanhã começa o novo período)_',
+    ].join('\n');
+  }
+  return formatComissao(d);
 }
 
 async function handleComissao(chatId) {
@@ -410,8 +436,8 @@ async function enviarResumoVendas() {
     }
     linhas.push('', `Total: *${total}* unidades saíram hoje`);
   }
-  // Bloco final: mesmo conteúdo do /comissao (textoComissao nunca lança).
-  linhas.push('', await textoComissao());
+  // Bloco final: comissão (com cabeçalho de FECHAMENTO no último dia do período).
+  linhas.push('', await textoComissaoRelatorio());
   await sendTelegram(VENDAS_CHAT_ID, linhas.join('\n'));
 }
 
@@ -541,6 +567,7 @@ module.exports = {
   handleReposicao,
   handleComissao,
   textoComissao,
+  textoComissaoRelatorio,
   handleMovimentos,
   parseMovimentoLine,
   parseLinhaReposicaoSemPrefixo,
