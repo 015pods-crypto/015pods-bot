@@ -17,6 +17,8 @@ const VENDAS_CHAT_ID = String(process.env.VENDAS_CHAT_ID || '-4938589018');
 const REPOSICAO_CHAT_ID = String(process.env.REPOSICAO_CHAT_ID || '-5332904723');
 // Privado do Lucas: comandos de consulta também funcionam no DM dele.
 const LUCAS_USER_ID = String(process.env.LUCAS_USER_ID || '5984124812');
+// Dono: único que pode anular/desanular comissão (/anular, /desanular).
+const ADMIN_USER_ID = String(process.env.ADMIN_USER_ID || '5984124812');
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
 //   bot_ler_estoque       -> leitura (comandos /estoque, /zerados, etc.)
@@ -407,6 +409,97 @@ async function handleComissao(chatId) {
   await sendTelegram(chatId, await textoComissao());
 }
 
+// ---------------------------------------------------------------------------
+// Anulação de comissão
+// Baixa que não é venda (troca, uso interno) não deve gerar comissão. As RPCs
+// bot_anular_comissao / bot_desanular_comissao só marcam/desmarcam as últimas N
+// unidades baixadas: o ESTOQUE não é tocado e /comissao já ignora as anuladas.
+// Restrito ao dono (ADMIN_USER_ID) — funcionário recebe recusa.
+// ---------------------------------------------------------------------------
+
+const ANULAR_MIN = 1;
+const ANULAR_MAX = 50;
+
+// Extrai o N de "/anular 10". null se faltar, não for número ou sair de 1..50.
+function parseUnidadesComando(text) {
+  const arg = (text || '').trim().split(/\s+/)[1];
+  if (!arg || !/^\d+$/.test(arg)) return null;
+  const n = parseInt(arg, 10);
+  if (!n || n < ANULAR_MIN || n > ANULAR_MAX) return null;
+  return n;
+}
+
+// A RPC pode devolver `itens` como texto pronto ou como lista de objetos; os
+// nomes dos campos seguem o mesmo padrão frouxo das outras RPCs (model/modelo).
+function formatItensAnulados(itens) {
+  if (!itens) return '';
+  if (typeof itens === 'string') return itens;
+  if (!Array.isArray(itens)) return '';
+  const linhas = [];
+  for (const it of itens) {
+    if (it == null) continue;
+    if (typeof it === 'string') { linhas.push(`• ${escapeMd(it)}`); continue; }
+    const modelo = it.model || it.modelo || '';
+    const sabor = it.flavor || it.sabor || '';
+    const qtd = it.qty ?? it.qtd ?? it.unidades ?? null;
+    const nome = [modelo, sabor].filter(Boolean).join(' – ');
+    if (!nome && qtd == null) continue;
+    linhas.push(`• ${escapeMd(nome || '(item)')}${qtd != null ? `: ${qtd}` : ''}`);
+  }
+  return linhas.join('\n');
+}
+
+function ehDono(userId) {
+  return String(userId ?? '') === ADMIN_USER_ID;
+}
+
+// Chama a RPC de (des)anulação sem nunca lançar: devolve { ok, data, msg }.
+async function chamarRpcComissao(fn, unidades) {
+  try {
+    const data = await callRpc(fn, { p_token: BOT_SYNC_TOKEN, p_unidades: unidades });
+    if (!data || data.ok === false) {
+      const detalhe = data && (data.erro || data.msg || data.aviso);
+      return { ok: false, msg: `⚠️ ${detalhe || 'Não foi possível concluir a operação.'}` };
+    }
+    return { ok: true, data };
+  } catch (err) {
+    console.error(`${fn}:`, err.message);
+    return { ok: false, msg: '⚠️ Erro ao falar com o servidor. Tente de novo em instantes.' };
+  }
+}
+
+async function handleAnular(chatId, text, userId) {
+  if (!ehDono(userId)) { await sendTelegram(chatId, '⛔ Só o dono pode anular comissão.'); return; }
+  const unidades = parseUnidadesComando(text);
+  if (unidades == null) {
+    await sendTelegram(chatId, `Uso: /anular 10 (${ANULAR_MIN} a ${ANULAR_MAX})`);
+    return;
+  }
+  const r = await chamarRpcComissao('bot_anular_comissao', unidades);
+  if (!r.ok) { await sendTelegram(chatId, r.msg); return; }
+
+  const partes = [`✂️ ${r.data.unidades_anuladas ?? 0} unidade(s) fora da comissão:`];
+  const itens = formatItensAnulados(r.data.itens);
+  if (itens) partes.push(itens);
+  if (r.data.aviso) partes.push(`⚠️ ${escapeMd(String(r.data.aviso))}`);
+  await sendTelegram(chatId, partes.join('\n'));
+}
+
+async function handleDesanular(chatId, text, userId) {
+  if (!ehDono(userId)) { await sendTelegram(chatId, '⛔ Só o dono pode anular comissão.'); return; }
+  const unidades = parseUnidadesComando(text);
+  if (unidades == null) {
+    await sendTelegram(chatId, `Uso: /desanular 10 (${ANULAR_MIN} a ${ANULAR_MAX})`);
+    return;
+  }
+  const r = await chamarRpcComissao('bot_desanular_comissao', unidades);
+  if (!r.ok) { await sendTelegram(chatId, r.msg); return; }
+
+  const partes = [`↩️ ${r.data.unidades_reativadas ?? 0} unidade(s) de volta na comissão.`];
+  if (r.data.aviso) partes.push(`⚠️ ${escapeMd(String(r.data.aviso))}`);
+  await sendTelegram(chatId, partes.join('\n'));
+}
+
 const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`';
 
 const vendasDoDia = {};
@@ -534,6 +627,10 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/relatorio') { await handleRelatorio(chatId); return; }
     if (cmd === '/reposicao') { await handleReposicao(chatId); return; }
     if (cmd === '/comissao') { await handleComissao(chatId); return; }
+    // Só o dono: a checagem de quem mandou é feita dentro dos handlers.
+    const fromId = msg.from && msg.from.id;
+    if (cmd === '/anular') { await handleAnular(chatId, text, fromId); return; }
+    if (cmd === '/desanular') { await handleDesanular(chatId, text, fromId); return; }
   } catch (err) {
     console.error(err);
     try {
@@ -566,6 +663,10 @@ module.exports = {
   handleRelatorio,
   handleReposicao,
   handleComissao,
+  handleAnular,
+  handleDesanular,
+  parseUnidadesComando,
+  formatItensAnulados,
   textoComissao,
   textoComissaoRelatorio,
   handleMovimentos,
