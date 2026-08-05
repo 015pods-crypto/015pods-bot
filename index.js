@@ -429,26 +429,6 @@ function parseUnidadesComando(text) {
   return n;
 }
 
-// A RPC pode devolver `itens` como texto pronto ou como lista de objetos; os
-// nomes dos campos seguem o mesmo padrão frouxo das outras RPCs (model/modelo).
-function formatItensAnulados(itens) {
-  if (!itens) return '';
-  if (typeof itens === 'string') return itens;
-  if (!Array.isArray(itens)) return '';
-  const linhas = [];
-  for (const it of itens) {
-    if (it == null) continue;
-    if (typeof it === 'string') { linhas.push(`• ${escapeMd(it)}`); continue; }
-    const modelo = it.model || it.modelo || '';
-    const sabor = it.flavor || it.sabor || '';
-    const qtd = it.qty ?? it.qtd ?? it.unidades ?? null;
-    const nome = [modelo, sabor].filter(Boolean).join(' – ');
-    if (!nome && qtd == null) continue;
-    linhas.push(`• ${escapeMd(nome || '(item)')}${qtd != null ? `: ${qtd}` : ''}`);
-  }
-  return linhas.join('\n');
-}
-
 function ehDono(userId) {
   return String(userId ?? '') === ADMIN_USER_ID;
 }
@@ -478,11 +458,8 @@ async function handleAnular(chatId, text, userId) {
   const r = await chamarRpcComissao('bot_anular_comissao', unidades);
   if (!r.ok) { await sendTelegram(chatId, r.msg); return; }
 
-  const partes = [`✂️ ${r.data.unidades_anuladas ?? 0} unidade(s) fora da comissão:`];
-  const itens = formatItensAnulados(r.data.itens);
-  if (itens) partes.push(itens);
-  if (r.data.aviso) partes.push(`⚠️ ${escapeMd(String(r.data.aviso))}`);
-  await sendTelegram(chatId, partes.join('\n'));
+  // A RPC é um contador puro: devolve só { ok, unidades_anuladas }.
+  await sendTelegram(chatId, `✂️ ${r.data.unidades_anuladas ?? 0} unidade(s) descontada(s) da comissão.`);
 }
 
 async function handleDesanular(chatId, text, userId) {
@@ -666,7 +643,6 @@ module.exports = {
   handleAnular,
   handleDesanular,
   parseUnidadesComando,
-  formatItensAnulados,
   textoComissao,
   textoComissaoRelatorio,
   handleMovimentos,

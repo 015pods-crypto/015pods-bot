@@ -93,16 +93,8 @@ function teste(nome, fn) { testes.push({ nome, fn }); }
 
 // ---------------------------------------------------------------------------
 
-teste('/anular 2 pelo dono chama a RPC e lista os itens', async (ctx) => {
-  respostas.bot_anular_comissao = {
-    status: 200,
-    body: {
-      ok: true,
-      unidades_anuladas: 2,
-      itens: [{ modelo: 'Ignite 5500', sabor: 'Grape Ice', qtd: 2 }],
-      aviso: null,
-    },
-  };
+teste('/anular 2 pelo dono chama a RPC e responde só o contador', async (ctx) => {
+  respostas.bot_anular_comissao = { status: 200, body: { ok: true, unidades_anuladas: 2 } };
   const [resp] = await mandar(ctx.webhook, update('/anular 2'));
 
   const rpc = chamadas.filter(c => c.fn === 'bot_anular_comissao');
@@ -110,23 +102,23 @@ teste('/anular 2 pelo dono chama a RPC e lista os itens', async (ctx) => {
   assert.strictEqual(rpc[0].body.p_unidades, 2);
   assert.strictEqual(rpc[0].body.p_token, 'token-de-teste');
 
-  assert.ok(resp.text.includes('✂️ 2 unidade(s) fora da comissão:'), resp.text);
-  assert.ok(resp.text.includes('Ignite 5500 – Grape Ice: 2'), resp.text);
+  assert.strictEqual(resp.text, '✂️ 2 unidade(s) descontada(s) da comissão.');
 });
 
-teste('/anular repassa o aviso da RPC (ex.: anulou a baixa inteira)', async (ctx) => {
+// A RPC virou contador puro. Se um dia voltar a mandar itens/aviso, o bot
+// continua respondendo só a linha do contador.
+teste('/anular ignora itens e aviso se a RPC mandar', async (ctx) => {
   respostas.bot_anular_comissao = {
     status: 200,
     body: {
       ok: true,
       unidades_anuladas: 3,
-      itens: ['Ignite 5500 – Grape Ice: 3'],
+      itens: [{ modelo: 'Ignite 5500', sabor: 'Grape Ice', qtd: 3 }],
       aviso: 'A última baixa tinha 3 unidades; foi anulada inteira.',
     },
   };
-  const [resp] = await mandar(ctx.webhook, update('/anular 2'));
-  assert.ok(resp.text.includes('✂️ 3 unidade(s) fora da comissão:'), resp.text);
-  assert.ok(resp.text.includes('foi anulada inteira'), resp.text);
+  const [resp] = await mandar(ctx.webhook, update('/anular 3'));
+  assert.strictEqual(resp.text, '✂️ 3 unidade(s) descontada(s) da comissão.');
 });
 
 teste('/anular pelo funcionário é recusado e não chega na RPC', async (ctx) => {
@@ -166,13 +158,14 @@ teste('/desanular 2 pelo dono devolve as unidades', async (ctx) => {
 });
 
 teste('/anular funciona no grupo de reposição e no privado do dono', async (ctx) => {
-  respostas.bot_anular_comissao = { status: 200, body: { ok: true, unidades_anuladas: 1, itens: [] } };
+  respostas.bot_anular_comissao = { status: 200, body: { ok: true, unidades_anuladas: 1 } };
+  const esperado = '✂️ 1 unidade(s) descontada(s) da comissão.';
 
   const [noReposicao] = await mandar(ctx.webhook, update('/anular 1', { chat: GRUPO_REPOSICAO }));
-  assert.ok(noReposicao.text.startsWith('✂️ 1 unidade(s)'), noReposicao.text);
+  assert.strictEqual(noReposicao.text, esperado);
 
   const [noPrivado] = await mandar(ctx.webhook, update('/anular 1', { chat: DONO, tipo: 'private' }));
-  assert.ok(noPrivado.text.startsWith('✂️ 1 unidade(s)'), noPrivado.text);
+  assert.strictEqual(noPrivado.text, esperado);
 });
 
 teste('erro da RPC vira mensagem amigável e o webhook continua vivo', async (ctx) => {
@@ -187,9 +180,9 @@ teste('erro da RPC vira mensagem amigável e o webhook continua vivo', async (ct
   assert.ok(recusa.text.includes('nada a anular'), recusa.text);
 
   // e o bot segue respondendo normalmente depois
-  respostas.bot_anular_comissao = { status: 200, body: { ok: true, unidades_anuladas: 1, itens: [] } };
+  respostas.bot_anular_comissao = { status: 200, body: { ok: true, unidades_anuladas: 1 } };
   const [depois] = await mandar(ctx.webhook, update('/anular 1'));
-  assert.ok(depois.text.startsWith('✂️ 1 unidade(s)'), depois.text);
+  assert.strictEqual(depois.text, '✂️ 1 unidade(s) descontada(s) da comissão.');
 });
 
 // --- Regressão: o resto do bot não mudou -----------------------------------
