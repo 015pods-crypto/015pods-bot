@@ -185,6 +185,36 @@ teste('erro da RPC vira mensagem amigável e o webhook continua vivo', async (ct
   assert.strictEqual(depois.text, '✂️ 1 unidade(s) descontada(s) da comissão.');
 });
 
+// --- Comando desconhecido não pode ficar mudo pro dono ---------------------
+// Foi esse silêncio que disfarçou o deploy velho de "bug no /anular".
+
+teste('comando desconhecido responde ao dono, com o commit no ar', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/anularr 24'));
+  assert.ok(resp.text.includes('Comando não reconhecido'), resp.text);
+  assert.ok(resp.text.includes('/anularr'), resp.text);
+  assert.ok(resp.text.includes('commit'), resp.text);
+});
+
+teste('comando desconhecido do funcionário segue silencioso (sem ruído no grupo)', async (ctx) => {
+  await mandar(ctx.webhook, update('/qualquercoisa', { from: FUNCIONARIO }), { esperaResposta: false });
+  assert.strictEqual(enviadas.length, 0, `não devia responder: ${JSON.stringify(enviadas)}`);
+});
+
+teste('texto normal no grupo de vendas continua sem resposta', async (ctx) => {
+  // Sem o guard de "/" o fallback responderia a conversa normal do dono.
+  await mandar(ctx.webhook, update('bom dia pessoal'), { esperaResposta: false });
+  assert.strictEqual(enviadas.length, 0, `não devia responder: ${JSON.stringify(enviadas)}`);
+});
+
+teste('/versao mostra o commit ao dono e ignora o funcionário', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/versao'));
+  assert.ok(resp.text.includes('Versão no ar'), resp.text);
+  assert.ok(resp.text.includes('/anular'), resp.text);
+
+  await mandar(ctx.webhook, update('/versao', { from: FUNCIONARIO }), { esperaResposta: false });
+  assert.strictEqual(enviadas.length, 1, 'funcionário não devia receber resposta');
+});
+
 // --- Regressão: o resto do bot não mudou -----------------------------------
 
 teste('regressão: baixa continua indo pra bot_movimentar_estoque', async (ctx) => {

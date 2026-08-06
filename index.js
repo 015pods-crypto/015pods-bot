@@ -20,6 +20,19 @@ const LUCAS_USER_ID = String(process.env.LUCAS_USER_ID || '5984124812');
 // Dono: único que pode anular/desanular comissão (/anular, /desanular).
 const ADMIN_USER_ID = String(process.env.ADMIN_USER_ID || '5984124812');
 
+// Commit que está rodando (o Render injeta RENDER_GIT_COMMIT no deploy).
+// Existe pra responder "que versão está no ar?" sem abrir o painel: um deploy
+// velho faz comando novo simplesmente não existir, e isso é indistinguível de
+// bug no código se não dá pra ver a versão.
+const COMMIT = String(process.env.RENDER_GIT_COMMIT || 'desconhecido').slice(0, 7);
+
+// Só pra diagnóstico: o que ESTA versão conhece. Se um comando não está aqui,
+// ele também não está na cadeia de ifs do webhook (manter os dois em sincronia).
+const COMANDOS = [
+  '/start', '/ajuda', '/estoque', '/zerados', '/baixo', '/relatorio',
+  '/reposicao', '/comissao', '/anular', '/desanular', '/versao',
+];
+
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
 //   bot_ler_estoque       -> leitura (comandos /estoque, /zerados, etc.)
 //   bot_movimentar_estoque -> baixa/entrada (mensagens - / +)
@@ -79,11 +92,20 @@ async function sendTelegram(chatId, text) {
       body: JSON.stringify({ chat_id: chatId, text: chunk, parse_mode: 'Markdown' }),
     });
     if (!resp.ok) {
-      await fetch(`${TELEGRAM_API}/sendMessage`, {
+      // Markdown malformado derruba o envio: reenvia como texto puro. Os dois
+      // erros agora VÃO PRO LOG — antes sumiam em silêncio, e o bot mudo não
+      // deixava rastro nenhum pra investigar.
+      const motivo = await resp.text().catch(() => '');
+      console.error(`sendTelegram markdown falhou (${resp.status}): ${motivo.slice(0, 200)}`);
+      const retry = await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, text: chunk }),
       });
+      if (!retry.ok) {
+        const motivo2 = await retry.text().catch(() => '');
+        console.error(`sendTelegram texto puro falhou (${retry.status}): ${motivo2.slice(0, 200)}`);
+      }
     }
   }
 }
@@ -462,6 +484,13 @@ async function handleAnular(chatId, text, userId) {
   await sendTelegram(chatId, `✂️ ${r.data.unidades_anuladas ?? 0} unidade(s) descontada(s) da comissão.`);
 }
 
+// Diagnóstico: qual commit está no ar e quais comandos ESTA versão conhece.
+// Só o dono, pra não virar ruído nos grupos.
+async function handleVersao(chatId, userId) {
+  if (!ehDono(userId)) return;
+  await sendTelegram(chatId, `🔖 *Versão no ar*\nCommit: \`${COMMIT}\`\nComandos: ${COMANDOS.join(' ')}`);
+}
+
 async function handleDesanular(chatId, text, userId) {
   if (!ehDono(userId)) { await sendTelegram(chatId, '⛔ Só o dono pode anular comissão.'); return; }
   const unidades = parseUnidadesComando(text);
@@ -561,6 +590,7 @@ app.post('/webhook', async (req, res) => {
 
     // Só os dois grupos e o privado do Lucas são atendidos; o resto é ignorado.
     const chatKey = String(chatId);
+    const fromId = msg.from && msg.from.id;
     const isVendas = chatKey === VENDAS_CHAT_ID;
     const isReposicao = chatKey === REPOSICAO_CHAT_ID;
     const isPrivadoLucas =
@@ -605,20 +635,33 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/reposicao') { await handleReposicao(chatId); return; }
     if (cmd === '/comissao') { await handleComissao(chatId); return; }
     // Só o dono: a checagem de quem mandou é feita dentro dos handlers.
-    const fromId = msg.from && msg.from.id;
     if (cmd === '/anular') { await handleAnular(chatId, text, fromId); return; }
     if (cmd === '/desanular') { await handleDesanular(chatId, text, fromId); return; }
+    if (cmd === '/versao') { await handleVersao(chatId, fromId); return; }
+
+    // Nenhum comando bateu. Sem isso o bot fica MUDO em comando desconhecido —
+    // que é exatamente como um deploy velho se disfarça de bug no código.
+    // Só o dono é avisado, pra não encher os grupos com quem digita "/" à toa.
+    if (cmd.startsWith('/') && ehDono(fromId)) {
+      await sendTelegram(chatId, `❓ Comando não reconhecido: \`${escapeMd(cmd)}\`\n🔖 No ar: commit \`${COMMIT}\`\n\nDisponíveis: ${COMANDOS.join(' ')}`);
+    }
   } catch (err) {
     console.error(err);
     try {
       const chatId = (req.body.message || req.body.edited_message || {}).chat?.id;
       if (chatId) await sendTelegram(chatId, `❌ Erro: ${err.message}`);
-    } catch (_) {}
+    } catch (err2) {
+      // Aqui o bot fica mudo de verdade (nem o aviso de erro saiu): logar é a
+      // única pista que sobra.
+      console.error('falha ao avisar o chat sobre o erro:', err2.message);
+    }
   }
 });
 
 app.get('/', (req, res) => res.send('015 Pods Bot online!'));
 app.get('/ping', (req, res) => res.status(200).send('OK'));
+// Mesma info do /versao do Telegram, checável com um curl (sem abrir o Render).
+app.get('/versao', (req, res) => res.json({ commit: COMMIT, comandos: COMANDOS }));
 
 // Só sobe o servidor quando executado direto (node index.js). Quando importado
 // por um teste, expõe as funções internas sem iniciar o listener.
