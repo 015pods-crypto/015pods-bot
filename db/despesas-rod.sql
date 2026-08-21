@@ -35,7 +35,8 @@ alter table public.despesas_rod enable row level security;
 -- Ciclo vigente para um instante qualquer. Regra única do sistema: fecha SEMPRE
 -- no dia 20 às 23:59 (Brasília). Dia 21..fim-do-mês → ciclo começa neste mês;
 -- dia 1..20 → ciclo começou no dia 21 do mês passado.
--- (bot_comissao deve passar a usar esta mesma função — ver TAREFA 1.)
+-- (bot_comissao aplica a MESMA regra no próprio corpo — ver comissao-ciclo-20.sql.
+--  A duplicação é de propósito: os dois arquivos rodam em qualquer ordem.)
 create or replace function public.bot_ciclo(p_ts timestamptz default now())
 returns table (inicio date, fim date)
 language sql
