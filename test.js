@@ -247,6 +247,149 @@ teste('regressão: /comissao não passa por bot_anular_comissao', async (ctx) =>
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_anular_comissao').length, 0);
 });
 
+// --- Despesas particulares do Rod ("+25 ENTREGA ROD") ----------------------
+
+teste('"+25 ENTREGA ROD" vira despesa e responde com o acumulado do ciclo', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = {
+    status: 200,
+    body: { ok: true, id: 7, valor: 25, descricao: 'ENTREGA', total_ciclo: 143, ciclo: '21/08 → 20/09' },
+  };
+  const [resp] = await mandar(ctx.webhook, update('+25 ENTREGA ROD', { chat: GRUPO_REPOSICAO }));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar');
+  assert.strictEqual(rpc.length, 1, 'deveria registrar a despesa');
+  assert.strictEqual(rpc[0].body.p_valor, 25);
+  assert.strictEqual(rpc[0].body.p_descricao, 'ENTREGA');
+  assert.strictEqual(resp.text, '📝 Anotado: R$ 25 ENTREGA — total do ciclo: R$ 143');
+
+  // O ponto da tarefa: despesa NUNCA pode cair no fluxo de estoque.
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('despesa com centavos e ROD minúsculo também é aceita', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = {
+    status: 200, body: { ok: true, valor: 18.5, total_ciclo: 161.5 },
+  };
+  const [resp] = await mandar(ctx.webhook, update('+18,50 Uber rod', { chat: GRUPO_REPOSICAO }));
+  const rpc = chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar');
+  assert.strictEqual(rpc[0].body.p_valor, 18.5);
+  assert.strictEqual(rpc[0].body.p_descricao, 'Uber');
+  assert.strictEqual(resp.text, '📝 Anotado: R$ 18,50 Uber — total do ciclo: R$ 161,50');
+});
+
+teste('COLISÃO: "+2 ignite 50000 grape" continua indo pro estoque', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: {
+      resultados: [{
+        status: 'ok', direction: 'entrada', model: 'Ignite 50000 (V500)',
+        flavor: 'Grape', qty: 2, stock_after: 20,
+      }],
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('+2 ignite 50000 grape', { chat: GRUPO_REPOSICAO }));
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar').length, 0,
+    'não podia ter virado despesa');
+  const rpc = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
+  assert.strictEqual(rpc.length, 1);
+  assert.deepStrictEqual(rpc[0].body.p_items, [{ produto: 'ignite 50000 grape', qty: 2 }]);
+  assert.ok(resp.text.includes('Entrada registrada'), resp.text);
+});
+
+teste('despesa no grupo de VENDAS não leva bronca de "grupo errado"', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = { status: 200, body: { ok: true, valor: 30, total_ciclo: 30 } };
+  const respostasBot = await mandar(ctx.webhook, update('+30 ENTREGA ROD'));
+  const textos = respostasBot.map(r => r.text).join('\n');
+  assert.ok(textos.includes('Anotado'), textos);
+  assert.ok(!textos.includes('grupo de reposição'), `não devia reclamar de grupo: ${textos}`);
+});
+
+teste('"+25 ROD" (sem descrição) mostra o uso e não chama RPC nenhuma', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('+25 ROD', { chat: GRUPO_REPOSICAO }));
+  assert.ok(resp.text.includes('+25 ENTREGA ROD'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar').length, 0);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('falha da RPC de despesa não some em silêncio', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = { status: 500, body: { message: 'boom' } };
+  const [resp] = await mandar(ctx.webhook, update('+25 ENTREGA ROD', { chat: GRUPO_REPOSICAO }));
+  assert.ok(resp.text.includes('Não consegui anotar'), resp.text);
+  assert.ok(!resp.text.includes('boom'), 'não deve vazar o erro cru');
+});
+
+teste('mensagem mista: despesa e reposição na mesma mensagem seguem rotas diferentes', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = { status: 200, body: { ok: true, valor: 25, total_ciclo: 25 } };
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: {
+      resultados: [{
+        status: 'ok', direction: 'entrada', model: 'Ignite 8000 (V80)',
+        flavor: 'Cactus', qty: 3, stock_after: 8,
+      }],
+    },
+  };
+  await mandar(ctx.webhook, update('+25 ENTREGA ROD\n+3 ignite 8000 cactus', { chat: GRUPO_REPOSICAO }));
+
+  const despesa = chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar');
+  const estoque = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
+  assert.strictEqual(despesa.length, 1);
+  assert.strictEqual(estoque.length, 1);
+  assert.deepStrictEqual(estoque[0].body.p_items, [{ produto: 'ignite 8000 cactus', qty: 3 }]);
+});
+
+teste('/despesas lista os lançamentos do ciclo', async (ctx) => {
+  respostas.bot_despesas_rod = {
+    status: 200,
+    body: {
+      ok: true, ciclo: '21/08 → 20/09', total: 43,
+      itens: [
+        { valor: 25, descricao: 'ENTREGA', data: '21/08' },
+        { valor: 18, descricao: 'UBER', data: '22/08' },
+      ],
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/despesas'));
+  assert.ok(resp.text.includes('21/08 → 20/09'), resp.text);
+  assert.ok(resp.text.includes('R$ 25 ENTREGA'), resp.text);
+  assert.ok(resp.text.includes('Total do ciclo: R$ 43'), resp.text);
+});
+
+// --- Fechamento soma comissão + despesas -----------------------------------
+
+teste('fechamento inclui a linha de despesas e o total a pagar', async (ctx) => {
+  const texto = ctx.mod.montarFechamento(
+    { mes: '21/07 → 20/08', unidades_mes: 120, taxa_atual: 2.5, comissao: 300 },
+    { ok: true, total: 143 },
+  );
+  assert.ok(texto.includes('FECHAMENTO DO PERÍODO 21/07 → 20/08'), texto);
+  assert.ok(texto.includes('💰 Comissão: *R$ 300,00*'), texto);
+  assert.ok(texto.includes('🛵 Entregas/despesas Rod: R$ 143,00'), texto);
+  assert.ok(texto.includes('Total a pagar: R$ 443,00'), texto);
+});
+
+teste('fechamento avisa quando não conseguiu somar as despesas (não paga a menos calado)', async (ctx) => {
+  const texto = ctx.mod.montarFechamento(
+    { mes: '21/07 → 20/08', unidades_mes: 120, taxa_atual: 2.5, comissao: 300 }, null,
+  );
+  assert.ok(texto.includes('Não consegui somar'), texto);
+  assert.ok(!texto.includes('Total a pagar'), 'sem despesas confiáveis não pode anunciar total');
+});
+
+teste('o fechamento do relatório diário puxa as despesas do ciclo', async (ctx) => {
+  respostas.bot_comissao = {
+    status: 200,
+    body: {
+      ok: true, mes: '21/07 → 20/08', fecha_hoje: true, unidades_mes: 120,
+      unidades_hoje: 4, taxa_atual: 2.5, comissao: 300,
+    },
+  };
+  respostas.bot_despesas_rod = { status: 200, body: { ok: true, total: 143, itens: [] } };
+  const texto = await ctx.mod.textoComissaoRelatorio();
+  assert.ok(texto.includes('Total a pagar: R$ 443,00'), texto);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {
@@ -263,11 +406,14 @@ async function main() {
   process.env.VENDAS_CHAT_ID = String(GRUPO_VENDAS);
   process.env.REPOSICAO_CHAT_ID = String(GRUPO_REPOSICAO);
 
-  const { app } = require('./index.js');
+  const mod = require('./index.js');
+  const { app } = mod;
   const server = await new Promise(resolve => {
     const s = app.listen(0, '127.0.0.1', () => resolve(s));
   });
-  const ctx = { webhook: `http://127.0.0.1:${server.address().port}/webhook` };
+  // `mod` fica no ctx pros testes que chamam função exportada direto (fechamento),
+  // em vez de dirigir o webhook.
+  const ctx = { webhook: `http://127.0.0.1:${server.address().port}/webhook`, mod };
 
   let falhas = 0;
   for (const t of testes) {

@@ -30,7 +30,7 @@ const COMMIT = String(process.env.RENDER_GIT_COMMIT || 'desconhecido').slice(0, 
 // ele também não está na cadeia de ifs do webhook (manter os dois em sincronia).
 const COMANDOS = [
   '/start', '/ajuda', '/estoque', '/zerados', '/baixo', '/relatorio',
-  '/reposicao', '/comissao', '/anular', '/desanular', '/versao',
+  '/reposicao', '/comissao', '/despesas', '/anular', '/desanular', '/versao',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -126,6 +126,33 @@ async function readEstoque() {
     }
   }
   return produtos.filter(p => p.modelo || p.sabor);
+}
+
+// ---------------------------------------------------------------------------
+// Despesa particular do Rod: "+25 ENTREGA ROD", "+18,50 Uber Rod".
+//
+// COLISÃO DE PREFIXO: o "+" é o mesmo da reposição de estoque. A regra de
+// desempate é a palavra ROD isolada NO FIM da linha — por isso este parser roda
+// ANTES do fluxo de estoque no webhook. "+2 ignite 50000 grape" não termina em
+// ROD e continua indo pro estoque; um produto que termine em "rod" (não existe
+// hoje) passaria a ser lido como despesa, que é o comportamento pedido.
+// ---------------------------------------------------------------------------
+
+const RE_DESPESA_ROD = /^\+\s*(\d+(?:[.,]\d{1,2})?)\s+(\S.*?)\s+rod\s*$/i;
+// "+25 ROD" (valor sem descrição): não é estoque nem despesa válida — vira aviso
+// de uso, senão o estoque responderia "produto não encontrado: ROD".
+const RE_DESPESA_ROD_SEM_DESC = /^\+\s*\d+(?:[.,]\d{1,2})?\s+rod\s*$/i;
+
+function parseDespesaRod(line) {
+  const raw = (line || '').trim();
+  if (!raw) return null;
+  if (RE_DESPESA_ROD_SEM_DESC.test(raw)) return { invalid: true, raw };
+  const m = raw.match(RE_DESPESA_ROD);
+  if (!m) return null;
+  const valor = parseFloat(m[1].replace(',', '.'));
+  const descricao = m[2].trim();
+  if (!valor || valor <= 0 || !descricao) return { invalid: true, raw };
+  return { valor, descricao, raw };
 }
 
 function parseMovimentoLine(line) {
@@ -375,6 +402,13 @@ function fmtBR(n, dec = 2) {
   });
 }
 
+// Dinheiro para o texto do grupo: inteiro sai sem centavos ("R$ 25"), quebrado
+// sai no formato BR ("R$ 18,50").
+function fmtValor(n) {
+  const v = Number(n) || 0;
+  return Number.isInteger(v) ? String(v) : fmtBR(v);
+}
+
 // Busca os dados da RPC bot_comissao. Nunca lança: erro vira null.
 // `mes` é o período ("20/07 → 19/08"); `fecha_hoje` = último dia do período.
 async function dadosComissao() {
@@ -415,16 +449,99 @@ async function textoComissao() {
 async function textoComissaoRelatorio() {
   const d = await dadosComissao();
   if (!d) return '⚠️ Erro ao consultar comissão.';
-  if (d.fecha_hoje) {
-    return [
-      `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`,
-      `Total: *${d.unidades_mes ?? 0}* produtos`,
-      `Faixa final: R$ ${fmtBR(d.taxa_atual)}/produto`,
-      `💰 Comissão a pagar: *R$ ${fmtBR(d.comissao)}*`,
-      '_(amanhã começa o novo período)_',
-    ].join('\n');
-  }
+  if (d.fecha_hoje) return montarFechamento(d, await dadosDespesasRod());
   return formatComissao(d);
+}
+
+// Fechamento = comissão + despesas particulares do Rod do mesmo ciclo.
+// `desp` null = a RPC de despesas falhou: o total NÃO é somado e o texto avisa,
+// porque um total silenciosamente menor viraria pagamento errado.
+function montarFechamento(d, desp) {
+  const comissao = Number(d.comissao) || 0;
+  const linhas = [
+    `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`,
+    `Total: *${d.unidades_mes ?? 0}* produtos`,
+    `Faixa final: R$ ${fmtBR(d.taxa_atual)}/produto`,
+    `💰 Comissão: *R$ ${fmtBR(comissao)}*`,
+  ];
+  if (!desp) {
+    linhas.push('⚠️ _Não consegui somar as entregas/despesas do Rod — confira antes de pagar._');
+    linhas.push('_(amanhã começa o novo período)_');
+    return linhas.join('\n');
+  }
+  const despesas = Number(desp.total) || 0;
+  linhas.push(`🛵 Entregas/despesas Rod: R$ ${fmtBR(despesas)}`);
+  linhas.push(`🧾 *Total a pagar: R$ ${fmtBR(comissao + despesas)}*`);
+  linhas.push('_(amanhã começa o novo período)_');
+  return linhas.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Despesas particulares do Rod
+// "+25 ENTREGA ROD" no grupo → linha em despesas_rod, amarrada ao ciclo vigente
+// (21/mm → 20/mm+1, corte 20 às 23:59). Persistido no banco, nunca em memória:
+// o Render reinicia o processo a qualquer momento.
+// ---------------------------------------------------------------------------
+
+// Lê o acumulado do ciclo (RPC bot_despesas_rod). Nunca lança: erro vira null.
+async function dadosDespesasRod() {
+  try {
+    const d = await callRpc('bot_despesas_rod', { p_token: BOT_SYNC_TOKEN });
+    return d && d.ok !== false ? d : null;
+  } catch (err) {
+    console.error('despesas_rod:', err.message);
+    return null;
+  }
+}
+
+const USO_DESPESA_ROD = 'Uso: `+25 ENTREGA ROD` (valor + descrição + ROD)';
+
+// Registra cada lançamento e responde com o acumulado do ciclo — é essa linha
+// que dá visibilidade do total sem ninguém precisar somar na mão.
+async function handleDespesasRod(chatId, despesas, meta) {
+  const respostas = [];
+  for (const d of despesas) {
+    if (d.invalid) {
+      respostas.push(`❌ Não entendi \`${escapeMd(d.raw)}\`. ${USO_DESPESA_ROD}`);
+      continue;
+    }
+    let r = null;
+    try {
+      r = await callRpc('bot_despesa_rod_registrar', {
+        p_token: BOT_SYNC_TOKEN,
+        p_valor: d.valor,
+        p_descricao: d.descricao,
+        p_meta: meta || {},
+      });
+    } catch (err) {
+      console.error('bot_despesa_rod_registrar:', err.message);
+    }
+    if (!r || r.ok === false) {
+      respostas.push(`⚠️ Não consegui anotar \`${escapeMd(d.raw)}\`. Tente de novo em instantes.`);
+      continue;
+    }
+    respostas.push(
+      `📝 Anotado: R$ ${fmtValor(d.valor)} ${escapeMd(d.descricao)} — total do ciclo: R$ ${fmtValor(r.total_ciclo)}`,
+    );
+  }
+  if (respostas.length) await sendTelegram(chatId, respostas.join('\n'));
+}
+
+// /despesas — o que já foi lançado no ciclo vigente.
+async function handleDespesasLista(chatId) {
+  const d = await dadosDespesasRod();
+  if (!d) { await sendTelegram(chatId, '⚠️ Erro ao consultar as despesas do Rod.'); return; }
+  const itens = Array.isArray(d.itens) ? d.itens : [];
+  const linhas = [`🛵 *Entregas/despesas Rod — ${escapeMd(String(d.ciclo ?? ''))}*`, ''];
+  if (!itens.length) {
+    linhas.push('Nenhum lançamento neste ciclo.');
+  } else {
+    for (const it of itens) {
+      linhas.push(`• ${escapeMd(String(it.data ?? ''))} — R$ ${fmtValor(it.valor)} ${escapeMd(String(it.descricao ?? ''))}`);
+    }
+    linhas.push('', `*Total do ciclo: R$ ${fmtValor(d.total)}*`);
+  }
+  await sendTelegram(chatId, linhas.join('\n'));
 }
 
 async function handleComissao(chatId) {
@@ -506,7 +623,7 @@ async function handleDesanular(chatId, text, userId) {
   await sendTelegram(chatId, partes.join('\n'));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA ROD`';
 
 const vendasDoDia = {};
 
@@ -600,7 +717,23 @@ app.post('/webhook', async (req, res) => {
     // Movimentos com prefixo: cada grupo aceita só o seu sinal.
     //   VENDAS: só baixa (-). REPOSIÇÃO: só entrada (+). Privado: os dois.
     if (text.charAt(0) === '-' || text.charAt(0) === '+') {
-      const linhas = text.split('\n').map(l => l.trim());
+      const todas = text.split('\n').map(l => l.trim());
+
+      // Despesa do Rod ("+25 ENTREGA ROD") sai da fila ANTES do estoque: as duas
+      // rotas dividem o prefixo "+", e sem isso a despesa viraria "produto não
+      // encontrado" (e ainda levaria bronca de grupo errado no VENDAS).
+      const linhas = [];
+      const despesas = [];
+      for (const l of todas) {
+        const d = parseDespesaRod(l);
+        if (d) despesas.push(d); else linhas.push(l);
+      }
+      if (despesas.length) {
+        await handleDespesasRod(chatId, despesas, {
+          chat_id: chatId, message_id: msg.message_id, user_id: fromId,
+        });
+      }
+
       const baixas = linhas.filter(l => l.startsWith('-'));
       const entradas = linhas.filter(l => l.startsWith('+'));
 
@@ -634,6 +767,7 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/relatorio') { await handleRelatorio(chatId); return; }
     if (cmd === '/reposicao') { await handleReposicao(chatId); return; }
     if (cmd === '/comissao') { await handleComissao(chatId); return; }
+    if (cmd === '/despesas') { await handleDespesasLista(chatId); return; }
     // Só o dono: a checagem de quem mandou é feita dentro dos handlers.
     if (cmd === '/anular') { await handleAnular(chatId, text, fromId); return; }
     if (cmd === '/desanular') { await handleDesanular(chatId, text, fromId); return; }
@@ -683,6 +817,11 @@ module.exports = {
   handleRelatorio,
   handleReposicao,
   handleComissao,
+  handleDespesasRod,
+  handleDespesasLista,
+  parseDespesaRod,
+  montarFechamento,
+  fmtValor,
   handleAnular,
   handleDesanular,
   parseUnidadesComando,
