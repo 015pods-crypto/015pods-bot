@@ -30,8 +30,8 @@ const COMMIT = String(process.env.RENDER_GIT_COMMIT || 'desconhecido').slice(0, 
 // ele também não está na cadeia de ifs do webhook (manter os dois em sincronia).
 const COMANDOS = [
   '/start', '/ajuda', '/estoque', '/zerados', '/baixo', '/relatorio',
-  '/reposicao', '/comissao', '/despesas', '/anular', '/desanular',
-  '/refazerfechamento', '/versao',
+  '/reposicao', '/comissao', '/despesas', '/dinheiro', '/geral',
+  '/anular', '/desanular', '/refazerfechamento', '/versao',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -130,30 +130,94 @@ async function readEstoque() {
 }
 
 // ---------------------------------------------------------------------------
-// Despesa particular do Rod: "+25 ENTREGA ROD", "+18,50 Uber Rod".
+// Registros do Rod: DESPESA ("+25 ENTREGA") e DINHEIRO ("+100 DINHEIRO").
 //
-// COLISÃO DE PREFIXO: o "+" é o mesmo da reposição de estoque. A regra de
-// desempate é a palavra ROD isolada NO FIM da linha — por isso este parser roda
-// ANTES do fluxo de estoque no webhook. "+2 ignite 50000 grape" não termina em
-// ROD e continua indo pro estoque; um produto que termine em "rod" (não existe
-// hoje) passaria a ser lido como despesa, que é o comportamento pedido.
+// COLISÃO DE PREFIXO: o "+" é o mesmo da reposição de estoque. O desempate é a
+// PRIMEIRA PALAVRA depois do número — e só ela:
+//   1. DINHEIRO (palavra reservada, categoria própria)  -> tipo 'dinheiro'
+//   2. linha terminada em ROD isolado (formato antigo)  -> tipo 'despesa'
+//   3. palavra na lista `bot_despesa_palavras` do banco -> tipo 'despesa'
+//   4. qualquer outra coisa                             -> estoque (inalterado)
+// Produto com typo cai no caso 4 e continua respondendo "não encontrado": a
+// regra NUNCA transforma erro de digitação de produto em despesa silenciosa.
+//
+// Os dois sinais contábeis são opostos e por isso não podem virar o mesmo tipo:
+// despesa = a loja DEVE ao Rod; dinheiro = o Rod está COM dinheiro da loja.
 // ---------------------------------------------------------------------------
 
 const RE_DESPESA_ROD = /^\+\s*(\d+(?:[.,]\d{1,2})?)\s+(\S.*?)\s+rod\s*$/i;
 // "+25 ROD" (valor sem descrição): não é estoque nem despesa válida — vira aviso
 // de uso, senão o estoque responderia "produto não encontrado: ROD".
 const RE_DESPESA_ROD_SEM_DESC = /^\+\s*\d+(?:[.,]\d{1,2})?\s+rod\s*$/i;
+// "+VALOR PALAVRA [complemento livre]" — a palavra é m[2], o complemento m[3].
+const RE_VALOR_PALAVRA = /^\+\s*(\d+(?:[.,]\d{1,2})?)\s+(\S+)(?:\s+(.*\S))?\s*$/;
 
-function parseDespesaRod(line) {
+// Palavra reservada do dinheiro em mãos. NÃO entra em bot_despesa_palavras.
+const PALAVRA_DINHEIRO = 'DINHEIRO';
+
+// Rede de segurança: se o config sumir ou o banco estiver fora do ar, estas
+// palavras continuam valendo. Tipo NOVO de despesa é update no config (sem
+// deploy) — esta lista existe só pra não deixar o Rod sem registrar nada.
+const PALAVRAS_DESPESA_PADRAO = ['ENTREGA', 'UBER', 'GASOLINA'];
+
+// Cache da lista vinda do banco (~1 min). Só sucesso atualiza o cache: falha
+// mantém o último valor bom em vez de gravar uma lista vazia por um minuto.
+let cachePalavras = { at: 0, lista: null };
+const PALAVRAS_TTL_MS = 60 * 1000;
+
+async function palavrasDespesa() {
+  if (cachePalavras.lista && Date.now() - cachePalavras.at < PALAVRAS_TTL_MS) {
+    return cachePalavras.lista;
+  }
+  try {
+    const d = await callRpc('bot_config', { p_token: BOT_SYNC_TOKEN, p_key: 'bot_despesa_palavras' });
+    const csv = d && d.ok !== false ? String(d.valor ?? '') : '';
+    const lista = csv.split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+    if (lista.length) {
+      cachePalavras = { at: Date.now(), lista };
+      return lista;
+    }
+  } catch (err) {
+    console.error('bot_config bot_despesa_palavras:', err.message);
+  }
+  return cachePalavras.lista || PALAVRAS_DESPESA_PADRAO;
+}
+
+// `palavras` é a lista já resolvida (o parser é síncrono de propósito: o
+// webhook busca a lista uma vez por mensagem e reusa em todas as linhas).
+function parseRegistroRod(line, palavras) {
   const raw = (line || '').trim();
-  if (!raw) return null;
+  if (!raw || raw.charAt(0) !== '+') return null;
   if (RE_DESPESA_ROD_SEM_DESC.test(raw)) return { invalid: true, raw };
-  const m = raw.match(RE_DESPESA_ROD);
-  if (!m) return null;
-  const valor = parseFloat(m[1].replace(',', '.'));
-  const descricao = m[2].trim();
-  if (!valor || valor <= 0 || !descricao) return { invalid: true, raw };
-  return { valor, descricao, raw };
+
+  const m = raw.match(RE_VALOR_PALAVRA);
+  const palavra = m ? m[2].toUpperCase() : null;
+  const valor = m ? parseFloat(m[1].replace(',', '.')) : null;
+  const resto = m ? [m[2], m[3]].filter(Boolean).join(' ').trim() : '';
+
+  // 1. DINHEIRO tem prioridade sobre tudo: é palavra reservada.
+  if (palavra === PALAVRA_DINHEIRO) {
+    if (!valor || valor <= 0) return { invalid: true, raw };
+    return { tipo: 'dinheiro', valor, descricao: resto, raw };
+  }
+
+  // 2. Formato antigo "+25 ENTREGA ROD" — antes da lista, senão "Uber rod"
+  //    guardaria a descrição com o "rod" grudado no fim.
+  const rod = raw.match(RE_DESPESA_ROD);
+  if (rod) {
+    const v = parseFloat(rod[1].replace(',', '.'));
+    const desc = rod[2].trim();
+    if (!v || v <= 0 || !desc) return { invalid: true, raw };
+    return { tipo: 'despesa', valor: v, descricao: desc, raw };
+  }
+
+  // 3. Primeira palavra na lista de despesa (case-insensitive).
+  if (palavra && palavras.includes(palavra)) {
+    if (!valor || valor <= 0) return { invalid: true, raw };
+    return { tipo: 'despesa', valor, descricao: resto, raw };
+  }
+
+  return null; // 4. estoque
 }
 
 function parseMovimentoLine(line) {
@@ -450,16 +514,30 @@ async function textoComissao() {
 async function textoComissaoRelatorio() {
   const d = await dadosComissao();
   if (!d) return '⚠️ Erro ao consultar comissão.';
-  if (d.fecha_hoje) return montarFechamento(d, await dadosDespesasRod());
+  if (d.fecha_hoje) {
+    return montarFechamento(d, await dadosRegistrosRod(), await dadosRegistrosRod(null, 'dinheiro'));
+  }
   return formatComissao(d);
 }
 
-// Fechamento = comissão + despesas particulares do Rod do mesmo ciclo.
-// `desp` null = a RPC de despesas falhou: o total NÃO é somado e o texto avisa,
+// Acerto do ciclo: dinheiro em mãos do Rod − (comissão + despesas).
+//   positivo -> sobra dinheiro da loja com o Rod: ele repassa a diferença.
+//   negativo -> a loja ainda deve: paga a diferença ao Rod.
+// (Convenção do sistema; trocar o sinal é trocar estas duas linhas.)
+function linhaAcerto(dinheiro, aPagar) {
+  const acerto = Number(dinheiro) - Number(aPagar);
+  if (Math.abs(acerto) < 0.005) return '⚖️ Acerto: *zerado* (nada a repassar)';
+  return acerto > 0
+    ? `⚖️ Acerto: *Rod repassa R$ ${fmtBR(acerto)}* no fechamento`
+    : `⚖️ Acerto: *Loja paga R$ ${fmtBR(-acerto)} ao Rod*`;
+}
+
+// Fechamento = comissão + despesas do Rod + dinheiro em mãos do mesmo ciclo.
+// `desp`/`dinh` null = a RPC falhou: o total NÃO é somado e o texto avisa,
 // porque um total silenciosamente menor viraria pagamento errado.
 // `opts` troca título/rodapé — é como o /refazerfechamento publica a correção
 // sem se passar por um fechamento novo.
-function montarFechamento(d, desp, opts = {}) {
+function montarFechamento(d, desp, dinh, opts = {}) {
   const comissao = Number(d.comissao) || 0;
   const titulo = opts.titulo || `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`;
   const rodape = opts.rodape || '_(amanhã começa o novo período)_';
@@ -469,31 +547,42 @@ function montarFechamento(d, desp, opts = {}) {
     `Faixa final: R$ ${fmtBR(d.taxa_atual)}/produto`,
     `💰 Comissão: *R$ ${fmtBR(comissao)}*`,
   ];
+  let aPagar = null;
   if (!desp) {
     linhas.push('⚠️ _Não consegui somar as entregas/despesas do Rod — confira antes de pagar._');
   } else {
     const despesas = Number(desp.total) || 0;
+    aPagar = comissao + despesas;
     linhas.push(`🛵 Entregas/despesas Rod: R$ ${fmtBR(despesas)}`);
-    linhas.push(`🧾 *Total a pagar: R$ ${fmtBR(comissao + despesas)}*`);
+    linhas.push(`🧾 *Total a pagar: R$ ${fmtBR(aPagar)}*`);
+  }
+  if (!dinh) {
+    linhas.push('⚠️ _Não consegui somar o dinheiro em mãos do Rod — confira antes de acertar._');
+  } else {
+    const dinheiro = Number(dinh.total) || 0;
+    linhas.push(`💵 Dinheiro em mãos (Rod): R$ ${fmtBR(dinheiro)}`);
+    if (aPagar != null) linhas.push(linhaAcerto(dinheiro, aPagar));
   }
   linhas.push(rodape);
   return linhas.join('\n');
 }
 
 // ---------------------------------------------------------------------------
-// Despesas particulares do Rod
-// "+25 ENTREGA ROD" no grupo → linha em despesas_rod, amarrada ao ciclo vigente
-// (21/mm → 20/mm+1, corte 20 às 23:59). Persistido no banco, nunca em memória:
-// o Render reinicia o processo a qualquer momento.
+// Registros do Rod (despesa + dinheiro em mãos)
+// "+25 ENTREGA" / "+100 DINHEIRO" no grupo → linha em despesas_rod (coluna
+// `tipo`), amarrada ao ciclo vigente (21/mm → 20/mm+1, corte 20 às 23:59).
+// Persistido no banco, nunca em memória: o Render reinicia o processo a
+// qualquer momento.
 // ---------------------------------------------------------------------------
 
 // Lê o acumulado do ciclo (RPC bot_despesas_rod). Nunca lança: erro vira null.
 // `ref` (ISO YYYY-MM-DD) consulta o ciclo de outra data — usado ao refazer um
-// fechamento passado.
-async function dadosDespesasRod(ref) {
+// fechamento passado. `tipo` = 'despesa' (padrão) ou 'dinheiro'.
+async function dadosRegistrosRod(ref, tipo) {
   try {
     const body = { p_token: BOT_SYNC_TOKEN };
     if (ref) body.p_ref = ref;
+    if (tipo) body.p_tipo = tipo;
     const d = await callRpc('bot_despesas_rod', body);
     return d && d.ok !== false ? d : null;
   } catch (err) {
@@ -502,15 +591,16 @@ async function dadosDespesasRod(ref) {
   }
 }
 
-const USO_DESPESA_ROD = 'Uso: `+25 ENTREGA ROD` (valor + descrição + ROD)';
+const USO_REGISTRO_ROD =
+  'Uso: `+25 ENTREGA` (valor + palavra de despesa) ou `+100 DINHEIRO`';
 
 // Registra cada lançamento e responde com o acumulado do ciclo — é essa linha
 // que dá visibilidade do total sem ninguém precisar somar na mão.
-async function handleDespesasRod(chatId, despesas, meta) {
+async function handleRegistrosRod(chatId, registros, meta) {
   const respostas = [];
-  for (const d of despesas) {
+  for (const d of registros) {
     if (d.invalid) {
-      respostas.push(`❌ Não entendi \`${escapeMd(d.raw)}\`. ${USO_DESPESA_ROD}`);
+      respostas.push(`❌ Não entendi \`${escapeMd(d.raw)}\`. ${USO_REGISTRO_ROD}`);
       continue;
     }
     let r = null;
@@ -519,6 +609,7 @@ async function handleDespesasRod(chatId, despesas, meta) {
         p_token: BOT_SYNC_TOKEN,
         p_valor: d.valor,
         p_descricao: d.descricao,
+        p_tipo: d.tipo,
         p_meta: meta || {},
       });
     } catch (err) {
@@ -529,26 +620,92 @@ async function handleDespesasRod(chatId, despesas, meta) {
       continue;
     }
     respostas.push(
-      `📝 Anotado: R$ ${fmtValor(d.valor)} ${escapeMd(d.descricao)} — total do ciclo: R$ ${fmtValor(r.total_ciclo)}`,
+      d.tipo === 'dinheiro'
+        ? `💵 Anotado: R$ ${fmtValor(d.valor)} em DINHEIRO — total em mãos no ciclo: R$ ${fmtValor(r.total_ciclo)}`
+        : `📝 Anotado: R$ ${fmtValor(d.valor)} ${escapeMd(d.descricao)} — total do ciclo: R$ ${fmtValor(r.total_ciclo)}`,
     );
   }
   if (respostas.length) await sendTelegram(chatId, respostas.join('\n'));
 }
 
-// /despesas — o que já foi lançado no ciclo vigente.
-async function handleDespesasLista(chatId) {
-  const d = await dadosDespesasRod();
-  if (!d) { await sendTelegram(chatId, '⚠️ Erro ao consultar as despesas do Rod.'); return; }
+// Lista de lançamentos de um tipo no ciclo vigente (/despesas e /dinheiro).
+async function handleListaRod(chatId, tipo) {
+  const dinheiro = tipo === 'dinheiro';
+  const d = await dadosRegistrosRod(null, tipo);
+  if (!d) {
+    await sendTelegram(chatId, dinheiro
+      ? '⚠️ Erro ao consultar o dinheiro em mãos.'
+      : '⚠️ Erro ao consultar as despesas do Rod.');
+    return;
+  }
   const itens = Array.isArray(d.itens) ? d.itens : [];
-  const linhas = [`🛵 *Entregas/despesas Rod — ${escapeMd(String(d.ciclo ?? ''))}*`, ''];
+  const cabecalho = dinheiro
+    ? `💵 *Dinheiro em mãos (Rod) — ${escapeMd(String(d.ciclo ?? ''))}*`
+    : `🛵 *Entregas/despesas Rod — ${escapeMd(String(d.ciclo ?? ''))}*`;
+  const linhas = [cabecalho, ''];
   if (!itens.length) {
     linhas.push('Nenhum lançamento neste ciclo.');
   } else {
     for (const it of itens) {
-      linhas.push(`• ${escapeMd(String(it.data ?? ''))} — R$ ${fmtValor(it.valor)} ${escapeMd(String(it.descricao ?? ''))}`);
+      const desc = escapeMd(String(it.descricao ?? '')).trim();
+      linhas.push(`• ${escapeMd(String(it.data ?? ''))} — R$ ${fmtValor(it.valor)}${desc ? ' ' + desc : ''}`);
     }
-    linhas.push('', `*Total do ciclo: R$ ${fmtValor(d.total)}*`);
+    linhas.push('', dinheiro
+      ? `*Total em mãos no ciclo: R$ ${fmtValor(d.total)}*`
+      : `*Total do ciclo: R$ ${fmtValor(d.total)}*`);
   }
+  await sendTelegram(chatId, linhas.join('\n'));
+}
+
+// /geral — painel do ciclo vigente: comissão, despesas, dinheiro e o acerto.
+// As três fontes são independentes; se uma falhar o painel diz QUAL falhou em
+// vez de mostrar um número errado (o acerto só sai com as três disponíveis).
+async function handleGeral(chatId) {
+  const [com, desp, dinh] = await Promise.all([
+    dadosComissao(),
+    dadosRegistrosRod(null, 'despesa'),
+    dadosRegistrosRod(null, 'dinheiro'),
+  ]);
+
+  const ciclo = (com && com.mes) || (desp && desp.ciclo) || (dinh && dinh.ciclo) || '';
+  const linhas = [`📋 *Geral — ${escapeMd(String(ciclo))}*`, ''];
+
+  const comissao = com ? Number(com.comissao) || 0 : null;
+  if (!com) {
+    linhas.push('💰 *Comissão*: ⚠️ não consegui consultar');
+  } else {
+    linhas.push('💰 *Comissão*');
+    linhas.push(`Unidades: *${com.unidades_mes ?? 0}* · faixa R$ ${fmtBR(com.taxa_atual)}/un`);
+    linhas.push(`Total: *R$ ${fmtBR(comissao)}*`);
+  }
+
+  const despesas = desp ? Number(desp.total) || 0 : null;
+  linhas.push('');
+  if (!desp) {
+    linhas.push('🛵 *Despesas Rod*: ⚠️ não consegui consultar');
+  } else {
+    const n = Array.isArray(desp.itens) ? desp.itens.length : 0;
+    linhas.push('🛵 *Despesas Rod*');
+    linhas.push(`${n} lançamento(s) → *R$ ${fmtBR(despesas)}*`);
+  }
+
+  const dinheiro = dinh ? Number(dinh.total) || 0 : null;
+  linhas.push('');
+  if (!dinh) {
+    linhas.push('💵 *Dinheiro em mãos*: ⚠️ não consegui consultar');
+  } else {
+    const n = Array.isArray(dinh.itens) ? dinh.itens.length : 0;
+    linhas.push('💵 *Dinheiro em mãos*');
+    linhas.push(`${n} lançamento(s) → *R$ ${fmtBR(dinheiro)}*`);
+  }
+
+  linhas.push('');
+  if (comissao == null || despesas == null || dinheiro == null) {
+    linhas.push('⚖️ *Acerto*: ⚠️ falta dado acima — não dá pra fechar a conta.');
+  } else {
+    linhas.push(linhaAcerto(dinheiro, comissao + despesas));
+  }
+
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
@@ -600,7 +757,7 @@ async function handleRefazerFechamento(chatId, text, userId) {
   }
 
   const [, mes, dia] = data.split('-');
-  const texto = montarFechamento(d, await dadosDespesasRod(data), {
+  const texto = montarFechamento(d, await dadosRegistrosRod(data), await dadosRegistrosRod(data, 'dinheiro'), {
     titulo: `🔁 *FECHAMENTO CORRIGIDO — ${escapeMd(String(d.mes ?? ''))}*`,
     rodape: `_Novo corte: ${dia}/${mes} às 23:59. Substitui o fechamento anterior._`,
   });
@@ -616,7 +773,12 @@ async function handleRefazerFechamento(chatId, text, userId) {
 // Baixa que não é venda (troca, uso interno) não deve gerar comissão. As RPCs
 // bot_anular_comissao / bot_desanular_comissao só marcam/desmarcam as últimas N
 // unidades baixadas: o ESTOQUE não é tocado e /comissao já ignora as anuladas.
-// Restrito ao dono (ADMIN_USER_ID) — funcionário recebe recusa.
+//
+// QUEM PODE: /anular é de QUALQUER membro — anular só REDUZ a comissão do Rod,
+// então o pior caso é ele se descontar sozinho. /desanular continua só do dono
+// (ADMIN_USER_ID) porque AUMENTA a comissão, e isso fica na mão do Lucas.
+// Todo /anular grava o autor no ajuste (bot_anular_comissao_autor) — auditoria
+// simples de "quem apertou".
 // ---------------------------------------------------------------------------
 
 const ANULAR_MIN = 1;
@@ -635,10 +797,30 @@ function ehDono(userId) {
   return String(userId ?? '') === ADMIN_USER_ID;
 }
 
+// Nome LEGÍVEL do autor: "Rodrigo Silva" ou "@rodrigo". String vazia quando o
+// Telegram não mandou nenhum dos dois — de propósito: "(por 5984124812)" no
+// grupo é ruído, não informação. O id não se perde, vai no meta do registro.
+function nomeAutor(from) {
+  if (!from) return '';
+  const nome = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
+  if (nome) return nome;
+  return from.username ? `@${from.username}` : '';
+}
+
+// Erro de RPC que ainda não existe no banco (Run não aplicado). É o que separa
+// "falta rodar o SQL" de "o servidor caiu" — no primeiro caso dá pra cair no
+// fallback sem autor em vez de deixar o /anular quebrado.
+function rpcAusente(mensagem) {
+  return /HTTP 404|schema cache|Could not find the function|does not exist/i.test(mensagem || '');
+}
+
 // Chama a RPC de (des)anulação sem nunca lançar: devolve { ok, data, msg }.
-async function chamarRpcComissao(fn, unidades) {
+// `meta` (opcional) vira p_meta — o registro de quem pediu a anulação.
+async function chamarRpcComissao(fn, unidades, meta) {
   try {
-    const data = await callRpc(fn, { p_token: BOT_SYNC_TOKEN, p_unidades: unidades });
+    const body = { p_token: BOT_SYNC_TOKEN, p_unidades: unidades };
+    if (meta) body.p_meta = meta;
+    const data = await callRpc(fn, body);
     if (!data || data.ok === false) {
       const detalhe = data && (data.erro || data.msg || data.aviso);
       return { ok: false, msg: `⚠️ ${detalhe || 'Não foi possível concluir a operação.'}` };
@@ -646,22 +828,36 @@ async function chamarRpcComissao(fn, unidades) {
     return { ok: true, data };
   } catch (err) {
     console.error(`${fn}:`, err.message);
-    return { ok: false, msg: '⚠️ Erro ao falar com o servidor. Tente de novo em instantes.' };
+    return {
+      ok: false,
+      ausente: rpcAusente(err.message),
+      msg: '⚠️ Erro ao falar com o servidor. Tente de novo em instantes.',
+    };
   }
 }
 
-async function handleAnular(chatId, text, userId) {
-  if (!ehDono(userId)) { await sendTelegram(chatId, '⛔ Só o dono pode anular comissão.'); return; }
+async function handleAnular(chatId, text, from) {
   const unidades = parseUnidadesComando(text);
   if (unidades == null) {
     await sendTelegram(chatId, `Uso: /anular 10 (${ANULAR_MIN} a ${ANULAR_MAX})`);
     return;
   }
-  const r = await chamarRpcComissao('bot_anular_comissao', unidades);
+  const autor = nomeAutor(from);
+  const meta = { user_id: from && from.id != null ? String(from.id) : null, nome: autor };
+
+  // Preferimos a versão que carimba o autor no ajuste. Se o Run dela ainda não
+  // foi aplicado, a anulação AINDA ACONTECE pela RPC antiga — perder auditoria
+  // é ruim, deixar o Rod sem conseguir anular venda errada é pior.
+  let r = await chamarRpcComissao('bot_anular_comissao_autor', unidades, meta);
+  if (!r.ok && r.ausente) {
+    console.error('bot_anular_comissao_autor ausente — caindo na RPC sem autor');
+    r = await chamarRpcComissao('bot_anular_comissao', unidades);
+  }
   if (!r.ok) { await sendTelegram(chatId, r.msg); return; }
 
   // A RPC é um contador puro: devolve só { ok, unidades_anuladas }.
-  await sendTelegram(chatId, `✂️ ${r.data.unidades_anuladas ?? 0} unidade(s) descontada(s) da comissão.`);
+  const porQuem = autor ? ` (por ${escapeMd(autor)})` : '';
+  await sendTelegram(chatId, `✂️ ${r.data.unidades_anuladas ?? 0} unidade(s) descontada(s) da comissão.${porQuem}`);
 }
 
 // Diagnóstico: qual commit está no ar e quais comandos ESTA versão conhece.
@@ -671,8 +867,9 @@ async function handleVersao(chatId, userId) {
   await sendTelegram(chatId, `🔖 *Versão no ar*\nCommit: \`${COMMIT}\`\nComandos: ${COMANDOS.join(' ')}`);
 }
 
+// Só o dono: desanular AUMENTA a comissão (ao contrário do /anular, liberado).
 async function handleDesanular(chatId, text, userId) {
-  if (!ehDono(userId)) { await sendTelegram(chatId, '⛔ Só o dono pode anular comissão.'); return; }
+  if (!ehDono(userId)) { await sendTelegram(chatId, '⛔ Só o dono pode desanular comissão.'); return; }
   const unidades = parseUnidadesComando(text);
   if (unidades == null) {
     await sendTelegram(chatId, `Uso: /desanular 10 (${ANULAR_MIN} a ${ANULAR_MAX})`);
@@ -686,7 +883,7 @@ async function handleDesanular(chatId, text, userId) {
   await sendTelegram(chatId, partes.join('\n'));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA ROD`';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`';
 
 const vendasDoDia = {};
 
@@ -782,18 +979,21 @@ app.post('/webhook', async (req, res) => {
     if (text.charAt(0) === '-' || text.charAt(0) === '+') {
       const todas = text.split('\n').map(l => l.trim());
 
-      // Despesa do Rod ("+25 ENTREGA ROD") sai da fila ANTES do estoque: as duas
-      // rotas dividem o prefixo "+", e sem isso a despesa viraria "produto não
-      // encontrado" (e ainda levaria bronca de grupo errado no VENDAS).
+      // Despesa ("+25 ENTREGA") e dinheiro ("+100 DINHEIRO") saem da fila ANTES
+      // do estoque: as três rotas dividem o prefixo "+", e sem isso o registro
+      // viraria "produto não encontrado" (e ainda levaria bronca de grupo
+      // errado no VENDAS). A lista de palavras é buscada UMA vez por mensagem.
+      const palavras = todas.some(l => l.charAt(0) === '+') ? await palavrasDespesa() : [];
       const linhas = [];
-      const despesas = [];
+      const registros = [];
       for (const l of todas) {
-        const d = parseDespesaRod(l);
-        if (d) despesas.push(d); else linhas.push(l);
+        const d = parseRegistroRod(l, palavras);
+        if (d) registros.push(d); else linhas.push(l);
       }
-      if (despesas.length) {
-        await handleDespesasRod(chatId, despesas, {
-          chat_id: chatId, message_id: msg.message_id, user_id: fromId,
+      if (registros.length) {
+        await handleRegistrosRod(chatId, registros, {
+          chat_id: chatId, message_id: msg.message_id,
+          user_id: fromId, nome: nomeAutor(msg.from),
         });
       }
 
@@ -830,9 +1030,12 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/relatorio') { await handleRelatorio(chatId); return; }
     if (cmd === '/reposicao') { await handleReposicao(chatId); return; }
     if (cmd === '/comissao') { await handleComissao(chatId); return; }
-    if (cmd === '/despesas') { await handleDespesasLista(chatId); return; }
-    // Só o dono: a checagem de quem mandou é feita dentro dos handlers.
-    if (cmd === '/anular') { await handleAnular(chatId, text, fromId); return; }
+    if (cmd === '/despesas') { await handleListaRod(chatId, 'despesa'); return; }
+    if (cmd === '/dinheiro') { await handleListaRod(chatId, 'dinheiro'); return; }
+    if (cmd === '/geral') { await handleGeral(chatId); return; }
+    // /anular é liberado (registra o autor); /desanular e /refazerfechamento
+    // continuam só do dono — a checagem é feita dentro dos handlers.
+    if (cmd === '/anular') { await handleAnular(chatId, text, msg.from); return; }
     if (cmd === '/desanular') { await handleDesanular(chatId, text, fromId); return; }
     if (cmd === '/refazerfechamento') { await handleRefazerFechamento(chatId, text, fromId); return; }
     if (cmd === '/versao') { await handleVersao(chatId, fromId); return; }
@@ -881,10 +1084,14 @@ module.exports = {
   handleRelatorio,
   handleReposicao,
   handleComissao,
-  handleDespesasRod,
-  handleDespesasLista,
-  parseDespesaRod,
+  handleRegistrosRod,
+  handleListaRod,
+  handleGeral,
+  parseRegistroRod,
+  palavrasDespesa,
   montarFechamento,
+  linhaAcerto,
+  nomeAutor,
   fmtValor,
   handleRefazerFechamento,
   parseDataComando,

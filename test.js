@@ -34,7 +34,10 @@ async function subirFalsos() {
     let body = null;
     try { body = JSON.parse(raw); } catch (_) {}
     chamadas.push({ fn, body });
-    const r = respostas[fn] || { status: 200, body: {} };
+    // Resposta pode ser função de (body): é o que permite a mesma RPC devolver
+    // coisas diferentes por p_tipo (bot_despesas_rod despesa vs dinheiro).
+    const bruta = respostas[fn];
+    const r = (typeof bruta === 'function' ? bruta(body) : bruta) || { status: 200, body: {} };
     res.writeHead(r.status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(r.body));
   });
@@ -54,12 +57,12 @@ const GRUPO_REPOSICAO = -200;
 
 let updateId = 1;
 
-function update(text, { from = DONO, chat = GRUPO_VENDAS, tipo = 'group' } = {}) {
+function update(text, { from = DONO, chat = GRUPO_VENDAS, tipo = 'group', nome } = {}) {
   return {
     update_id: updateId++,
     message: {
       message_id: updateId,
-      from: { id: from },
+      from: nome ? { id: from, first_name: nome } : { id: from },
       chat: { id: chat, type: tipo },
       text,
     },
@@ -93,22 +96,45 @@ function teste(nome, fn) { testes.push({ nome, fn }); }
 
 // ---------------------------------------------------------------------------
 
-teste('/anular 2 pelo dono chama a RPC e responde só o contador', async (ctx) => {
-  respostas.bot_anular_comissao = { status: 200, body: { ok: true, unidades_anuladas: 2 } };
+teste('/anular 2 chama a RPC com autor e responde só o contador', async (ctx) => {
+  respostas.bot_anular_comissao_autor = { status: 200, body: { ok: true, unidades_anuladas: 2 } };
   const [resp] = await mandar(ctx.webhook, update('/anular 2'));
 
-  const rpc = chamadas.filter(c => c.fn === 'bot_anular_comissao');
-  assert.strictEqual(rpc.length, 1, 'deveria chamar bot_anular_comissao uma vez');
+  const rpc = chamadas.filter(c => c.fn === 'bot_anular_comissao_autor');
+  assert.strictEqual(rpc.length, 1, 'deveria chamar bot_anular_comissao_autor uma vez');
   assert.strictEqual(rpc[0].body.p_unidades, 2);
   assert.strictEqual(rpc[0].body.p_token, 'token-de-teste');
+  assert.strictEqual(rpc[0].body.p_meta.user_id, String(DONO));
 
   assert.strictEqual(resp.text, '✂️ 2 unidade(s) descontada(s) da comissão.');
+});
+
+// AJUSTE 2: qualquer membro pode anular (só REDUZ a comissão do Rod).
+teste('/anular pelo Rodrigo funciona e registra quem apertou', async (ctx) => {
+  respostas.bot_anular_comissao_autor = { status: 200, body: { ok: true, unidades_anuladas: 1 } };
+  const [resp] = await mandar(ctx.webhook, update('/anular 1', { from: FUNCIONARIO, nome: 'Rodrigo' }));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_anular_comissao_autor');
+  assert.strictEqual(rpc.length, 1, 'funcionário deveria conseguir anular');
+  assert.strictEqual(rpc[0].body.p_meta.user_id, String(FUNCIONARIO));
+  assert.strictEqual(rpc[0].body.p_meta.nome, 'Rodrigo');
+  assert.strictEqual(resp.text, '✂️ 1 unidade(s) descontada(s) da comissão. (por Rodrigo)');
+});
+
+// Sem o Run do autor aplicado, anular NÃO pode quebrar: cai na RPC antiga.
+teste('/anular cai na RPC sem autor se bot_anular_comissao_autor não existe', async (ctx) => {
+  respostas.bot_anular_comissao_autor = { status: 404, body: { message: 'Could not find the function' } };
+  respostas.bot_anular_comissao = { status: 200, body: { ok: true, unidades_anuladas: 4 } };
+  const [resp] = await mandar(ctx.webhook, update('/anular 4', { from: FUNCIONARIO, nome: 'Rodrigo' }));
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_anular_comissao').length, 1, 'faltou o fallback');
+  assert.strictEqual(resp.text, '✂️ 4 unidade(s) descontada(s) da comissão. (por Rodrigo)');
 });
 
 // A RPC virou contador puro. Se um dia voltar a mandar itens/aviso, o bot
 // continua respondendo só a linha do contador.
 teste('/anular ignora itens e aviso se a RPC mandar', async (ctx) => {
-  respostas.bot_anular_comissao = {
+  respostas.bot_anular_comissao_autor = {
     status: 200,
     body: {
       ok: true,
@@ -121,16 +147,9 @@ teste('/anular ignora itens e aviso se a RPC mandar', async (ctx) => {
   assert.strictEqual(resp.text, '✂️ 3 unidade(s) descontada(s) da comissão.');
 });
 
-teste('/anular pelo funcionário é recusado e não chega na RPC', async (ctx) => {
-  respostas.bot_anular_comissao = { status: 200, body: { ok: true, unidades_anuladas: 2 } };
-  const [resp] = await mandar(ctx.webhook, update('/anular 2', { from: FUNCIONARIO }));
-  assert.strictEqual(resp.text, '⛔ Só o dono pode anular comissão.');
-  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_anular_comissao').length, 0);
-});
-
-teste('/desanular pelo funcionário é recusado', async (ctx) => {
+teste('/desanular pelo funcionário é recusado (aumenta comissão: só o dono)', async (ctx) => {
   const [resp] = await mandar(ctx.webhook, update('/desanular 2', { from: FUNCIONARIO }));
-  assert.strictEqual(resp.text, '⛔ Só o dono pode anular comissão.');
+  assert.strictEqual(resp.text, '⛔ Só o dono pode desanular comissão.');
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_desanular_comissao').length, 0);
 });
 
@@ -139,7 +158,7 @@ teste('/anular sem número ou fora de 1..50 mostra o uso', async (ctx) => {
     const [resp] = await mandar(ctx.webhook, update(texto));
     assert.strictEqual(resp.text, 'Uso: /anular 10 (1 a 50)', `para: ${texto}`);
   }
-  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_anular_comissao').length, 0);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_anular_comissao_autor').length, 0);
 });
 
 teste('/desanular sem número mostra o uso', async (ctx) => {
@@ -158,7 +177,7 @@ teste('/desanular 2 pelo dono devolve as unidades', async (ctx) => {
 });
 
 teste('/anular funciona no grupo de reposição e no privado do dono', async (ctx) => {
-  respostas.bot_anular_comissao = { status: 200, body: { ok: true, unidades_anuladas: 1 } };
+  respostas.bot_anular_comissao_autor = { status: 200, body: { ok: true, unidades_anuladas: 1 } };
   const esperado = '✂️ 1 unidade(s) descontada(s) da comissão.';
 
   const [noReposicao] = await mandar(ctx.webhook, update('/anular 1', { chat: GRUPO_REPOSICAO }));
@@ -169,18 +188,21 @@ teste('/anular funciona no grupo de reposição e no privado do dono', async (ct
 });
 
 teste('erro da RPC vira mensagem amigável e o webhook continua vivo', async (ctx) => {
-  respostas.bot_anular_comissao = { status: 500, body: { message: 'boom' } };
+  // 500 não é "RPC ausente": não pode cair no fallback, tem que avisar.
+  respostas.bot_anular_comissao_autor = { status: 500, body: { message: 'boom' } };
   const [erro] = await mandar(ctx.webhook, update('/anular 2'));
   assert.ok(erro.text.includes('Erro ao falar com o servidor'), erro.text);
   assert.ok(!erro.text.includes('boom'), 'não deve vazar o erro cru da RPC');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_anular_comissao').length, 0,
+    '500 não é RPC ausente — não podia tentar a antiga');
 
   // ok:false também é tratado
-  respostas.bot_anular_comissao = { status: 200, body: { ok: false, erro: 'nada a anular' } };
+  respostas.bot_anular_comissao_autor = { status: 200, body: { ok: false, erro: 'nada a anular' } };
   const [recusa] = await mandar(ctx.webhook, update('/anular 2'));
   assert.ok(recusa.text.includes('nada a anular'), recusa.text);
 
   // e o bot segue respondendo normalmente depois
-  respostas.bot_anular_comissao = { status: 200, body: { ok: true, unidades_anuladas: 1 } };
+  respostas.bot_anular_comissao_autor = { status: 200, body: { ok: true, unidades_anuladas: 1 } };
   const [depois] = await mandar(ctx.webhook, update('/anular 1'));
   assert.strictEqual(depois.text, '✂️ 1 unidade(s) descontada(s) da comissão.');
 });
@@ -260,6 +282,7 @@ teste('"+25 ENTREGA ROD" vira despesa e responde com o acumulado do ciclo', asyn
   assert.strictEqual(rpc.length, 1, 'deveria registrar a despesa');
   assert.strictEqual(rpc[0].body.p_valor, 25);
   assert.strictEqual(rpc[0].body.p_descricao, 'ENTREGA');
+  assert.strictEqual(rpc[0].body.p_tipo, 'despesa');
   assert.strictEqual(resp.text, '📝 Anotado: R$ 25 ENTREGA — total do ciclo: R$ 143');
 
   // O ponto da tarefa: despesa NUNCA pode cair no fluxo de estoque.
@@ -307,7 +330,7 @@ teste('despesa no grupo de VENDAS não leva bronca de "grupo errado"', async (ct
 
 teste('"+25 ROD" (sem descrição) mostra o uso e não chama RPC nenhuma', async (ctx) => {
   const [resp] = await mandar(ctx.webhook, update('+25 ROD', { chat: GRUPO_REPOSICAO }));
-  assert.ok(resp.text.includes('+25 ENTREGA ROD'), resp.text);
+  assert.ok(resp.text.includes('Uso: `+25 ENTREGA`'), resp.text);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar').length, 0);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
 });
@@ -351,33 +374,186 @@ teste('/despesas lista os lançamentos do ciclo', async (ctx) => {
     },
   };
   const [resp] = await mandar(ctx.webhook, update('/despesas'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesas_rod')[0].body.p_tipo, 'despesa');
   assert.ok(resp.text.includes('21/08 → 20/09'), resp.text);
   assert.ok(resp.text.includes('R$ 25 ENTREGA'), resp.text);
   assert.ok(resp.text.includes('Total do ciclo: R$ 43'), resp.text);
 });
 
+// --- AJUSTE 1: despesa SEM o sufixo ROD, por lista de palavras -------------
+
+teste('"+25 ENTREGA" (sem ROD) vira despesa', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = { status: 200, body: { ok: true, valor: 25, total_ciclo: 25 } };
+  const [resp] = await mandar(ctx.webhook, update('+25 ENTREGA', { chat: GRUPO_REPOSICAO }));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar');
+  assert.strictEqual(rpc.length, 1, 'deveria ter virado despesa');
+  assert.strictEqual(rpc[0].body.p_valor, 25);
+  assert.strictEqual(rpc[0].body.p_descricao, 'ENTREGA');
+  assert.strictEqual(rpc[0].body.p_tipo, 'despesa');
+  assert.strictEqual(resp.text, '📝 Anotado: R$ 25 ENTREGA — total do ciclo: R$ 25');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('"+18 uber centro" guarda o complemento livre na descrição', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = { status: 200, body: { ok: true, valor: 18, total_ciclo: 43 } };
+  await mandar(ctx.webhook, update('+18 uber centro', { chat: GRUPO_REPOSICAO }));
+  const rpc = chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar');
+  assert.strictEqual(rpc[0].body.p_valor, 18);
+  assert.strictEqual(rpc[0].body.p_descricao, 'uber centro');
+});
+
+// O ponto mais importante do ajuste: typo de PRODUTO não pode virar despesa.
+teste('produto com typo continua "não encontrado" — NUNCA vira despesa', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: { resultados: [{ status: 'nao_encontrado', input: 'ignitee 50000 grape' }] },
+  };
+  const [resp] = await mandar(ctx.webhook, update('+2 ignitee 50000 grape', { chat: GRUPO_REPOSICAO }));
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar').length, 0,
+    'typo de produto não podia virar despesa silenciosa');
+  assert.ok(resp.text.includes('Produto não encontrado'), resp.text);
+});
+
+teste('"+25 XYZ" (palavra fora da lista) vai pro estoque, não pra despesa', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: { resultados: [{ status: 'nao_encontrado', input: 'XYZ' }] },
+  };
+  const [resp] = await mandar(ctx.webhook, update('+25 XYZ', { chat: GRUPO_REPOSICAO }));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar').length, 0);
+  assert.ok(resp.text.includes('Produto não encontrado'), resp.text);
+});
+
+// --- AJUSTE 3: dinheiro em mãos -------------------------------------------
+
+teste('"+100 DINHEIRO" é categoria própria (não despesa) e responde o total em mãos', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = { status: 200, body: { ok: true, valor: 100, total_ciclo: 130 } };
+  const [resp] = await mandar(ctx.webhook, update('+100 DINHEIRO'));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_valor, 100);
+  assert.strictEqual(rpc[0].body.p_tipo, 'dinheiro', 'DINHEIRO não pode ser gravado como despesa');
+  assert.strictEqual(resp.text, '💵 Anotado: R$ 100 em DINHEIRO — total em mãos no ciclo: R$ 130');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('/dinheiro lista só o ciclo de dinheiro em mãos', async (ctx) => {
+  respostas.bot_despesas_rod = {
+    status: 200,
+    body: {
+      ok: true, tipo: 'dinheiro', ciclo: '21/08 → 20/09', total: 130,
+      itens: [{ valor: 30, descricao: 'DINHEIRO', data: '21/08' },
+              { valor: 100, descricao: 'DINHEIRO', data: '22/08' }],
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/dinheiro'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesas_rod')[0].body.p_tipo, 'dinheiro');
+  assert.ok(resp.text.includes('Dinheiro em mãos'), resp.text);
+  assert.ok(resp.text.includes('21/08 → 20/09'), resp.text);
+  assert.ok(resp.text.includes('R$ 100'), resp.text);
+  assert.ok(resp.text.includes('Total em mãos no ciclo: R$ 130'), resp.text);
+});
+
+teste('/geral mostra comissão, despesas, dinheiro e o acerto do ciclo', async (ctx) => {
+  respostas.bot_comissao = {
+    status: 200,
+    body: {
+      ok: true, mes: '21/08 → 20/09', unidades_hoje: 4, unidades_mes: 120,
+      taxa_atual: 2.5, comissao: 300,
+    },
+  };
+  respostas.bot_despesas_rod = (body) => body.p_tipo === 'dinheiro'
+    ? { status: 200, body: { ok: true, total: 500, itens: [{}, {}], ciclo: '21/08 → 20/09' } }
+    : { status: 200, body: { ok: true, total: 143, itens: [{}, {}, {}], ciclo: '21/08 → 20/09' } };
+
+  const [resp] = await mandar(ctx.webhook, update('/geral'));
+  assert.ok(resp.text.includes('Geral — 21/08 → 20/09'), resp.text);
+  assert.ok(resp.text.includes('Unidades: *120*'), resp.text);
+  assert.ok(resp.text.includes('R$ 300,00'), resp.text);
+  assert.ok(resp.text.includes('3 lançamento(s) → *R$ 143,00*'), resp.text);
+  assert.ok(resp.text.includes('2 lançamento(s) → *R$ 500,00*'), resp.text);
+  // 500 − (300 + 143) = 57
+  assert.ok(resp.text.includes('Rod repassa R$ 57,00'), resp.text);
+});
+
+teste('/geral com sinal invertido diz que a loja paga o Rod', async (ctx) => {
+  assert.ok(ctx.mod.linhaAcerto(100, 443).includes('Loja paga R$ 343,00 ao Rod'),
+    ctx.mod.linhaAcerto(100, 443));
+  assert.ok(ctx.mod.linhaAcerto(443, 443).includes('zerado'), ctx.mod.linhaAcerto(443, 443));
+});
+
+teste('/geral avisa qual fonte falhou em vez de inventar o acerto', async (ctx) => {
+  respostas.bot_comissao = { status: 500, body: { message: 'boom' } };
+  respostas.bot_despesas_rod = { status: 200, body: { ok: true, total: 10, itens: [] } };
+  const [resp] = await mandar(ctx.webhook, update('/geral'));
+  assert.ok(resp.text.includes('não consegui consultar'), resp.text);
+  assert.ok(!resp.text.includes('Rod repassa'), 'sem comissão não pode anunciar acerto');
+});
+
+// --- Lista de palavras vem do banco (palavra nova = update no config) ------
+// Deixado por último de propósito: é o único teste que popula o cache de
+// palavras do módulo (TTL ~1 min), e um cache quente mudaria os testes acima.
+
+teste('palavra nova no bot_despesa_palavras funciona sem deploy', async (ctx) => {
+  respostas.bot_config = {
+    status: 200,
+    body: { ok: true, key: 'bot_despesa_palavras', valor: 'ENTREGA,UBER,GASOLINA,ALMOÇO' },
+  };
+  respostas.bot_despesa_rod_registrar = { status: 200, body: { ok: true, valor: 15, total_ciclo: 15 } };
+
+  const [resp] = await mandar(ctx.webhook, update('+15 ALMOÇO', { chat: GRUPO_REPOSICAO }));
+
+  const cfg = chamadas.filter(c => c.fn === 'bot_config');
+  assert.ok(cfg.length >= 1, 'deveria consultar a lista no banco');
+  assert.strictEqual(cfg[0].body.p_key, 'bot_despesa_palavras');
+  const rpc = chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar');
+  assert.strictEqual(rpc.length, 1, 'ALMOÇO deveria ter virado despesa');
+  assert.strictEqual(rpc[0].body.p_descricao, 'ALMOÇO');
+  assert.ok(resp.text.includes('Anotado: R$ 15 ALMOÇO'), resp.text);
+});
+
 // --- Fechamento soma comissão + despesas -----------------------------------
 
-teste('fechamento inclui a linha de despesas e o total a pagar', async (ctx) => {
+teste('fechamento inclui despesas, dinheiro em mãos e o acerto', async (ctx) => {
   const texto = ctx.mod.montarFechamento(
     { mes: '21/07 → 20/08', unidades_mes: 120, taxa_atual: 2.5, comissao: 300 },
     { ok: true, total: 143 },
+    { ok: true, total: 500 },
   );
   assert.ok(texto.includes('FECHAMENTO DO PERÍODO 21/07 → 20/08'), texto);
   assert.ok(texto.includes('💰 Comissão: *R$ 300,00*'), texto);
   assert.ok(texto.includes('🛵 Entregas/despesas Rod: R$ 143,00'), texto);
   assert.ok(texto.includes('Total a pagar: R$ 443,00'), texto);
+  assert.ok(texto.includes('💵 Dinheiro em mãos (Rod): R$ 500,00'), texto);
+  assert.ok(texto.includes('Rod repassa R$ 57,00'), texto);
 });
 
 teste('fechamento avisa quando não conseguiu somar as despesas (não paga a menos calado)', async (ctx) => {
   const texto = ctx.mod.montarFechamento(
-    { mes: '21/07 → 20/08', unidades_mes: 120, taxa_atual: 2.5, comissao: 300 }, null,
+    { mes: '21/07 → 20/08', unidades_mes: 120, taxa_atual: 2.5, comissao: 300 },
+    null,
+    { ok: true, total: 500 },
   );
-  assert.ok(texto.includes('Não consegui somar'), texto);
+  assert.ok(texto.includes('Não consegui somar as entregas'), texto);
   assert.ok(!texto.includes('Total a pagar'), 'sem despesas confiáveis não pode anunciar total');
+  assert.ok(!texto.includes('Acerto'), 'sem o total a pagar não dá pra fechar o acerto');
 });
 
-teste('o fechamento do relatório diário puxa as despesas do ciclo', async (ctx) => {
+teste('fechamento avisa quando não conseguiu somar o dinheiro em mãos', async (ctx) => {
+  const texto = ctx.mod.montarFechamento(
+    { mes: '21/07 → 20/08', unidades_mes: 120, taxa_atual: 2.5, comissao: 300 },
+    { ok: true, total: 143 },
+    null,
+  );
+  assert.ok(texto.includes('Total a pagar: R$ 443,00'), texto);
+  assert.ok(texto.includes('Não consegui somar o dinheiro'), texto);
+  assert.ok(!texto.includes('Acerto'), texto);
+});
+
+teste('o fechamento do relatório diário puxa despesas E dinheiro do ciclo', async (ctx) => {
   respostas.bot_comissao = {
     status: 200,
     body: {
@@ -385,9 +561,14 @@ teste('o fechamento do relatório diário puxa as despesas do ciclo', async (ctx
       unidades_hoje: 4, taxa_atual: 2.5, comissao: 300,
     },
   };
-  respostas.bot_despesas_rod = { status: 200, body: { ok: true, total: 143, itens: [] } };
+  respostas.bot_despesas_rod = (body) => body.p_tipo === 'dinheiro'
+    ? { status: 200, body: { ok: true, total: 500, itens: [] } }
+    : { status: 200, body: { ok: true, total: 143, itens: [] } };
+
   const texto = await ctx.mod.textoComissaoRelatorio();
   assert.ok(texto.includes('Total a pagar: R$ 443,00'), texto);
+  assert.ok(texto.includes('Dinheiro em mãos (Rod): R$ 500,00'), texto);
+  assert.ok(texto.includes('Rod repassa R$ 57,00'), texto);
 });
 
 // --- /refazerfechamento (correção do corte 19 → 20) ------------------------
