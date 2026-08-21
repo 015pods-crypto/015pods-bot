@@ -390,6 +390,51 @@ teste('o fechamento do relatório diário puxa as despesas do ciclo', async (ctx
   assert.ok(texto.includes('Total a pagar: R$ 443,00'), texto);
 });
 
+// --- /refazerfechamento (correção do corte 19 → 20) ------------------------
+
+teste('/refazerfechamento publica a correção no grupo de vendas', async (ctx) => {
+  respostas.bot_comissao = {
+    status: 200,
+    body: {
+      ok: true, mes: '20/07 → 20/08', fecha_hoje: true, unidades_mes: 130,
+      unidades_hoje: 6, taxa_atual: 2.5, comissao: 325,
+    },
+  };
+  respostas.bot_despesas_rod = { status: 200, body: { ok: true, total: 0, itens: [] } };
+
+  // Mandado no privado do dono: a correção tem que sair no GRUPO, não só no DM.
+  await mandar(ctx.webhook, update('/refazerfechamento 20/08/2026', { chat: DONO, tipo: 'private' }));
+  await new Promise(r => setTimeout(r, 200));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_comissao');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_mes, '2026-08-20', 'data de corte errada');
+
+  const noGrupo = enviadas.find(e => String(e.chat_id) === String(GRUPO_VENDAS));
+  assert.ok(noGrupo, `nada foi pro grupo: ${JSON.stringify(enviadas)}`);
+  assert.ok(noGrupo.text.includes('FECHAMENTO CORRIGIDO — 20/07 → 20/08'), noGrupo.text);
+  assert.ok(noGrupo.text.includes('Novo corte: 20/08 às 23:59'), noGrupo.text);
+  assert.ok(noGrupo.text.includes('Substitui o fechamento anterior'), noGrupo.text);
+  assert.ok(noGrupo.text.includes('*130* produtos'), noGrupo.text);
+
+  const noPrivado = enviadas.find(e => String(e.chat_id) === String(DONO));
+  assert.ok(noPrivado && noPrivado.text.includes('publicada no grupo'), 'faltou confirmar pro dono');
+});
+
+teste('/refazerfechamento é recusado pro funcionário e não recalcula nada', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/refazerfechamento 20/08', { from: FUNCIONARIO }));
+  assert.ok(resp.text.includes('Só o dono'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comissao').length, 0);
+});
+
+teste('/refazerfechamento sem data (ou com data inválida) mostra o uso', async (ctx) => {
+  for (const texto of ['/refazerfechamento', '/refazerfechamento ontem', '/refazerfechamento 32/13']) {
+    const [resp] = await mandar(ctx.webhook, update(texto));
+    assert.ok(resp.text.includes('Uso: /refazerfechamento'), `para ${texto}: ${resp.text}`);
+  }
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comissao').length, 0);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {

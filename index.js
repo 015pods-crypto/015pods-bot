@@ -30,7 +30,8 @@ const COMMIT = String(process.env.RENDER_GIT_COMMIT || 'desconhecido').slice(0, 
 // ele também não está na cadeia de ifs do webhook (manter os dois em sincronia).
 const COMANDOS = [
   '/start', '/ajuda', '/estoque', '/zerados', '/baixo', '/relatorio',
-  '/reposicao', '/comissao', '/despesas', '/anular', '/desanular', '/versao',
+  '/reposicao', '/comissao', '/despesas', '/anular', '/desanular',
+  '/refazerfechamento', '/versao',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -456,23 +457,26 @@ async function textoComissaoRelatorio() {
 // Fechamento = comissão + despesas particulares do Rod do mesmo ciclo.
 // `desp` null = a RPC de despesas falhou: o total NÃO é somado e o texto avisa,
 // porque um total silenciosamente menor viraria pagamento errado.
-function montarFechamento(d, desp) {
+// `opts` troca título/rodapé — é como o /refazerfechamento publica a correção
+// sem se passar por um fechamento novo.
+function montarFechamento(d, desp, opts = {}) {
   const comissao = Number(d.comissao) || 0;
+  const titulo = opts.titulo || `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`;
+  const rodape = opts.rodape || '_(amanhã começa o novo período)_';
   const linhas = [
-    `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`,
+    titulo,
     `Total: *${d.unidades_mes ?? 0}* produtos`,
     `Faixa final: R$ ${fmtBR(d.taxa_atual)}/produto`,
     `💰 Comissão: *R$ ${fmtBR(comissao)}*`,
   ];
   if (!desp) {
     linhas.push('⚠️ _Não consegui somar as entregas/despesas do Rod — confira antes de pagar._');
-    linhas.push('_(amanhã começa o novo período)_');
-    return linhas.join('\n');
+  } else {
+    const despesas = Number(desp.total) || 0;
+    linhas.push(`🛵 Entregas/despesas Rod: R$ ${fmtBR(despesas)}`);
+    linhas.push(`🧾 *Total a pagar: R$ ${fmtBR(comissao + despesas)}*`);
   }
-  const despesas = Number(desp.total) || 0;
-  linhas.push(`🛵 Entregas/despesas Rod: R$ ${fmtBR(despesas)}`);
-  linhas.push(`🧾 *Total a pagar: R$ ${fmtBR(comissao + despesas)}*`);
-  linhas.push('_(amanhã começa o novo período)_');
+  linhas.push(rodape);
   return linhas.join('\n');
 }
 
@@ -484,9 +488,13 @@ function montarFechamento(d, desp) {
 // ---------------------------------------------------------------------------
 
 // Lê o acumulado do ciclo (RPC bot_despesas_rod). Nunca lança: erro vira null.
-async function dadosDespesasRod() {
+// `ref` (ISO YYYY-MM-DD) consulta o ciclo de outra data — usado ao refazer um
+// fechamento passado.
+async function dadosDespesasRod(ref) {
   try {
-    const d = await callRpc('bot_despesas_rod', { p_token: BOT_SYNC_TOKEN });
+    const body = { p_token: BOT_SYNC_TOKEN };
+    if (ref) body.p_ref = ref;
+    const d = await callRpc('bot_despesas_rod', body);
     return d && d.ok !== false ? d : null;
   } catch (err) {
     console.error('despesas_rod:', err.message);
@@ -546,6 +554,61 @@ async function handleDespesasLista(chatId) {
 
 async function handleComissao(chatId) {
   await sendTelegram(chatId, await textoComissao());
+}
+
+// ---------------------------------------------------------------------------
+// /refazerfechamento DD/MM — republica um fechamento com a janela corrigida.
+// Existe porque o bot já anunciou no grupo um fechamento com o corte velho
+// (dia 19): a correção tem que ser visível, não um segundo fechamento calado.
+// A comissão não é armazenada — a RPC recalcula a partir das vendas —, então
+// basta apontar a data de corte do ciclo. Só o dono.
+// ---------------------------------------------------------------------------
+
+// "20/08" ou "20/08/2026" -> "2026-08-20" (ano padrão = ano corrente em SP).
+function parseDataComando(text) {
+  const arg = (text || '').trim().split(/\s+/)[1];
+  if (!arg) return null;
+  const m = arg.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?$/);
+  if (!m) return null;
+  const dia = parseInt(m[1], 10);
+  const mes = parseInt(m[2], 10);
+  if (dia < 1 || dia > 31 || mes < 1 || mes > 12) return null;
+  const anoCorrente = new Date()
+    .toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' })
+    .split('/')[2];
+  const ano = m[3] || anoCorrente;
+  return `${ano}-${String(mes).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
+}
+
+async function handleRefazerFechamento(chatId, text, userId) {
+  if (!ehDono(userId)) { await sendTelegram(chatId, '⛔ Só o dono pode refazer o fechamento.'); return; }
+  const data = parseDataComando(text);
+  if (!data) {
+    await sendTelegram(chatId, 'Uso: /refazerfechamento 20/08 (data de corte do ciclo)');
+    return;
+  }
+
+  let d = null;
+  try {
+    d = await callRpc('bot_comissao', { p_token: BOT_SYNC_TOKEN, p_mes: data });
+  } catch (err) {
+    console.error('refazerfechamento:', err.message);
+  }
+  if (!d || d.ok === false) {
+    await sendTelegram(chatId, '⚠️ Não consegui recalcular o fechamento dessa data.');
+    return;
+  }
+
+  const [, mes, dia] = data.split('-');
+  const texto = montarFechamento(d, await dadosDespesasRod(data), {
+    titulo: `🔁 *FECHAMENTO CORRIGIDO — ${escapeMd(String(d.mes ?? ''))}*`,
+    rodape: `_Novo corte: ${dia}/${mes} às 23:59. Substitui o fechamento anterior._`,
+  });
+
+  await sendTelegram(VENDAS_CHAT_ID, texto);
+  if (String(chatId) !== VENDAS_CHAT_ID) {
+    await sendTelegram(chatId, '✅ Correção publicada no grupo de vendas.');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -771,6 +834,7 @@ app.post('/webhook', async (req, res) => {
     // Só o dono: a checagem de quem mandou é feita dentro dos handlers.
     if (cmd === '/anular') { await handleAnular(chatId, text, fromId); return; }
     if (cmd === '/desanular') { await handleDesanular(chatId, text, fromId); return; }
+    if (cmd === '/refazerfechamento') { await handleRefazerFechamento(chatId, text, fromId); return; }
     if (cmd === '/versao') { await handleVersao(chatId, fromId); return; }
 
     // Nenhum comando bateu. Sem isso o bot fica MUDO em comando desconhecido —
@@ -822,6 +886,8 @@ module.exports = {
   parseDespesaRod,
   montarFechamento,
   fmtValor,
+  handleRefazerFechamento,
+  parseDataComando,
   handleAnular,
   handleDesanular,
   parseUnidadesComando,
