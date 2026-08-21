@@ -426,6 +426,112 @@ teste('"+25 XYZ" (palavra fora da lista) vai pro estoque, não pra despesa', asy
   assert.ok(resp.text.includes('Produto não encontrado'), resp.text);
 });
 
+// --- ESTORNO: mesmo formato no negativo ------------------------------------
+
+teste('"-50 DINHEIRO" estorna dinheiro em mãos (mesma RPC, valor negativo)', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = {
+    status: 200, body: { ok: true, tipo: 'dinheiro', estorno: true, valor: -50, total_ciclo: 80 },
+  };
+  const [resp] = await mandar(ctx.webhook, update('-50 DINHEIRO'));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_valor, -50, 'o valor tem que ir NEGATIVO pra RPC');
+  assert.strictEqual(rpc[0].body.p_tipo, 'dinheiro');
+  assert.strictEqual(resp.text, '↩️ Estornado: R$ 50 de DINHEIRO — total em mãos no ciclo: R$ 80');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0,
+    'estorno não podia virar baixa de estoque');
+});
+
+teste('"-25 ENTREGA erro de digitação" estorna despesa com o motivo junto', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = {
+    status: 200, body: { ok: true, tipo: 'despesa', estorno: true, valor: -25, total_ciclo: 0 },
+  };
+  const [resp] = await mandar(ctx.webhook, update('-25 ENTREGA erro de digitação'));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar');
+  assert.strictEqual(rpc[0].body.p_valor, -25);
+  assert.strictEqual(rpc[0].body.p_descricao, 'ENTREGA erro de digitação');
+  assert.strictEqual(rpc[0].body.p_tipo, 'despesa');
+  assert.ok(resp.text.startsWith('↩️ Estornado: R$ 25 de ENTREGA erro de digitação'), resp.text);
+  assert.ok(resp.text.includes('total do ciclo: R$ 0'), resp.text);
+});
+
+// O risco do ajuste: "-" é o comando de VENDA. Uma linha de venda engolida
+// como estorno seria um produto que sai do estoque sem sair de verdade.
+teste('ESTORNO x VENDA: "-2 ignite 50000 grape" continua baixando estoque', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: {
+      resultados: [{
+        status: 'ok', direction: 'baixa', model: 'Ignite 50000 (V500)',
+        flavor: 'Grape', qty: 2, stock_after: 18,
+      }],
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('-2 ignite 50000 grape'));
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar').length, 0,
+    'venda não podia virar estorno');
+  const rpc = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
+  assert.strictEqual(rpc.length, 1);
+  assert.deepStrictEqual(rpc[0].body.p_items, [{ produto: 'ignite 50000 grape', qty: -2 }]);
+  assert.ok(resp.text.includes('Baixa registrada'), resp.text);
+});
+
+teste('ESTORNO x VENDA: produto com typo continua "não encontrado", não estorno', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: { resultados: [{ status: 'nao_encontrado', input: 'igniti 50000 grape' }] },
+  };
+  const [resp] = await mandar(ctx.webhook, update('-2 igniti 50000 grape'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar').length, 0);
+  assert.ok(resp.text.includes('Produto não encontrado'), resp.text);
+});
+
+teste('+ e - convivem na mesma mensagem, cada um na sua rota', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = { status: 200, body: { ok: true, valor: 0, total_ciclo: 0 } };
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: {
+      resultados: [{
+        status: 'ok', direction: 'baixa', model: 'Ignite 5500',
+        flavor: 'Grape Ice', qty: 1, stock_after: 6,
+      }],
+    },
+  };
+  await mandar(ctx.webhook, update('+100 DINHEIRO\n-50 DINHEIRO\n-1 Ignite 5500 Grape Ice'));
+  await new Promise(r => setTimeout(r, 150));
+
+  const reg = chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar');
+  assert.strictEqual(reg.length, 2, 'os dois lançamentos de dinheiro deviam ter ido pra RPC');
+  assert.strictEqual(reg[0].body.p_valor, 100);
+  assert.strictEqual(reg[1].body.p_valor, -50);
+
+  const estoque = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
+  assert.strictEqual(estoque.length, 1);
+  assert.deepStrictEqual(estoque[0].body.p_items, [{ produto: 'Ignite 5500 Grape Ice', qty: -1 }]);
+});
+
+// Se o Run que devolve 'estorno' ainda não estiver aplicado, o sinal que o bot
+// mandou decide — não pode responder "Anotado" pra um estorno.
+teste('estorno sem o campo estorno na resposta cai no sinal enviado', async (ctx) => {
+  respostas.bot_despesa_rod_registrar = { status: 200, body: { ok: true, total_ciclo: 80 } };
+  const [resp] = await mandar(ctx.webhook, update('-50 DINHEIRO'));
+  assert.ok(resp.text.startsWith('↩️ Estornado'), resp.text);
+});
+
+teste('valor zero não vira lançamento nem estorno', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: { resultados: [{ status: 'nao_encontrado', input: 'DINHEIRO' }] },
+  };
+  const [resp] = await mandar(ctx.webhook, update('-0 DINHEIRO'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar').length, 0,
+    'zero não podia ir pra RPC');
+  assert.ok(resp.text.includes('Não entendi') || resp.text.includes('não encontrado'), resp.text);
+});
+
 // --- AJUSTE 3: dinheiro em mãos -------------------------------------------
 
 teste('"+100 DINHEIRO" é categoria própria (não despesa) e responde o total em mãos', async (ctx) => {
@@ -646,6 +752,7 @@ async function main() {
     enviadas.length = 0;
     chamadas.length = 0;
     respostas = {};
+    mod._resetCachePalavras(); // o cache de palavras atravessa testes (TTL 1 min)
     try {
       await t.fn(ctx);
       console.log(`✅ ${t.nome}`);

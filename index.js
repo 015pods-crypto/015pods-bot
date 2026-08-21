@@ -130,16 +130,25 @@ async function readEstoque() {
 }
 
 // ---------------------------------------------------------------------------
-// Registros do Rod: DESPESA ("+25 ENTREGA") e DINHEIRO ("+100 DINHEIRO").
+// Registros do Rod: DESPESA ("+25 ENTREGA") e DINHEIRO ("+100 DINHEIRO"),
+// e os ESTORNOS dos dois com o mesmo formato no negativo ("-50 DINHEIRO",
+// "-25 ENTREGA erro de digitação"). Estorno é o MESMO lançamento com valor
+// negativo: os totais são soma da coluna, então saem líquidos sozinhos.
 //
-// COLISÃO DE PREFIXO: o "+" é o mesmo da reposição de estoque. O desempate é a
-// PRIMEIRA PALAVRA depois do número — e só ela:
+// COLISÃO DE PREFIXO: "+" é a reposição de estoque e "-" é a BAIXA DE VENDA —
+// o comando mais usado do bot. Nos dois casos o desempate é a PRIMEIRA PALAVRA
+// depois do número, e só ela:
 //   1. DINHEIRO (palavra reservada, categoria própria)  -> tipo 'dinheiro'
 //   2. linha terminada em ROD isolado (formato antigo)  -> tipo 'despesa'
 //   3. palavra na lista `bot_despesa_palavras` do banco -> tipo 'despesa'
 //   4. qualquer outra coisa                             -> estoque (inalterado)
 // Produto com typo cai no caso 4 e continua respondendo "não encontrado": a
-// regra NUNCA transforma erro de digitação de produto em despesa silenciosa.
+// regra NUNCA transforma erro de digitação de produto em despesa silenciosa —
+// e isso vale em dobro no "-", onde a linha engolida seria uma VENDA.
+//
+// O caso 2 (sufixo ROD) é de propósito só do "+": era um formato de despesa,
+// nunca de venda. Estender ele ao "-" criaria mais um jeito de uma linha de
+// venda virar estorno, sem ninguém ter pedido.
 //
 // Os dois sinais contábeis são opostos e por isso não podem virar o mesmo tipo:
 // despesa = a loja DEVE ao Rod; dinheiro = o Rod está COM dinheiro da loja.
@@ -149,8 +158,8 @@ const RE_DESPESA_ROD = /^\+\s*(\d+(?:[.,]\d{1,2})?)\s+(\S.*?)\s+rod\s*$/i;
 // "+25 ROD" (valor sem descrição): não é estoque nem despesa válida — vira aviso
 // de uso, senão o estoque responderia "produto não encontrado: ROD".
 const RE_DESPESA_ROD_SEM_DESC = /^\+\s*\d+(?:[.,]\d{1,2})?\s+rod\s*$/i;
-// "+VALOR PALAVRA [complemento livre]" — a palavra é m[2], o complemento m[3].
-const RE_VALOR_PALAVRA = /^\+\s*(\d+(?:[.,]\d{1,2})?)\s+(\S+)(?:\s+(.*\S))?\s*$/;
+// "±VALOR PALAVRA [complemento livre]" — sinal m[1], palavra m[3], resto m[4].
+const RE_VALOR_PALAVRA = /^([+-])\s*(\d+(?:[.,]\d{1,2})?)\s+(\S+)(?:\s+(.*\S))?\s*$/;
 
 // Palavra reservada do dinheiro em mãos. NÃO entra em bot_despesa_palavras.
 const PALAVRA_DINHEIRO = 'DINHEIRO';
@@ -160,8 +169,10 @@ const PALAVRA_DINHEIRO = 'DINHEIRO';
 // deploy) — esta lista existe só pra não deixar o Rod sem registrar nada.
 const PALAVRAS_DESPESA_PADRAO = ['ENTREGA', 'UBER', 'GASOLINA'];
 
-// Cache da lista vinda do banco (~1 min). Só sucesso atualiza o cache: falha
-// mantém o último valor bom em vez de gravar uma lista vazia por um minuto.
+// Cache da lista vinda do banco (~1 min). O fallback TAMBÉM é cacheado: desde
+// que o "-" entrou na rota, toda linha de venda passa por aqui, e sem cachear a
+// falha o bot pagaria um round-trip morto a cada baixa com o banco fora do ar.
+// Recuperar em até 1 min é o mesmo prazo de uma palavra nova no config.
 let cachePalavras = { at: 0, lista: null };
 const PALAVRAS_TTL_MS = 60 * 1000;
 
@@ -169,41 +180,50 @@ async function palavrasDespesa() {
   if (cachePalavras.lista && Date.now() - cachePalavras.at < PALAVRAS_TTL_MS) {
     return cachePalavras.lista;
   }
+  let lista = null;
   try {
     const d = await callRpc('bot_config', { p_token: BOT_SYNC_TOKEN, p_key: 'bot_despesa_palavras' });
     const csv = d && d.ok !== false ? String(d.valor ?? '') : '';
-    const lista = csv.split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
-    if (lista.length) {
-      cachePalavras = { at: Date.now(), lista };
-      return lista;
-    }
+    const doBanco = csv.split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+    if (doBanco.length) lista = doBanco;
   } catch (err) {
     console.error('bot_config bot_despesa_palavras:', err.message);
   }
-  return cachePalavras.lista || PALAVRAS_DESPESA_PADRAO;
+  cachePalavras = { at: Date.now(), lista: lista || PALAVRAS_DESPESA_PADRAO };
+  return cachePalavras.lista;
+}
+
+// Só pro teste: como o cache agora guarda também o fallback, sem zerar ele
+// entre casos o teste da lista do banco passaria sem nunca consultar o banco.
+function _resetCachePalavras() {
+  cachePalavras = { at: 0, lista: null };
 }
 
 // `palavras` é a lista já resolvida (o parser é síncrono de propósito: o
 // webhook busca a lista uma vez por mensagem e reusa em todas as linhas).
 function parseRegistroRod(line, palavras) {
   const raw = (line || '').trim();
-  if (!raw || raw.charAt(0) !== '+') return null;
+  const sinal = raw.charAt(0);
+  if (sinal !== '+' && sinal !== '-') return null;
   if (RE_DESPESA_ROD_SEM_DESC.test(raw)) return { invalid: true, raw };
 
   const m = raw.match(RE_VALOR_PALAVRA);
-  const palavra = m ? m[2].toUpperCase() : null;
-  const valor = m ? parseFloat(m[1].replace(',', '.')) : null;
-  const resto = m ? [m[2], m[3]].filter(Boolean).join(' ').trim() : '';
+  const palavra = m ? m[3].toUpperCase() : null;
+  // Estorno é o mesmo lançamento com o valor negativo — não existe RPC nem
+  // tipo separado pra ele.
+  const bruto = m ? parseFloat(m[2].replace(',', '.')) : null;
+  const valor = bruto ? (m[1] === '-' ? -bruto : bruto) : null;
+  const resto = m ? [m[3], m[4]].filter(Boolean).join(' ').trim() : '';
 
   // 1. DINHEIRO tem prioridade sobre tudo: é palavra reservada.
   if (palavra === PALAVRA_DINHEIRO) {
-    if (!valor || valor <= 0) return { invalid: true, raw };
+    if (!valor) return { invalid: true, raw };
     return { tipo: 'dinheiro', valor, descricao: resto, raw };
   }
 
-  // 2. Formato antigo "+25 ENTREGA ROD" — antes da lista, senão "Uber rod"
-  //    guardaria a descrição com o "rod" grudado no fim.
-  const rod = raw.match(RE_DESPESA_ROD);
+  // 2. Formato antigo "+25 ENTREGA ROD" (só no "+", ver cabeçalho) — antes da
+  //    lista, senão "Uber rod" guardaria a descrição com o "rod" grudado no fim.
+  const rod = sinal === '+' ? raw.match(RE_DESPESA_ROD) : null;
   if (rod) {
     const v = parseFloat(rod[1].replace(',', '.'));
     const desc = rod[2].trim();
@@ -213,7 +233,7 @@ function parseRegistroRod(line, palavras) {
 
   // 3. Primeira palavra na lista de despesa (case-insensitive).
   if (palavra && palavras.includes(palavra)) {
-    if (!valor || valor <= 0) return { invalid: true, raw };
+    if (!valor) return { invalid: true, raw };
     return { tipo: 'despesa', valor, descricao: resto, raw };
   }
 
@@ -592,7 +612,8 @@ async function dadosRegistrosRod(ref, tipo) {
 }
 
 const USO_REGISTRO_ROD =
-  'Uso: `+25 ENTREGA` (valor + palavra de despesa) ou `+100 DINHEIRO`';
+  'Uso: `+25 ENTREGA` (valor + palavra de despesa) ou `+100 DINHEIRO`. ' +
+  'Pra estornar, o mesmo no negativo: `-25 ENTREGA`, `-50 DINHEIRO`.';
 
 // Registra cada lançamento e responde com o acumulado do ciclo — é essa linha
 // que dá visibilidade do total sem ninguém precisar somar na mão.
@@ -619,11 +640,24 @@ async function handleRegistrosRod(chatId, registros, meta) {
       respostas.push(`⚠️ Não consegui anotar \`${escapeMd(d.raw)}\`. Tente de novo em instantes.`);
       continue;
     }
-    respostas.push(
-      d.tipo === 'dinheiro'
-        ? `💵 Anotado: R$ ${fmtValor(d.valor)} em DINHEIRO — total em mãos no ciclo: R$ ${fmtValor(r.total_ciclo)}`
-        : `📝 Anotado: R$ ${fmtValor(d.valor)} ${escapeMd(d.descricao)} — total do ciclo: R$ ${fmtValor(r.total_ciclo)}`,
-    );
+    // `estorno` vem da RPC; se o Run novo ainda não estiver aplicado o campo
+    // não vem, e o sinal que NÓS mandamos decide — nunca fica sem resposta.
+    const estorno = r.estorno != null ? !!r.estorno : d.valor < 0;
+    const total = `R$ ${fmtValor(r.total_ciclo)}`;
+    const quanto = `R$ ${fmtValor(Math.abs(d.valor))}`;
+    if (estorno) {
+      respostas.push(
+        d.tipo === 'dinheiro'
+          ? `↩️ Estornado: ${quanto} de DINHEIRO — total em mãos no ciclo: ${total}`
+          : `↩️ Estornado: ${quanto} de ${escapeMd(d.descricao)} — total do ciclo: ${total}`,
+      );
+    } else {
+      respostas.push(
+        d.tipo === 'dinheiro'
+          ? `💵 Anotado: ${quanto} em DINHEIRO — total em mãos no ciclo: ${total}`
+          : `📝 Anotado: ${quanto} ${escapeMd(d.descricao)} — total do ciclo: ${total}`,
+      );
+    }
   }
   if (respostas.length) await sendTelegram(chatId, respostas.join('\n'));
 }
@@ -883,7 +917,7 @@ async function handleDesanular(chatId, text, userId) {
   await sendTelegram(chatId, partes.join('\n'));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`';
 
 const vendasDoDia = {};
 
@@ -979,11 +1013,12 @@ app.post('/webhook', async (req, res) => {
     if (text.charAt(0) === '-' || text.charAt(0) === '+') {
       const todas = text.split('\n').map(l => l.trim());
 
-      // Despesa ("+25 ENTREGA") e dinheiro ("+100 DINHEIRO") saem da fila ANTES
-      // do estoque: as três rotas dividem o prefixo "+", e sem isso o registro
-      // viraria "produto não encontrado" (e ainda levaria bronca de grupo
-      // errado no VENDAS). A lista de palavras é buscada UMA vez por mensagem.
-      const palavras = todas.some(l => l.charAt(0) === '+') ? await palavrasDespesa() : [];
+      // Despesa ("+25 ENTREGA"), dinheiro ("+100 DINHEIRO") e os estornos dos
+      // dois ("-25 ENTREGA", "-50 DINHEIRO") saem da fila ANTES do estoque: as
+      // rotas dividem os prefixos "+" e "-", e sem isso o registro viraria
+      // "produto não encontrado" (e ainda levaria bronca de grupo errado no
+      // VENDAS). A lista de palavras é buscada UMA vez por mensagem.
+      const palavras = await palavrasDespesa();
       const linhas = [];
       const registros = [];
       for (const l of todas) {
@@ -1089,6 +1124,7 @@ module.exports = {
   handleGeral,
   parseRegistroRod,
   palavrasDespesa,
+  _resetCachePalavras,
   montarFechamento,
   linhaAcerto,
   nomeAutor,

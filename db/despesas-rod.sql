@@ -17,6 +17,11 @@
 --   'despesa'  → a loja DEVE ao Rod (entrega, uber, gasolina...)
 --   'dinheiro' → o Rod está COM dinheiro da loja em mãos (venda paga em espécie)
 --
+-- ESTORNO: lançamento errado é corrigido com o MESMO formato no negativo
+-- ("-50 DINHEIRO", "-25 ENTREGA"). Não existe tipo nem RPC de estorno: é uma
+-- linha com valor negativo, e como todo total é sum(valor), os números saem
+-- líquidos sozinhos. O único valor proibido é ZERO.
+--
 -- Ciclo: 21/mm 00:00 → 20/mm+1 23:59:59 (America/Sao_Paulo). O ciclo é gravado
 -- em cada lançamento (ciclo_inicio/ciclo_fim), então o acumulado zera sozinho na
 -- virada e um lançamento nunca "muda de ciclo" depois.
@@ -30,7 +35,8 @@ create table if not exists public.despesas_rod (
   id           bigint generated always as identity primary key,
   tipo         text          not null default 'despesa'
                              check (tipo in ('despesa', 'dinheiro')),
-  valor        numeric(10,2) not null check (valor > 0),
+  valor        numeric(10,2) not null
+                             constraint despesas_rod_valor_nao_zero check (valor <> 0),
   descricao    text          not null default '',
   criado_em    timestamptz   not null default now(),
   ciclo_inicio date          not null,
@@ -42,6 +48,13 @@ create table if not exists public.despesas_rod (
 -- (no-op quando a coluna já está lá).
 alter table public.despesas_rod
   add column if not exists tipo text not null default 'despesa';
+
+-- Troca o check antigo (valor > 0) pelo novo (valor <> 0): é ele que libera o
+-- estorno. Numa tabela que já existe, sem isto o "-50 DINHEIRO" bate na
+-- constraint e a RPC devolve erro. Idempotente — pode rodar de novo à vontade.
+alter table public.despesas_rod drop constraint if exists despesas_rod_valor_check;
+alter table public.despesas_rod drop constraint if exists despesas_rod_valor_nao_zero;
+alter table public.despesas_rod add  constraint despesas_rod_valor_nao_zero check (valor <> 0);
 
 create index if not exists despesas_rod_ciclo_idx
   on public.despesas_rod (ciclo_inicio, tipo, criado_em);
@@ -125,6 +138,8 @@ $$;
 -- esse número que o bot ecoa no grupo ("total do ciclo" / "total em mãos").
 -- Somar tipos diferentes aqui daria um total sem significado: os sinais são
 -- opostos.
+-- p_valor negativo = estorno; o retorno traz 'estorno': true e o total já sai
+-- líquido, porque é sum(valor) da coluna.
 create or replace function public.bot_despesa_rod_registrar(
   p_token     text,
   p_valor     numeric,
@@ -150,7 +165,8 @@ begin
     return jsonb_build_object('ok', false, 'erro', 'token inválido');
   end if;
 
-  if p_valor is null or p_valor <= 0 then
+  -- Negativo é ESTORNO e é aceito de propósito; zero não corrige nada.
+  if p_valor is null or round(p_valor, 2) = 0 then
     return jsonb_build_object('ok', false, 'erro', 'valor inválido');
   end if;
 
@@ -180,6 +196,7 @@ begin
     'ok', true,
     'id', v_id,
     'tipo', v_tipo,
+    'estorno', (round(p_valor, 2) < 0),
     'valor', round(p_valor, 2),
     'descricao', btrim(coalesce(p_descricao, '')),
     'total_ciclo', v_total,
@@ -277,8 +294,12 @@ on conflict (key) do update set value = excluded.value;
 -- select public.bot_config('<TOKEN>', 'bot_despesa_palavras');        -- lista atual
 -- select public.bot_despesa_rod_registrar('<TOKEN>', 25, 'ENTREGA', 'despesa');
 -- select public.bot_despesa_rod_registrar('<TOKEN>', 100, 'DINHEIRO', 'dinheiro');
+-- select public.bot_despesa_rod_registrar('<TOKEN>', -50, 'DINHEIRO', 'dinheiro');  -- estorno
 -- select public.bot_despesas_rod('<TOKEN>', now(), 'despesa');
 -- select public.bot_despesas_rod('<TOKEN>', now(), 'dinheiro');
+--
+-- Valor zero tem que ser recusado ("valor inválido"):
+-- select public.bot_despesa_rod_registrar('<TOKEN>', 0, 'ENTREGA', 'despesa');
 --
 -- Depois de testar, para limpar os lançamentos de teste:
 -- delete from public.despesas_rod where meta = '{}'::jsonb;
