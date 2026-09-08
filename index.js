@@ -30,7 +30,7 @@ const COMMIT = String(process.env.RENDER_GIT_COMMIT || 'desconhecido').slice(0, 
 // ele também não está na cadeia de ifs do webhook (manter os dois em sincronia).
 const COMANDOS = [
   '/start', '/ajuda', '/estoque', '/zerados', '/baixo', '/relatorio',
-  '/reposicao', '/comissao', '/despesas', '/dinheiro', '/geral',
+  '/semana', '/reposicao', '/comissao', '/despesas', '/dinheiro', '/geral',
   '/anular', '/desanular', '/refazerfechamento', '/versao',
 ];
 
@@ -917,7 +917,134 @@ async function handleDesanular(chatId, text, userId) {
   await sendTelegram(chatId, partes.join('\n'));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`';
+// ---------------------------------------------------------------------------
+// Relatório semanal (domingo 14:00 no grupo de VENDAS, ou /semana na hora).
+//
+// Todo o cálculo é da RPC bot_relatorio_semanal — que já soma as DUAS lojas e
+// não devolve nada em R$. Aqui é só formatação: se um número aparecer neste
+// bloco sem ter vindo da RPC, é bug.
+//
+// Seção vazia some inteira; a única exceção é PARADOS, que fala explicitamente
+// que não há parado — "nenhum pod parado" é notícia boa, e sumir com a seção
+// leria como "esqueci de calcular".
+// ---------------------------------------------------------------------------
+
+const SEMANA_TOP_MODELOS = 6;
+const SEMANA_TOP_SABORES = 8;
+const SEMANA_REPOR = 8;
+const SEMANA_PARADOS = 6;
+const SEMANA_PARADOS_EXTRA = 5;
+
+// Domingo (0) às 14:00. Timezone vai no schedule, como nos outros crons.
+const CRON_RELATORIO_SEMANAL = '0 14 * * 0';
+
+// Comparação com a semana anterior: 🔥 vendeu mais, 📉 menos, ➡️ igual.
+function setaTendencia(atual, anterior) {
+  const a = Number(atual) || 0;
+  const b = Number(anterior) || 0;
+  if (a > b) return '🔥';
+  if (a < b) return '📉';
+  return '➡️';
+}
+
+async function dadosRelatorioSemanal() {
+  try {
+    const d = await callRpc('bot_relatorio_semanal', { p_token: BOT_SYNC_TOKEN });
+    return d && d.ok !== false ? d : null;
+  } catch (err) {
+    console.error('relatorio_semanal:', err.message);
+    return null;
+  }
+}
+
+function montarRelatorioSemanal(d) {
+  const lista = v => (Array.isArray(v) ? v : []);
+  const total = Number(d.total) || 0;
+  const anterior = Number(d.total_anterior) || 0;
+
+  const linhas = [
+    `📊 *RELATÓRIO DA SEMANA (${escapeMd(String(d.periodo ?? ''))})*`,
+    `*${total}* unidades vendidas (semana anterior: ${anterior}) ${setaTendencia(total, anterior)}`,
+  ];
+
+  const top = lista(d.top).slice(0, SEMANA_TOP_MODELOS);
+  if (top.length) {
+    linhas.push('', '🏆 *TOP MODELOS*');
+    top.forEach((m, i) => {
+      const qtd = Number(m.qtd) || 0;
+      const estoque = Number(m.estoque) || 0;
+      // ⚠️ só quando o estoque não cobre o que a semana vendeu.
+      const alerta = estoque < qtd ? ' ⚠️' : '';
+      linhas.push(
+        `${i + 1}. ${escapeMd(String(m.modelo ?? ''))} — ${qtd} un (${Number(m.qtd_ant) || 0}) ` +
+        `${setaTendencia(qtd, m.qtd_ant)} · estoque ${estoque}${alerta}`,
+      );
+      const sabores = lista(m.sabores)
+        .map(s => `${escapeMd(String(s.sabor ?? ''))} ${Number(s.qtd) || 0}`)
+        .join(' · ');
+      if (sabores) linhas.push(`   ${sabores}`);
+    });
+  }
+
+  const sabores = lista(d.top_sabores).slice(0, SEMANA_TOP_SABORES);
+  if (sabores.length) {
+    linhas.push('', '🍬 *TOP SABORES DA SEMANA*');
+    sabores.forEach((s, i) => {
+      linhas.push(
+        `${i + 1}. ${escapeMd(String(s.sabor ?? ''))} — ${Number(s.qtd) || 0} un ` +
+        `(${escapeMd(String(s.modelo ?? ''))})`,
+      );
+    });
+  }
+
+  const repor = lista(d.repor).slice(0, SEMANA_REPOR);
+  if (repor.length) {
+    linhas.push('', '⚠️ *REPOR* (vendeu mais do que tem)');
+    for (const r of repor) {
+      linhas.push(`· ${escapeMd(String(r.modelo ?? ''))} — vendeu ${Number(r.vendeu) || 0}, tem ${Number(r.estoque) || 0}`);
+    }
+  }
+
+  const parados = lista(d.parados).slice(0, SEMANA_PARADOS);
+  linhas.push('', '📉 *PARADOS* (2+ semanas sem vender)');
+  if (parados.length) {
+    for (const p of parados) {
+      linhas.push(`· ${escapeMd(String(p.modelo ?? ''))} — ${Number(p.estoque) || 0} un`);
+    }
+  } else {
+    linhas.push('· nenhum pod parado 👏');
+  }
+
+  // Doces/acompanhamentos: uma linha só, que não é pod e não merece seção.
+  const extra = lista(d.parados_extra).slice(0, SEMANA_PARADOS_EXTRA);
+  if (extra.length) {
+    const itens = extra
+      .map(p => `${escapeMd(String(p.modelo ?? ''))} ${Number(p.estoque) || 0}`)
+      .join(' · ');
+    linhas.push('', `🍬 Encalhados: ${itens}`);
+  }
+
+  return linhas.join('\n');
+}
+
+// Um caminho só para o cron e para o /semana: RPC fora do ar vira aviso, nunca
+// silêncio — semanal demais para alguém notar a ausência sozinho.
+async function textoRelatorioSemanal() {
+  const d = await dadosRelatorioSemanal();
+  return d
+    ? montarRelatorioSemanal(d)
+    : '⚠️ Não consegui montar o relatório da semana. Tente de novo em instantes.';
+}
+
+async function handleRelatorioSemanal(chatId) {
+  await sendTelegram(chatId, await textoRelatorioSemanal());
+}
+
+async function enviarRelatorioSemanal() {
+  await sendTelegram(VENDAS_CHAT_ID, await textoRelatorioSemanal());
+}
+
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`';
 
 const vendasDoDia = {};
 
@@ -959,6 +1086,11 @@ cron.schedule('59 23 * * *', async () => {
 cron.schedule('0 0 * * *', () => {
   resetVendasDoDia();
   console.log('vendasDoDia resetado');
+}, { timezone: 'America/Sao_Paulo' });
+
+cron.schedule(CRON_RELATORIO_SEMANAL, async () => {
+  try { await enviarRelatorioSemanal(); }
+  catch (err) { console.error('Erro no relatório semanal:', err); }
 }, { timezone: 'America/Sao_Paulo' });
 
 const LEMBRETE_SEMANAL = '📸 *FECHAMENTO SEMANAL – 015 PODS*\nÉ terça-feira! Hora de atualizar as fotos do estoque.\n\nPor favor, envie a foto de cada modelo em estoque e depois mande /estoque para conferir a lista.';
@@ -1063,6 +1195,7 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/zerados') { await handleZerados(chatId); return; }
     if (cmd === '/baixo') { await handleBaixo(chatId); return; }
     if (cmd === '/relatorio') { await handleRelatorio(chatId); return; }
+    if (cmd === '/semana') { await handleRelatorioSemanal(chatId); return; }
     if (cmd === '/reposicao') { await handleReposicao(chatId); return; }
     if (cmd === '/comissao') { await handleComissao(chatId); return; }
     if (cmd === '/despesas') { await handleListaRod(chatId, 'despesa'); return; }
@@ -1140,6 +1273,12 @@ module.exports = {
   parseMovimentoLine,
   parseLinhaReposicaoSemPrefixo,
   enviarResumoVendas,
+  handleRelatorioSemanal,
+  enviarRelatorioSemanal,
+  montarRelatorioSemanal,
+  textoRelatorioSemanal,
+  setaTendencia,
+  CRON_RELATORIO_SEMANAL,
   mapResultado,
   buildResumoSingle,
   buildResumoMulti,

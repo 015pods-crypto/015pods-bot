@@ -722,6 +722,139 @@ teste('/refazerfechamento sem data (ou com data inválida) mostra o uso', async 
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comissao').length, 0);
 });
 
+// --- Relatório semanal (/semana + domingo 14h) -----------------------------
+
+// Fixture no formato da RPC bot_relatorio_semanal. Números pequenos e
+// propositais: 2 do top vendem mais do que têm, 1 caiu, 1 empatou.
+const SEMANA_FIXTURE = {
+  ok: true,
+  periodo: '01/09 a 07/09',
+  periodo_anterior: '25/08 a 31/08',
+  total: 224,
+  total_anterior: 202,
+  top: [
+    { modelo: 'Ignite 50000 (V500)', qtd: 28, qtd_ant: 18, estoque: 19,
+      sabores: [{ sabor: 'Grape ice', qtd: 3 }, { sabor: 'Watermelon ice', qtd: 3 }] },
+    { modelo: 'Elfbar 30000', qtd: 10, qtd_ant: 15, estoque: 38, sabores: [] },
+    { modelo: 'Oxbar 50000', qtd: 9, qtd_ant: 9, estoque: 17,
+      sabores: [{ sabor: 'Strawberry Ice', qtd: 2 }] },
+  ],
+  top_sabores: [
+    { sabor: 'Strawberry Ice', modelo: 'Ignite 5500 (V55)', qtd: 3 },
+    { sabor: 'Grape ice', modelo: 'Ignite 50000 (V500)', qtd: 3 },
+  ],
+  repor: [{ modelo: 'Ignite 50000 (V500)', vendeu: 28, estoque: 19 }],
+  parados: [{ modelo: 'Elfbar 45000', estoque: 7 }],
+  parados_extra: [{ modelo: 'Stikadinho', estoque: 63 }, { modelo: 'Kitkat', estoque: 47 }],
+};
+
+teste('/semana devolve o relatório no formato combinado', async (ctx) => {
+  respostas.bot_relatorio_semanal = { status: 200, body: SEMANA_FIXTURE };
+  const [resp] = await mandar(ctx.webhook, update('/semana'));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_relatorio_semanal');
+  assert.strictEqual(rpc.length, 1, 'deveria consultar a RPC uma vez');
+  assert.strictEqual(rpc[0].body.p_token, 'token-de-teste');
+
+  const t = resp.text;
+  assert.ok(t.includes('RELATÓRIO DA SEMANA (01/09 a 07/09)'), t);
+  assert.ok(t.includes('*224* unidades vendidas (semana anterior: 202) 🔥'), t);
+  assert.ok(t.includes('1. Ignite 50000 (V500) — 28 un (18) 🔥 · estoque 19 ⚠️'), t);
+  assert.ok(t.includes('   Grape ice 3 · Watermelon ice 3'), t);
+  assert.ok(t.includes('1. Strawberry Ice — 3 un (Ignite 5500 (V55))'), t);
+  assert.ok(t.includes('· Ignite 50000 (V500) — vendeu 28, tem 19'), t);
+  assert.ok(t.includes('· Elfbar 45000 — 7 un'), t);
+  assert.ok(t.includes('🍬 Encalhados: Stikadinho 63 · Kitkat 47'), t);
+  assert.ok(!t.includes('R$'), 'relatório semanal não fala em dinheiro');
+});
+
+teste('semanal: setas comparam com a semana anterior (🔥 / 📉 / ➡️)', async (ctx) => {
+  const t = ctx.mod.montarRelatorioSemanal(SEMANA_FIXTURE);
+  assert.ok(t.includes('2. Elfbar 30000 — 10 un (15) 📉'), t);
+  assert.ok(t.includes('3. Oxbar 50000 — 9 un (9) ➡️'), t);
+  // estoque cobre o que vendeu → sem ⚠️ na linha
+  const linhaOxbar = t.split('\n').find(l => l.startsWith('3. Oxbar'));
+  assert.ok(!linhaOxbar.includes('⚠️'), linhaOxbar);
+});
+
+teste('semanal: sem parados o texto diz isso em vez de sumir com a seção', async (ctx) => {
+  const t = ctx.mod.montarRelatorioSemanal({ ...SEMANA_FIXTURE, parados: [] });
+  assert.ok(t.includes('📉 *PARADOS*'), t);
+  assert.ok(t.includes('· nenhum pod parado 👏'), t);
+});
+
+teste('semanal: seção vazia (menos PARADOS) é omitida inteira', async (ctx) => {
+  const t = ctx.mod.montarRelatorioSemanal({
+    ok: true, periodo: '01/09 a 07/09', total: 0, total_anterior: 0,
+    top: [], top_sabores: [], repor: [], parados: [], parados_extra: [],
+  });
+  assert.ok(!t.includes('TOP MODELOS'), t);
+  assert.ok(!t.includes('TOP SABORES'), t);
+  assert.ok(!t.includes('REPOR'), t);
+  assert.ok(!t.includes('Encalhados'), t);
+  assert.ok(t.includes('nenhum pod parado'), t);
+  assert.ok(t.includes('*0* unidades vendidas (semana anterior: 0) ➡️'), t);
+});
+
+teste('semanal: respeita os limites de cada seção', async (ctx) => {
+  const muitos = n => Array.from({ length: n }, (_, i) => i);
+  const t = ctx.mod.montarRelatorioSemanal({
+    ok: true, periodo: '01/09 a 07/09', total: 99, total_anterior: 1,
+    top: muitos(10).map(i => ({ modelo: `Modelo${i}`, qtd: 9, qtd_ant: 1, estoque: 99, sabores: [] })),
+    top_sabores: muitos(12).map(i => ({ sabor: `Sabor${i}`, modelo: 'M', qtd: 2 })),
+    repor: muitos(10).map(i => ({ modelo: `Repor${i}`, vendeu: 5, estoque: 1 })),
+    parados: muitos(9).map(i => ({ modelo: `Parado${i}`, estoque: 3 })),
+    parados_extra: muitos(8).map(i => ({ modelo: `Doce${i}`, estoque: 4 })),
+  });
+  assert.ok(t.includes('6. Modelo5') && !t.includes('7. Modelo6'), 'top: 6 modelos');
+  assert.ok(t.includes('8. Sabor7') && !t.includes('9. Sabor8'), 'sabores: 8');
+  assert.ok(t.includes('Repor7') && !t.includes('Repor8'), 'repor: 8');
+  assert.ok(t.includes('Parado5') && !t.includes('Parado6'), 'parados: 6');
+  assert.ok(t.includes('Doce4') && !t.includes('Doce5'), 'encalhados: 5');
+});
+
+teste('semanal: RPC fora do ar vira aviso amigável e o bot segue vivo', async (ctx) => {
+  respostas.bot_relatorio_semanal = { status: 500, body: { message: 'boom' } };
+  const [erro] = await mandar(ctx.webhook, update('/semana'));
+  assert.ok(erro.text.includes('Não consegui montar o relatório da semana'), erro.text);
+  assert.ok(!erro.text.includes('boom'), 'não deve vazar o erro cru');
+
+  // ok:false também é tratado, e o comando seguinte responde normal
+  respostas.bot_relatorio_semanal = { status: 200, body: { ok: false, erro: 'sem dados' } };
+  const [recusa] = await mandar(ctx.webhook, update('/semana'));
+  assert.ok(recusa.text.includes('Não consegui montar'), recusa.text);
+
+  respostas.bot_relatorio_semanal = { status: 200, body: SEMANA_FIXTURE };
+  const [depois] = await mandar(ctx.webhook, update('/semana'));
+  assert.ok(depois.text.includes('RELATÓRIO DA SEMANA'), depois.text);
+});
+
+teste('semanal: o envio automático vai pro grupo de VENDAS', async (ctx) => {
+  respostas.bot_relatorio_semanal = { status: 200, body: SEMANA_FIXTURE };
+  await ctx.mod.enviarRelatorioSemanal();
+  assert.strictEqual(enviadas.length, 1, JSON.stringify(enviadas));
+  assert.strictEqual(String(enviadas[0].chat_id), String(GRUPO_VENDAS));
+  assert.ok(enviadas[0].text.includes('RELATÓRIO DA SEMANA'), enviadas[0].text);
+});
+
+teste('semanal: o agendamento cai domingo às 14h de Brasília', async (ctx) => {
+  const cron = require('node-cron');
+  assert.strictEqual(ctx.mod.CRON_RELATORIO_SEMANAL, '0 14 * * 0');
+  assert.ok(cron.validate(ctx.mod.CRON_RELATORIO_SEMANAL), 'expressão inválida');
+
+  // Não basta conferir a string: é o node-cron quem decide quando ela dispara.
+  const task = cron.schedule(ctx.mod.CRON_RELATORIO_SEMANAL, () => {},
+    { timezone: 'America/Sao_Paulo', scheduled: false });
+  const proximo = new Date(task.getNextRun());
+  task.destroy();
+
+  const emSP = new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'America/Sao_Paulo', weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(proximo);
+  assert.ok(/dom/i.test(emSP), `deveria cair num domingo: ${emSP}`);
+  assert.ok(/14:00/.test(emSP), `deveria cair às 14:00: ${emSP}`);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {
