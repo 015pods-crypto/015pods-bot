@@ -722,6 +722,83 @@ teste('/refazerfechamento sem data (ou com data inválida) mostra o uso', async 
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comissao').length, 0);
 });
 
+// --- /adicionar N (oposto do /anular, só o dono) ---------------------------
+
+const COMISSAO_BASE = {
+  ok: true, mes: '21/08 → 20/09', unidades_hoje: 0, unidades_mes: 39,
+  taxa_atual: 2.5, comissao: 97.5, faltam_para_proxima: 762, proxima_taxa: 2.65,
+};
+
+teste('/adicionar 3 pelo dono chama a RPC com autor e mostra o extrato', async (ctx) => {
+  respostas.bot_adicionar_comissao = { status: 200, body: { ok: true, unidades_adicionadas: 3 } };
+  respostas.bot_comissao = { status: 200, body: { ...COMISSAO_BASE, unidades_mes: 42, comissao: 105 } };
+
+  const [resp] = await mandar(ctx.webhook, update('/adicionar 3', { nome: 'Lucas' }));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_adicionar_comissao');
+  assert.strictEqual(rpc.length, 1, 'deveria chamar bot_adicionar_comissao uma vez');
+  assert.strictEqual(rpc[0].body.p_unidades, 3);
+  assert.strictEqual(rpc[0].body.p_token, 'token-de-teste');
+  assert.deepStrictEqual(rpc[0].body.p_meta, { user_id: String(DONO), nome: 'Lucas' });
+
+  assert.ok(resp.text.includes('➕ 3 unidade(s) adicionada(s) à comissão. (por Lucas)'), resp.text);
+  assert.ok(resp.text.includes('Acumulado: *42* produtos'), resp.text);
+});
+
+teste('/adicionar pelo Rodrigo é recusado e não chega na RPC', async (ctx) => {
+  respostas.bot_adicionar_comissao = { status: 200, body: { ok: true, unidades_adicionadas: 3 } };
+  const [resp] = await mandar(ctx.webhook, update('/adicionar 3', { from: FUNCIONARIO, nome: 'Rodrigo' }));
+  assert.strictEqual(resp.text, '⛔ Só o dono pode adicionar comissão.');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_adicionar_comissao').length, 0);
+});
+
+teste('/adicionar 0 e /adicionar 99 batem na faixa 1..50', async (ctx) => {
+  for (const texto of ['/adicionar 0', '/adicionar 99', '/adicionar', '/adicionar abc']) {
+    const [resp] = await mandar(ctx.webhook, update(texto));
+    assert.strictEqual(resp.text, 'Uso: /adicionar 10 (1 a 50)', `para: ${texto}`);
+  }
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_adicionar_comissao').length, 0);
+});
+
+teste('/adicionar: o extrato bate com o que o /comissao responde depois', async (ctx) => {
+  // Supabase falso com estado: a RPC de adicionar move o acumulado que o
+  // bot_comissao devolve — é assim que dá pra ver os dois batendo.
+  let acumulado = 39;
+  respostas.bot_adicionar_comissao = (body) => {
+    acumulado += body.p_unidades;
+    return { status: 200, body: { ok: true, unidades_adicionadas: body.p_unidades } };
+  };
+  respostas.bot_comissao = () => ({
+    status: 200,
+    body: { ...COMISSAO_BASE, unidades_mes: acumulado, comissao: acumulado * 2.5 },
+  });
+
+  const [antes] = await mandar(ctx.webhook, update('/comissao'));
+  assert.ok(antes.text.includes('Acumulado: *39* produtos'), antes.text);
+
+  const [resp] = await mandar(ctx.webhook, update('/adicionar 3'));
+  assert.ok(resp.text.includes('Acumulado: *42* produtos'), resp.text);
+
+  const [depois] = await mandar(ctx.webhook, update('/comissao'));
+  assert.ok(depois.text.includes('Acumulado: *42* produtos'), depois.text);
+});
+
+teste('/adicionar: erro da RPC não vira adição fantasma', async (ctx) => {
+  respostas.bot_adicionar_comissao = { status: 200, body: { ok: false, erro: 'quantidade deve ser de 1 a 50' } };
+  const [resp] = await mandar(ctx.webhook, update('/adicionar 3'));
+  assert.ok(resp.text.includes('quantidade deve ser de 1 a 50'), resp.text);
+  assert.ok(!resp.text.includes('adicionada(s)'), 'não pode confirmar o que não entrou');
+});
+
+teste('/adicionar: extrato fora do ar não apaga a confirmação da adição', async (ctx) => {
+  respostas.bot_adicionar_comissao = { status: 200, body: { ok: true, unidades_adicionadas: 3 } };
+  respostas.bot_comissao = { status: 500, body: { message: 'boom' } };
+  const [resp] = await mandar(ctx.webhook, update('/adicionar 3'));
+  assert.ok(resp.text.includes('➕ 3 unidade(s) adicionada(s)'), resp.text);
+  assert.ok(resp.text.includes('não consegui puxar o extrato'), resp.text);
+  assert.ok(!resp.text.includes('boom'), 'não deve vazar o erro cru');
+});
+
 // --- Relatório semanal (/semana + domingo 14h) -----------------------------
 
 // Fixture no formato da RPC bot_relatorio_semanal. Números pequenos e

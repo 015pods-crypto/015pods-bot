@@ -31,7 +31,7 @@ const COMMIT = String(process.env.RENDER_GIT_COMMIT || 'desconhecido').slice(0, 
 const COMANDOS = [
   '/start', '/ajuda', '/estoque', '/zerados', '/baixo', '/relatorio',
   '/semana', '/reposicao', '/comissao', '/despesas', '/dinheiro', '/geral',
-  '/anular', '/desanular', '/refazerfechamento', '/versao',
+  '/anular', '/desanular', '/adicionar', '/refazerfechamento', '/versao',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -894,6 +894,35 @@ async function handleAnular(chatId, text, from) {
   await sendTelegram(chatId, `✂️ ${r.data.unidades_anuladas ?? 0} unidade(s) descontada(s) da comissão.${porQuem}`);
 }
 
+// Só o dono: adicionar AUMENTA a comissão, mesma regra do /desanular.
+// Serve pra venda que entrou fora do bot ou ajuste manual a favor do Rod.
+async function handleAdicionar(chatId, text, from) {
+  if (!ehDono(from && from.id)) {
+    await sendTelegram(chatId, '⛔ Só o dono pode adicionar comissão.');
+    return;
+  }
+  const unidades = parseUnidadesComando(text);
+  if (unidades == null) {
+    await sendTelegram(chatId, `Uso: /adicionar 10 (${ANULAR_MIN} a ${ANULAR_MAX})`);
+    return;
+  }
+  const autor = nomeAutor(from);
+  const meta = { user_id: from && from.id != null ? String(from.id) : null, nome: autor };
+
+  const r = await chamarRpcComissao('bot_adicionar_comissao', unidades, meta);
+  if (!r.ok) { await sendTelegram(chatId, r.msg); return; }
+
+  const porQuem = autor ? ` (por ${escapeMd(autor)})` : '';
+  const partes = [
+    `➕ ${r.data.unidades_adicionadas ?? unidades} unidade(s) adicionada(s) à comissão.${porQuem}`,
+  ];
+  // Extrato logo abaixo: é onde se vê a adição já refletida. Sai do mesmo
+  // bot_comissao que alimenta o /comissao, então os dois não têm como divergir.
+  const d = await dadosComissao();
+  partes.push('', d ? formatComissao(d) : '⚠️ _Adição registrada, mas não consegui puxar o extrato agora._');
+  await sendTelegram(chatId, partes.join('\n'));
+}
+
 // Diagnóstico: qual commit está no ar e quais comandos ESTA versão conhece.
 // Só o dono, pra não virar ruído nos grupos.
 async function handleVersao(chatId, userId) {
@@ -1044,7 +1073,7 @@ async function enviarRelatorioSemanal() {
   await sendTelegram(VENDAS_CHAT_ID, await textoRelatorioSemanal());
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`';
 
 const vendasDoDia = {};
 
@@ -1205,6 +1234,7 @@ app.post('/webhook', async (req, res) => {
     // continuam só do dono — a checagem é feita dentro dos handlers.
     if (cmd === '/anular') { await handleAnular(chatId, text, msg.from); return; }
     if (cmd === '/desanular') { await handleDesanular(chatId, text, fromId); return; }
+    if (cmd === '/adicionar') { await handleAdicionar(chatId, text, msg.from); return; }
     if (cmd === '/refazerfechamento') { await handleRefazerFechamento(chatId, text, fromId); return; }
     if (cmd === '/versao') { await handleVersao(chatId, fromId); return; }
 
@@ -1266,6 +1296,7 @@ module.exports = {
   parseDataComando,
   handleAnular,
   handleDesanular,
+  handleAdicionar,
   parseUnidadesComando,
   textoComissao,
   textoComissaoRelatorio,
