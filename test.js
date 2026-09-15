@@ -1956,21 +1956,120 @@ teste('PDF é aceito; sticker e vídeo são ignorados', async (ctx) => {
   assert.strictEqual(enviadas.length, 0);
 });
 
-// Foto com legenda de comando/movimento: o texto manda, a foto é só anexo.
-teste('foto com legenda de baixa continua dando baixa, não vira comprovante', async (ctx) => {
-  respostas.bot_movimentar_estoque = {
+// O caso mais comum do dia a dia: a foto do comprovante vem com a baixa
+// escrita na legenda. Tem que fazer as DUAS coisas, numa resposta só.
+function baixaParaComprovante() {
+  return {
     status: 200,
     body: {
       resultados: [{
-        status: 'ok', direction: 'baixa', model: 'Elfbar 30000',
-        flavor: 'Cherry', qty: 2, stock_after: 8, sale_id: '77',
+        status: 'ok', direction: 'baixa', model: 'Ignite 40000 Mix (V400Mix)',
+        flavor: 'Grape Ice', qty: 1, stock_after: 1, sale_id: '77',
       }],
     },
   };
-  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-2 elfbar 30000 cherry' }));
-  assert.strictEqual(chamadasGemini.length, 0, 'legenda de movimento tem prioridade');
+}
+
+teste('foto COM legenda de baixa dá baixa E registra o comprovante', async (ctx) => {
+  respostas.bot_movimentar_estoque = baixaParaComprovante();
+  respostaGemini = { status: 200, body: geminiJson({ valor: 165, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = {
+    status: 200, body: { ok: true, duplicado: false, total_dia: 1250, qtd_dia: 9 },
+  };
+
+  const respostasBot = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
+  await new Promise(r => setTimeout(r, 200));
+
+  // As duas coisas aconteceram...
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 1);
+  assert.strictEqual(chamadasGemini.length, 1, 'a imagem tem que ser lida também');
+
+  // ...numa RESPOSTA SÓ.
+  assert.strictEqual(respostasBot.length, 1, `devia ser uma mensagem só: ${JSON.stringify(respostasBot)}`);
+  assert.strictEqual(enviadas.length, 1, 'nada de segunda mensagem solta');
+  const t = respostasBot[0].text;
+  assert.ok(t.includes('Baixa registrada'), t);
+  assert.ok(t.includes('Ignite 40000 Mix (V400Mix) – Grape Ice'), t);
+  assert.ok(t.includes('Estoque baixo'), t);
+  assert.ok(t.includes('💰 Comprovante lido: *R$ 165,00* · total do dia: R$ 1.250,00 (9 comprovantes)'), t);
+});
+
+// Independência: a baixa é a parte que não pode falhar.
+teste('falha ao ler a imagem NÃO impede a baixa', async (ctx) => {
+  respostas.bot_movimentar_estoque = baixaParaComprovante();
+  respostaGemini = { status: 429, body: { error: { message: 'quota exceeded' } } };
+
+  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
+  await new Promise(r => setTimeout(r, 200));
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1,
+    'a baixa tem que acontecer de qualquer jeito');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
   assert.ok(resp.text.includes('Baixa registrada'), resp.text);
+  assert.ok(resp.text.includes('Não consegui ler o valor'), resp.text);
+});
+
+teste('comprovante duplicado com legenda de baixa: baixa entra, comprovante avisa', async (ctx) => {
+  respostas.bot_movimentar_estoque = baixaParaComprovante();
+  respostaGemini = { status: 200, body: geminiJson({ valor: 165, codigo: 'E1', confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = {
+    status: 200,
+    body: { ok: true, duplicado: true, motivo: 'codigo', valor: 165, quando: '14/09 16:31' },
+  };
+
+  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
+  await new Promise(r => setTimeout(r, 200));
+
+  assert.ok(resp.text.includes('Baixa registrada'), resp.text);
+  assert.ok(resp.text.includes('COMPROVANTE JÁ ENVIADO'), resp.text);
+  assert.ok(!resp.text.includes('total do dia'), 'duplicado não soma no caixa');
+});
+
+teste('valor fora da faixa com legenda de baixa registra e avisa', async (ctx) => {
+  respostas.bot_movimentar_estoque = baixaParaComprovante();
+  respostaGemini = { status: 200, body: geminiJson({ valor: 2500, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = {
+    status: 200, body: { ok: true, duplicado: false, total_dia: 2500, qtd_dia: 1 },
+  };
+
+  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
+  await new Promise(r => setTimeout(r, 200));
+  assert.ok(resp.text.includes('Baixa registrada'), resp.text);
+  assert.ok(resp.text.includes('valor fora do padrão'), resp.text);
+});
+
+teste('texto de baixa SEM foto segue igual, sem tocar no Gemini', async (ctx) => {
+  respostas.bot_movimentar_estoque = baixaParaComprovante();
+  const [resp] = await mandar(ctx.webhook, update('-1 ignite 40000 mix grape ice'));
+  assert.strictEqual(chamadasGemini.length, 0);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
+  assert.ok(resp.text.includes('Baixa registrada'), resp.text);
+  assert.ok(!resp.text.includes('Comprovante'), resp.text);
+});
+
+// Legenda de COMANDO continua sendo comando puro: a foto é só anexo.
+teste('foto com legenda de comando não vira comprovante', async (ctx) => {
+  respostas.bot_caixa_dia = { status: 200, body: { ok: true, dia: '15/09', comprovantes_qtd: 0 } };
+  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '/caixa' }));
+  assert.strictEqual(chamadasGemini.length, 0, 'comando não dispara leitura de imagem');
+  assert.ok(resp.text.includes('CAIXA DE'), resp.text);
+});
+
+// Linha barrada pela regra de grupo não pode levar a foto junto pro ralo.
+teste('legenda barrada pela regra de grupo ainda registra o comprovante', async (ctx) => {
+  respostaGemini = { status: 200, body: geminiJson({ valor: 165, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = {
+    status: 200, body: { ok: true, duplicado: false, total_dia: 165, qtd_dia: 1 },
+  };
+  // "+" no grupo de VENDAS é barrado.
+  await mandar(ctx.webhook, updateArquivo({ caption: '+1 ignite 40000 mix grape ice' }));
+  await new Promise(r => setTimeout(r, 250));
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 1,
+    'a foto não podia ser descartada junto com a linha barrada');
+  const todos = enviadas.map(e => e.text).join('\n');
+  assert.ok(todos.includes('Comprovante lido'), todos);
 });
 
 teste('foto no grupo de reposição não é tratada como comprovante', async (ctx) => {

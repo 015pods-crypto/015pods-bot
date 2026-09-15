@@ -406,9 +406,19 @@ function mapResultado(r, opFallback) {
   return { ok: false, op: opFallback, msg: `Não processado: "${input}" (${status || 'sem status'})` };
 }
 
-async function handleMovimentos(chatId, lines, messageId, forcarAtacado) {
+async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComprovante) {
   const parsed = lines.map(parseMovimentoLine).filter(Boolean);
   if (!parsed.length) return;
+
+  // Dispara a leitura do comprovante JÁ, sem await: ela corre junto com as RPCs
+  // de estoque em vez de somar a latência do Gemini na frente da baixa.
+  const lendoComprovante = msgComprovante
+    ? lerERegistrarComprovante(chatId, msgComprovante).catch(err => {
+        // Rede de segurança: a baixa não pode cair por causa da foto.
+        console.error('comprovante junto da baixa:', err.message);
+        return PEDE_VALOR;
+      })
+    : null;
 
   // Linhas que o parser entendeu viram itens { produto, qty } para a RPC; qty
   // negativo = baixa, positivo = entrada. Linhas com formato inválido (sem dar
@@ -463,6 +473,11 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado) {
   // falhou, marcar acertaria a venda ANTERIOR.
   const aMarcar = results.filter(r => r.ok && r.op === 'baixa' && r.atacado);
   if (aMarcar.length) linhasMsg.push(...(await marcarVendasAtacado(chatId, aMarcar)));
+
+  if (lendoComprovante) {
+    const texto = await lendoComprovante;
+    if (texto) linhasMsg.push('', texto);
+  }
 
   await sendTelegram(chatId, linhasMsg.join('\n'));
 }
@@ -1902,13 +1917,17 @@ function valorConfiavel(lido) {
   return valor;
 }
 
-async function handleComprovante(chatId, msg) {
+// Lê, registra e DEVOLVE o texto da resposta em vez de enviar. É o que permite
+// a baixa e o comprovante saírem numa mensagem só quando a foto vem com a
+// legenda do movimento.
+// Nunca lança: qualquer erro vira texto pedindo o valor. Isso é o que garante
+// que a leitura do comprovante não encoste na baixa.
+async function lerERegistrarComprovante(chatId, msg) {
   const arquivo = arquivoComprovante(msg);
-  if (!arquivo) return;
+  if (!arquivo) return null;
 
   if (arquivo.size > COMPROVANTE_MAX_BYTES) {
-    await sendTelegram(chatId, `📎 Esse arquivo é grande demais pra eu ler. ${PEDE_VALOR}`);
-    return;
+    return `📎 Esse arquivo é grande demais pra eu ler. ${PEDE_VALOR}`;
   }
 
   let lido = null;
@@ -1922,8 +1941,7 @@ async function handleComprovante(chatId, msg) {
   const valor = valorConfiavel(lido);
   if (valor == null) {
     // Inclui imagem que nem é comprovante: sem valor, não registra nada.
-    await sendTelegram(chatId, PEDE_VALOR);
-    return;
+    return PEDE_VALOR;
   }
 
   let r = null;
@@ -1942,18 +1960,22 @@ async function handleComprovante(chatId, msg) {
     });
   } catch (err) {
     console.error('bot_comprovante_registrar:', err.message);
-    await sendTelegram(chatId, rpcAusente(err.message)
+    return rpcAusente(err.message)
       ? '⚠️ A RPC `bot_comprovante_registrar` não existe no banco — falta rodar o SQL do comprovante.'
-      : `⚠️ Li R$ ${fmtBR(valor)}, mas não consegui registrar. Tente reenviar em instantes.`);
-    return;
+      : `⚠️ Li R$ ${fmtBR(valor)}, mas não consegui registrar. Tente reenviar em instantes.`;
   }
   if (!r || r.ok === false) {
     const detalhe = r && (r.erro || r.msg);
-    await sendTelegram(chatId, `⚠️ ${detalhe || `Li R$ ${fmtBR(valor)}, mas não consegui registrar.`}`);
-    return;
+    return `⚠️ ${detalhe || `Li R$ ${fmtBR(valor)}, mas não consegui registrar.`}`;
   }
 
-  await sendTelegram(chatId, textoComprovante(r, valor));
+  return textoComprovante(r, valor);
+}
+
+// Foto sozinha: a resposta é só o comprovante.
+async function handleComprovante(chatId, msg) {
+  const texto = await lerERegistrarComprovante(chatId, msg);
+  if (texto) await sendTelegram(chatId, texto);
 }
 
 // Monta a resposta do grupo a partir do retorno da RPC.
@@ -2147,14 +2169,22 @@ app.post('/webhook', async (req, res) => {
     const isPedidos = !!pedidosId && chatKey === String(pedidosId);
     if (!isVendas && !isReposicao && !isPrivadoLucas && !isPedidos) return;
 
-    // Comprovante: foto/PDF no grupo de VENDAS, sem legenda de comando. Com
-    // legenda de comando ou movimento, a foto é só anexo e o texto manda.
-    if (isVendas && arquivoComprovante(msg) && !legendaEhComando(text)) {
+    // Comprovante: foto/PDF no grupo de VENDAS.
+    //   sem legenda          -> só o comprovante
+    //   legenda de movimento -> a baixa E o comprovante, numa resposta só
+    //                           (é o caso mais comum: o atendente manda a foto
+    //                           já com a baixa escrita na legenda)
+    //   legenda de comando   -> o comando manda; a foto é só anexo
+    const temComprovante = !!(isVendas && arquivoComprovante(msg));
+    if (temComprovante && !text) {
       await handleComprovante(chatId, msg);
       return;
     }
 
     if (!text) return;
+
+    // A foto viaja junto pro fluxo de movimento; comando (/) não leva.
+    const msgComprovante = temComprovante && !cmd.startsWith('/') ? msg : null;
 
     // Onde /fornecedor, /apelido e /pedido valem.
     const pedidosAqui = podePedidos(chatKey, isPrivadoLucas, pedidosId);
@@ -2210,7 +2240,11 @@ app.post('/webhook', async (req, res) => {
 
       const permitidas = isVendas ? baixas : isReposicao ? entradas : [...baixas, ...entradas];
       if (permitidas.length) {
-        await handleMovimentos(chatId, permitidas, msg.message_id, controleAtacado);
+        await handleMovimentos(chatId, permitidas, msg.message_id, controleAtacado, msgComprovante);
+      } else if (msgComprovante) {
+        // Nenhuma linha passou (regra de grupo, formato), mas a foto está aqui:
+        // o comprovante não pode ser descartado junto.
+        await handleComprovante(chatId, msg);
       } else if (controleAtacado && !registros.length) {
         // Mensagem com cabeçalho de atacado cujas linhas foram todas barradas
         // pela regra de grupo. Ficar calado aqui é como o bug original passou.
@@ -2363,6 +2397,7 @@ module.exports = {
   valorConfiavel,
   textoComprovante,
   handleComprovante,
+  lerERegistrarComprovante,
   textoCaixa,
   handleCaixa,
   nomeAutor,
