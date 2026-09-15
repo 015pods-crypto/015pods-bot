@@ -1989,37 +1989,60 @@ teste('RPC de comprovante ausente diz qual SQL falta', async (ctx) => {
 
 // --- /caixa ----------------------------------------------------------------
 
-teste('/caixa mostra comprovantes, vendas e a diferença', async (ctx) => {
-  respostas.bot_caixa_dia = {
-    status: 200,
-    body: {
-      ok: true, dia: '15/09', comprovantes_total: 450, comprovantes_qtd: 3,
-      vendas_total: 520, vendas_unidades: 8, diferenca: -70,
-    },
-  };
+const CAIXA_DIA = {
+  ok: true, dia: '15/09', comprovantes_total: 450, comprovantes_qtd: 3, ticket_medio: 150,
+  itens: [
+    { hora: '16:42', valor: 150 },
+    { hora: '17:03', valor: 89.9 },
+    { hora: '18:20', valor: 210.1 },
+  ],
+};
+
+teste('/caixa mostra o total recebido, o ticket médio e a lista', async (ctx) => {
+  respostas.bot_caixa_dia = { status: 200, body: CAIXA_DIA };
   const [resp] = await mandar(ctx.webhook, update('/caixa'));
   assert.ok(resp.text.includes('CAIXA DE 15/09'), resp.text);
-  assert.ok(resp.text.includes('Comprovantes: R$ 450,00 (3)'), resp.text);
-  assert.ok(resp.text.includes('Vendas registradas: R$ 520,00 (8 un)'), resp.text);
-  assert.ok(resp.text.includes('Diferença: R$ -70,00'), resp.text);
-  assert.ok(resp.text.includes('confira se todas as vendas foram dadas baixa'), resp.text);
+  assert.ok(resp.text.includes('Total recebido: *R$ 450,00*'), resp.text);
+  assert.ok(resp.text.includes('3 comprovantes · ticket médio R$ 150,00'), resp.text);
+  assert.ok(resp.text.includes('16:42 · R$ 150,00'), resp.text);
+  assert.ok(resp.text.includes('17:03 · R$ 89,90'), resp.text);
 });
 
-teste('/caixa com diferença zero não pede conferência', async (ctx) => {
+// O motivo do ajuste: preço de tabela x venda negociada dava diferença falsa
+// todo dia. A comparação não pode voltar por descuido.
+teste('/caixa NÃO compara com as vendas do sistema', async (ctx) => {
+  respostas.bot_caixa_dia = { status: 200, body: CAIXA_DIA };
+  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  assert.ok(!/Diferen[çc]a/i.test(resp.text), resp.text);
+  assert.ok(!/Vendas registradas/i.test(resp.text), resp.text);
+  assert.ok(!/dadas baixa/i.test(resp.text), resp.text);
+});
+
+teste('/caixa com mais de 15 comprovantes mostra só o resumo', async (ctx) => {
+  const itens = [];
+  for (let i = 0; i < 16; i++) itens.push({ hora: `1${i % 10}:00`, valor: 50 });
   respostas.bot_caixa_dia = {
     status: 200,
-    body: {
-      ok: true, dia: '15/09', comprovantes_total: 450, comprovantes_qtd: 3,
-      vendas_total: 450, vendas_unidades: 6, diferenca: 0,
-    },
+    body: { ok: true, dia: '15/09', comprovantes_total: 800, comprovantes_qtd: 16, ticket_medio: 50, itens },
   };
   const [resp] = await mandar(ctx.webhook, update('/caixa'));
-  assert.ok(resp.text.includes('Diferença: R$ 0,00'), resp.text);
-  assert.ok(!resp.text.includes('confira se todas'), resp.text);
+  assert.ok(resp.text.includes('16 comprovantes · ticket médio R$ 50,00'), resp.text);
+  assert.ok(!resp.text.includes('· R$ 50,00\n'), 'lista longa não pode virar parede de texto');
+  assert.strictEqual(resp.text.split('\n').length, 3, resp.text);
+});
+
+teste('/caixa em dia sem comprovante diz isso, sem ticket médio zerado', async (ctx) => {
+  respostas.bot_caixa_dia = {
+    status: 200,
+    body: { ok: true, dia: '15/09', comprovantes_total: 0, comprovantes_qtd: 0, ticket_medio: 0, itens: [] },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  assert.ok(resp.text.includes('Nenhum comprovante registrado'), resp.text);
+  assert.ok(!resp.text.includes('ticket médio'), resp.text);
 });
 
 teste('/caixa 15/09 consulta o dia pedido', async (ctx) => {
-  respostas.bot_caixa_dia = { status: 200, body: { ok: true, dia: '15/09', diferenca: 0 } };
+  respostas.bot_caixa_dia = { status: 200, body: { ok: true, dia: '15/09', comprovantes_qtd: 0 } };
   await mandar(ctx.webhook, update('/caixa 15/09'));
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_dia')[0].body.p_data, '2026-09-15');
 });
@@ -2042,17 +2065,15 @@ teste('o resumo diário das 23:59 leva o caixa junto', async (ctx) => {
     status: 200,
     body: { ok: true, mes: '21/08 → 20/09', unidades_hoje: 4, unidades_mes: 120, taxa_atual: 1.5, comissao: 180 },
   };
-  respostas.bot_caixa_dia = {
-    status: 200,
-    body: {
-      ok: true, dia: '15/09', comprovantes_total: 450, comprovantes_qtd: 3,
-      vendas_total: 450, vendas_unidades: 6, diferenca: 0,
-    },
-  };
+  respostas.bot_caixa_dia = { status: 200, body: CAIXA_DIA };
   await ctx.mod.enviarResumoVendas();
   const noGrupo = enviadas.find(e => String(e.chat_id) === String(GRUPO_VENDAS));
   assert.ok(noGrupo.text.includes('CAIXA DE 15/09'), noGrupo.text);
-  assert.ok(noGrupo.text.includes('Comprovantes: R$ 450,00 (3)'), noGrupo.text);
+  assert.ok(noGrupo.text.includes('Total recebido: *R$ 450,00*'), noGrupo.text);
+  // O resumo das 23:59 já é longo: entra só o total, sem a lista e sem
+  // comparação nenhuma com as vendas.
+  assert.ok(!noGrupo.text.includes('16:42 · R$ 150,00'), noGrupo.text);
+  assert.ok(!/Diferen[çc]a/i.test(noGrupo.text), noGrupo.text);
 });
 
 // --- Runner ----------------------------------------------------------------

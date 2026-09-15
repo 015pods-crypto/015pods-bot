@@ -1977,11 +1977,20 @@ function textoComprovante(r, valor) {
 }
 
 // ---------------------------------------------------------------------------
-// /caixa — comprovantes x vendas do dia
+// /caixa — o que entrou de dinheiro no dia
+//
+// SEM COMPARAÇÃO COM AS VENDAS DO SISTEMA: o total do sistema sai do preço de
+// tabela, mas venda real tem desconto e negociação. A "diferença" dava vermelho
+// todo santo dia sem nada de errado ter acontecido — número que sempre acusa
+// não acusa nada, e o pessoal para de olhar.
 // ---------------------------------------------------------------------------
 
-// `data` ISO (YYYY-MM-DD) ou null = hoje. Nunca lança.
-async function textoCaixa(data) {
+// Acima disso a lista vira parede de texto no grupo; fica só o resumo.
+const CAIXA_MAX_LISTA = 15;
+
+// `data` ISO (YYYY-MM-DD) ou null = hoje. `compacto` corta a lista de itens —
+// é o modo do resumo das 23:59, que já é uma mensagem longa. Nunca lança.
+async function textoCaixa(data, { compacto = false } = {}) {
   let d = null;
   try {
     const body = { p_token: BOT_SYNC_TOKEN };
@@ -1996,17 +2005,23 @@ async function textoCaixa(data) {
   if (!d || d.ok === false) return `⚠️ ${(d && (d.erro || d.msg)) || 'Erro ao consultar o caixa do dia.'}`;
 
   const dia = d.dia || d.data || (data ? data.split('-').reverse().slice(0, 2).join('/') : 'hoje');
-  const diferenca = Number(d.diferenca) || 0;
-  const linhas = [
-    `💵 *CAIXA DE ${escapeMd(String(dia))}*`,
-    `Comprovantes: R$ ${fmtBR(d.comprovantes_total)} (${d.comprovantes_qtd ?? 0})`,
-    `Vendas registradas: R$ ${fmtBR(d.vendas_total)} (${d.vendas_unidades ?? 0} un)`,
-    `Diferença: R$ ${fmtBR(diferenca)}`,
-  ];
-  // A diferença é o ponto do comando: sem a explicação, um número solto no
-  // grupo não diz a ninguém o que fazer com ele.
-  if (Math.abs(diferenca) >= 0.005) {
-    linhas.push('_confira se todas as vendas foram dadas baixa ou se falta comprovante_');
+  const qtd = Number(d.comprovantes_qtd) || 0;
+  const linhas = [`💵 *CAIXA DE ${escapeMd(String(dia))}*`];
+
+  if (!qtd) {
+    linhas.push('Nenhum comprovante registrado.');
+    return linhas.join('\n');
+  }
+
+  linhas.push(`Total recebido: *R$ ${fmtBR(d.comprovantes_total)}*`);
+  linhas.push(`${qtd} comprovantes · ticket médio R$ ${fmtBR(d.ticket_medio)}`);
+
+  const itens = Array.isArray(d.itens) ? d.itens : [];
+  if (!compacto && itens.length && itens.length <= CAIXA_MAX_LISTA) {
+    linhas.push('');
+    for (const it of itens) {
+      linhas.push(`${escapeMd(String(it.hora ?? ''))} · R$ ${fmtBR(it.valor)}`);
+    }
   }
   return linhas.join('\n');
 }
@@ -2020,7 +2035,7 @@ async function handleCaixa(chatId, text) {
   await sendTelegram(chatId, await textoCaixa(parseDataComando(text)));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — comprovantes x vendas do dia (ou `/caixa 15/09`)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)';
 
 const vendasDoDia = {};
 
@@ -2052,7 +2067,7 @@ async function enviarResumoVendas() {
   // Bloco final: comissão (com cabeçalho de FECHAMENTO no último dia do período)
   // e o caixa do dia — é o fechamento de dinheiro ao lado do de unidades.
   linhas.push('', await textoComissaoRelatorio());
-  linhas.push('', await textoCaixa(null));
+  linhas.push('', await textoCaixa(null, { compacto: true }));
   await sendTelegram(VENDAS_CHAT_ID, linhas.join('\n'));
 }
 
