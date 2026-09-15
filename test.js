@@ -1266,6 +1266,193 @@ teste('RPC de pedido ausente diz qual SQL falta', async (ctx) => {
   assert.ok(resp.text.includes('falta rodar o SQL'), resp.text);
 });
 
+// --- Atacado ---------------------------------------------------------------
+
+const BAIXA_OK = {
+  status: 200,
+  body: {
+    resultados: [{
+      status: 'ok', direction: 'baixa', model: 'Elfbar 30000',
+      flavor: 'Cherry', qty: 6, stock_after: 4,
+    }],
+  },
+};
+
+teste('venda com "atacado" baixa normal, tira a palavra do produto e marca a venda', async (ctx) => {
+  respostas.bot_movimentar_estoque = BAIXA_OK;
+  respostas.bot_marcar_atacado = {
+    status: 200, body: { ok: true, ja_marcada: false, sale_id: '77', unidades: 6, quando: '14/09 19:32' },
+  };
+  const [resp] = await mandar(ctx.webhook, update('-6 elfbar 30000 cherry atacado'));
+
+  // A palavra de controle NÃO pode ir junto na busca do produto.
+  const mov = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
+  assert.deepStrictEqual(mov[0].body.p_items, [{ produto: 'elfbar 30000 cherry', qty: -6 }]);
+  assert.strictEqual(mov[0].body.p_meta.atacado, true);
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 1,
+    'deveria marcar a venda como atacado');
+  assert.ok(resp.text.includes('Baixa registrada (ATACADO)'), resp.text);
+  assert.ok(resp.text.includes('Elfbar 30000 – Cherry'), resp.text);
+  assert.ok(resp.text.includes('Saiu: *6*'), resp.text);
+});
+
+teste('ATACADO em maiúscula e no meio da linha também vale', async (ctx) => {
+  respostas.bot_movimentar_estoque = BAIXA_OK;
+  respostas.bot_marcar_atacado = { status: 200, body: { ok: true } };
+  await mandar(ctx.webhook, update('-6 ATACADO elfbar 30000 cherry'));
+  const mov = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
+  assert.deepStrictEqual(mov[0].body.p_items, [{ produto: 'elfbar 30000 cherry', qty: -6 }]);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 1);
+});
+
+teste('venda normal não vira atacado nem chama a RPC de marca', async (ctx) => {
+  respostas.bot_movimentar_estoque = BAIXA_OK;
+  const [resp] = await mandar(ctx.webhook, update('-6 elfbar 30000 cherry'));
+
+  const mov = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
+  assert.deepStrictEqual(mov[0].body.p_items, [{ produto: 'elfbar 30000 cherry', qty: -6 }]);
+  assert.strictEqual(mov[0].body.p_meta.atacado, undefined);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
+  assert.ok(resp.text.includes('Baixa registrada!'), resp.text);
+  assert.ok(!resp.text.includes('ATACADO'), resp.text);
+});
+
+// Produto que não existe não pode gerar marca de atacado: marcaria a venda
+// ANTERIOR, que não tem nada a ver.
+teste('atacado em baixa que falhou não marca venda nenhuma', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200, body: { resultados: [{ status: 'nao_encontrado', input: 'elfbari cherry' }] },
+  };
+  const [resp] = await mandar(ctx.webhook, update('-6 elfbari cherry atacado'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0,
+    'sem baixa não pode marcar a venda anterior');
+  assert.ok(resp.text.includes('Produto não encontrado'), resp.text);
+});
+
+teste('"-6 atacado" (só a palavra) é formato inválido, não venda', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('-6 atacado'));
+  assert.ok(resp.text.includes('Formato inválido'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
+});
+
+teste('falha ao marcar atacado avisa no grupo (não some em silêncio)', async (ctx) => {
+  respostas.bot_movimentar_estoque = BAIXA_OK;
+  respostas.bot_marcar_atacado = { status: 404, body: { message: 'Could not find the function' } };
+  const [resp] = await mandar(ctx.webhook, update('-6 elfbar 30000 cherry atacado'));
+  assert.ok(resp.text.includes('Baixa registrada (ATACADO)'), resp.text);
+  assert.ok(resp.text.includes('bot_marcar_atacado'), resp.text);
+  assert.ok(resp.text.includes('/atacado'), resp.text);
+});
+
+teste('entrada com a palavra atacado limpa o texto mas não marca nada', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: {
+      resultados: [{
+        status: 'ok', direction: 'entrada', model: 'Elfbar 30000',
+        flavor: 'Cherry', qty: 6, stock_after: 10,
+      }],
+    },
+  };
+  await mandar(ctx.webhook, update('+6 elfbar 30000 cherry atacado', { chat: GRUPO_REPOSICAO }));
+  const mov = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
+  assert.deepStrictEqual(mov[0].body.p_items, [{ produto: 'elfbar 30000 cherry', qty: 6 }]);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
+});
+
+// --- /atacado (correção) ---------------------------------------------------
+
+teste('/atacado marca a última venda e diz qual foi', async (ctx) => {
+  respostas.bot_marcar_atacado = {
+    status: 200, body: { ok: true, ja_marcada: false, sale_id: '77', unidades: 6, quando: '14/09 19:32' },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/atacado'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 1);
+  assert.ok(resp.text.includes('Marcada como ATACADO'), resp.text);
+  assert.ok(resp.text.includes('*6* unidade(s)'), resp.text);
+  assert.ok(resp.text.includes('14/09 19:32'), resp.text);
+});
+
+teste('/atacado numa venda já marcada não duplica, só avisa', async (ctx) => {
+  respostas.bot_marcar_atacado = {
+    status: 200, body: { ok: true, ja_marcada: true, unidades: 6, quando: '14/09 19:32' },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/atacado'));
+  assert.ok(resp.text.includes('já estava marcada'), resp.text);
+});
+
+teste('/atacado sem venda nenhuma devolve o erro da RPC', async (ctx) => {
+  respostas.bot_marcar_atacado = {
+    status: 200, body: { ok: false, erro: 'nenhuma venda do bot encontrada' },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/atacado'));
+  assert.ok(resp.text.includes('nenhuma venda do bot encontrada'), resp.text);
+});
+
+teste('/atacado do Rodrigo é recusado sem ROD_USER_ID, e a recusa mostra o id dele', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/atacado', { from: FUNCIONARIO }));
+  assert.ok(resp.text.includes('Só o dono e o Rodrigo'), resp.text);
+  assert.ok(resp.text.includes(String(FUNCIONARIO)), `a recusa tem que mostrar o id: ${resp.text}`);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
+});
+
+teste('podeMarcarAtacado: dono sempre; outro só com ROD_USER_ID cadastrado', async (ctx) => {
+  assert.strictEqual(ctx.mod.podeMarcarAtacado(DONO), true);
+  assert.strictEqual(ctx.mod.podeMarcarAtacado(FUNCIONARIO), false);
+});
+
+// --- Quebra varejo/atacado no extrato --------------------------------------
+
+const COMISSAO_ATACADO = {
+  ok: true, mes: '21/08 → 20/09', unidades_hoje: 12,
+  unidades_mes: 812, unidades_varejo: 780, unidades_atacado: 32,
+  taxa_atual: 2.65, valor_atacado: 2, comissao: 2131,
+  faltam_para_proxima: 88, proxima_taxa: 3,
+};
+
+teste('/comissao mostra a quebra varejo + atacado', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: COMISSAO_ATACADO };
+  const [resp] = await mandar(ctx.webhook, update('/comissao'));
+
+  assert.ok(resp.text.includes('Unidades: *812* (780 varejo + 32 atacado)'), resp.text);
+  assert.ok(resp.text.includes('Varejo: 780 × R$ 2,65 = R$ 2.067,00'), resp.text);
+  assert.ok(resp.text.includes('Atacado: 32 × R$ 2,00 = R$ 64,00'), resp.text);
+  assert.ok(resp.text.includes('💰 Comissão: *R$ 2.131,00*'), resp.text);
+});
+
+// O total exibido é o da RPC, não a soma feita aqui: quem decide é o banco.
+teste('o total do extrato vem da RPC, mesmo se não bater com as parcelas', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: { ...COMISSAO_ATACADO, comissao: 9999 } };
+  const [resp] = await mandar(ctx.webhook, update('/comissao'));
+  assert.ok(resp.text.includes('R$ 9.999,00'), resp.text);
+});
+
+teste('ciclo sem atacado mantém o extrato de sempre', async (ctx) => {
+  respostas.bot_comissao = {
+    status: 200,
+    body: {
+      ok: true, mes: '21/08 → 20/09', unidades_hoje: 4, unidades_mes: 120,
+      unidades_varejo: 120, unidades_atacado: 0, taxa_atual: 1.5,
+      valor_atacado: 2, comissao: 180, faltam_para_proxima: 30, proxima_taxa: 2,
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/comissao'));
+  assert.ok(resp.text.includes('Acumulado: *120* produtos'), resp.text);
+  assert.ok(!resp.text.includes('atacado'), `sem atacado no ciclo não polui o extrato: ${resp.text}`);
+});
+
+teste('fechamento mostra a quebra de atacado', async (ctx) => {
+  const texto = ctx.mod.montarFechamento(
+    COMISSAO_ATACADO, { ok: true, total: 143 }, { ok: true, total: 500 },
+  );
+  assert.ok(texto.includes('Unidades: *812* (780 varejo + 32 atacado)'), texto);
+  assert.ok(texto.includes('Atacado: 32 × R$ 2,00 = R$ 64,00'), texto);
+  assert.ok(texto.includes('💰 Comissão: *R$ 2.131,00*'), texto);
+  assert.ok(texto.includes('Total a pagar: R$ 2.274,00'), texto);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {

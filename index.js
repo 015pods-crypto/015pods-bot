@@ -19,6 +19,10 @@ const REPOSICAO_CHAT_ID = String(process.env.REPOSICAO_CHAT_ID || '-5332904723')
 const LUCAS_USER_ID = String(process.env.LUCAS_USER_ID || '5984124812');
 // Dono: único que pode anular/desanular comissão (/anular, /desanular).
 const ADMIN_USER_ID = String(process.env.ADMIN_USER_ID || '5984124812');
+// Rodrigo: além do dono, pode corrigir uma venda com /atacado. Sem a env
+// definida, só o dono — e a recusa mostra o id de quem tentou, que é como se
+// descobre o número pra cadastrar (não tem outro jeito de pegar o id dele).
+const ROD_USER_ID = String(process.env.ROD_USER_ID || '');
 
 // Commit que está rodando (o Render injeta RENDER_GIT_COMMIT no deploy).
 // Existe pra responder "que versão está no ar?" sem abrir o painel: um deploy
@@ -33,6 +37,7 @@ const COMANDOS = [
   '/semana', '/reposicao', '/comissao', '/despesas', '/dinheiro', '/geral',
   '/anular', '/desanular', '/adicionar', '/refazerfechamento', '/versao',
   '/chatid', '/setgrupopedidos', '/fornecedor', '/apelido', '/pedido',
+  '/atacado',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -262,6 +267,17 @@ function parseRegistroRod(line, palavras) {
   return null; // 4. estoque
 }
 
+// Venda de atacado: a palavra "atacado" em qualquer posição da linha. Ela é
+// ARRANCADA da descrição antes da busca do produto — senão "elfbar 30000 cherry
+// atacado" não acharia nada, e uma palavra de controle viraria erro de produto.
+const RE_ATACADO = /\batacado\b/gi;
+
+function extrairAtacado(desc) {
+  if (!RE_ATACADO.test(desc)) { RE_ATACADO.lastIndex = 0; return { atacado: false, desc }; }
+  RE_ATACADO.lastIndex = 0;
+  return { atacado: true, desc: desc.replace(RE_ATACADO, ' ').replace(/\s+/g, ' ').trim() };
+}
+
 function parseMovimentoLine(line) {
   const raw = line.trim();
   if (!raw) return null;
@@ -270,15 +286,18 @@ function parseMovimentoLine(line) {
     const m = raw.match(/^-(\d+)\s+(.+)$/) || raw.match(/^-(.+)$/);
     if (!m) return null;
     const qtd = m[2] ? parseInt(m[1], 10) : 1;
-    const desc = m[2] ? m[2].trim() : m[1].trim();
+    const bruta = m[2] ? m[2].trim() : m[1].trim();
+    const { atacado, desc } = extrairAtacado(bruta);
+    // "-6 atacado" (só a palavra de controle) não é venda de nada.
     if (!desc || !qtd || qtd <= 0) return { op: 'baixa', invalid: true, raw };
-    return { op: 'baixa', qtd, desc, raw };
+    return { op: 'baixa', qtd, desc, atacado, raw };
   }
   if (c === '+') {
     const m = raw.match(/^\+(\d+)\s+(.+)$/);
     if (!m) return { op: 'entrada', invalid: true, raw };
     const qtd = parseInt(m[1], 10);
-    const desc = m[2].trim();
+    // Entrada não é venda: a palavra sai da descrição, mas não marca nada.
+    const { desc } = extrairAtacado(m[2].trim());
     if (!desc || !qtd || qtd <= 0) return { op: 'entrada', invalid: true, raw };
     return { op: 'entrada', qtd, desc, raw };
   }
@@ -300,7 +319,8 @@ function buildResumoSingle(r) {
   if (!r.ok) return `❌ ${r.msg}`;
   if (r.op === 'baixa') {
     const aviso = r.restante <= 0 ? '\n🔴 _Estoque zerado!_' : r.restante === 1 ? '\n🟡 _Estoque baixo!_' : '';
-    return `✅ *Baixa registrada!*\n📦 ${r.modelo} – ${r.sabor}\n➖ Saiu: *${r.qtd}*\n📊 Restante: *${r.restante}*${aviso}`;
+    const titulo = r.atacado ? '✅ *Baixa registrada (ATACADO)!*' : '✅ *Baixa registrada!*';
+    return `${titulo}\n📦 ${r.modelo} – ${r.sabor}\n➖ Saiu: *${r.qtd}*\n📊 Restante: *${r.restante}*${aviso}`;
   }
   return `✅ *Entrada registrada!*\n📦 ${r.modelo} – ${r.sabor}\n➕ Entrou: *${r.qtd}*\n📊 Total agora: *${r.restante}*`;
 }
@@ -312,7 +332,10 @@ function buildResumoMulti(results) {
   const out = [];
   if (baixas.length) {
     out.push('✅ *Baixas registradas:*');
-    for (const r of baixas) out.push(`📦 ${r.modelo} – ${r.sabor}: -${r.qtd} (restante: ${r.restante})`);
+    for (const r of baixas) {
+      const marca = r.atacado ? ' _(atacado)_' : '';
+      out.push(`📦 ${r.modelo} – ${r.sabor}: -${r.qtd} (restante: ${r.restante})${marca}`);
+    }
   }
   if (entradas.length) {
     if (out.length) out.push('');
@@ -382,11 +405,13 @@ async function handleMovimentos(chatId, lines, messageId) {
   // pra extrair produto/qtd) são respondidas localmente, sem ir à RPC.
   const items = [];
   const plan = [];
+  let pediuAtacado = false;
   for (const item of parsed) {
     if (item.invalid) {
       plan.push({ invalid: true, op: item.op, raw: item.raw });
     } else {
-      plan.push({ op: item.op, itemIndex: items.length });
+      plan.push({ op: item.op, itemIndex: items.length, atacado: !!item.atacado });
+      if (item.atacado) pediuAtacado = true;
       items.push({ produto: item.desc, qty: item.op === 'baixa' ? -item.qtd : item.qtd });
     }
   }
@@ -396,7 +421,9 @@ async function handleMovimentos(chatId, lines, messageId) {
     const data = await callRpc('bot_movimentar_estoque', {
       p_token: BOT_SYNC_TOKEN,
       p_items: items,
-      p_meta: { chat_id: chatId, message_id: messageId },
+      // `atacado` aqui é só procedência: a marca que a bot_comissao lê é a
+      // palavra no `notes`, gravada pela bot_marcar_atacado logo abaixo.
+      p_meta: { chat_id: chatId, message_id: messageId, atacado: pediuAtacado || undefined },
     });
     resultados = (data && data.resultados) || [];
   }
@@ -409,14 +436,24 @@ async function handleMovimentos(chatId, lines, messageId) {
       continue;
     }
     const mapped = mapResultado(resultados[p.itemIndex], p.op);
+    if (p.atacado) mapped.atacado = true;
     // Mantém o resumo diário de vendas (cron 23:50) funcionando: cada baixa ok
     // é registrada por modelo, como era feito na lógica antiga da planilha.
     if (mapped.ok && mapped.op === 'baixa') registrarVenda(mapped.modelo, mapped.qtd);
     results.push(mapped);
   }
 
-  const msg = results.length === 1 ? buildResumoSingle(results[0]) : buildResumoMulti(results);
-  await sendTelegram(chatId, msg);
+  const linhasMsg = [results.length === 1 ? buildResumoSingle(results[0]) : buildResumoMulti(results)];
+
+  // A marca de atacado só faz sentido se alguma baixa de fato entrou.
+  const baixouAtacado = results.some(r => r.ok && r.op === 'baixa' && r.atacado);
+  if (baixouAtacado) {
+    const marca = await marcarAtacado();
+    if (!marca.ok) linhasMsg.push(`⚠️ _${marca.msg} Use /atacado pra corrigir._`);
+    else if (marca.ja_marcada) linhasMsg.push('🏷️ _Essa venda já estava marcada como atacado._');
+  }
+
+  await sendTelegram(chatId, linhasMsg.join('\n'));
 }
 
 function totaisPorModelo(produtos) {
@@ -529,12 +566,34 @@ async function dadosComissao() {
 }
 
 // Formato padrão (usado pelo /comissao e pelo relatório em dias normais).
+// Quebra varejo/atacado. Devolve null quando não houve atacado no ciclo — aí
+// o extrato fica no formato de sempre, sem linha de "0 atacado" pra ler.
+//
+// O TOTAL exibido é sempre o `comissao` da RPC, nunca a soma feita aqui: as
+// duas linhas são só a memória de cálculo, e quem decide quanto o Rod recebe
+// é o banco.
+function linhasQuebraAtacado(d) {
+  const atacado = Number(d.unidades_atacado) || 0;
+  if (!atacado) return null;
+  const varejo = Number(d.unidades_varejo) || 0;
+  const taxa = Number(d.taxa_atual) || 0;
+  const valorAtacado = Number(d.valor_atacado) || 0;
+  return [
+    `Unidades: *${d.unidades_mes ?? 0}* (${varejo} varejo + ${atacado} atacado)`,
+    `Varejo: ${varejo} × R$ ${fmtBR(taxa)} = R$ ${fmtBR(varejo * taxa)}`,
+    `Atacado: ${atacado} × R$ ${fmtBR(valorAtacado)} = R$ ${fmtBR(atacado * valorAtacado)}`,
+  ];
+}
+
 function formatComissao(d) {
+  const quebra = linhasQuebraAtacado(d);
   const linhas = [
     `📊 *Comissão — ${escapeMd(String(d.mes ?? ''))}*`,
     `Hoje: *${d.unidades_hoje ?? 0}* produtos`,
-    `Acumulado: *${d.unidades_mes ?? 0}* produtos`,
-    `Faixa atual: R$ ${fmtBR(d.taxa_atual)}/produto`,
+    ...(quebra || [
+      `Acumulado: *${d.unidades_mes ?? 0}* produtos`,
+      `Faixa atual: R$ ${fmtBR(d.taxa_atual)}/produto`,
+    ]),
     `💰 Comissão: *R$ ${fmtBR(d.comissao)}*`,
   ];
   if (d.faltam_para_proxima == null) {
@@ -583,10 +642,13 @@ function montarFechamento(d, desp, dinh, opts = {}) {
   const comissao = Number(d.comissao) || 0;
   const titulo = opts.titulo || `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`;
   const rodape = opts.rodape || '_(amanhã começa o novo período)_';
+  const quebra = linhasQuebraAtacado(d);
   const linhas = [
     titulo,
-    `Total: *${d.unidades_mes ?? 0}* produtos`,
-    `Faixa final: R$ ${fmtBR(d.taxa_atual)}/produto`,
+    ...(quebra || [
+      `Total: *${d.unidades_mes ?? 0}* produtos`,
+      `Faixa final: R$ ${fmtBR(d.taxa_atual)}/produto`,
+    ]),
     `💰 Comissão: *R$ ${fmtBR(comissao)}*`,
   ];
   let aPagar = null;
@@ -943,6 +1005,64 @@ async function handleAdicionar(chatId, text, from) {
   const d = await dadosComissao();
   partes.push('', d ? formatComissao(d) : '⚠️ _Adição registrada, mas não consegui puxar o extrato agora._');
   await sendTelegram(chatId, partes.join('\n'));
+}
+
+// ---------------------------------------------------------------------------
+// Atacado
+// Venda de atacado paga valor fixo por unidade (integration_config
+// .comissao_atacado_valor) em vez da taxa da faixa, mas as unidades CONTAM
+// para o volume do ciclo. Quem faz essa conta é a bot_comissao; o papel do bot
+// é só marcar a venda — a marca é a palavra "atacado" no `notes`.
+//
+// UMA VENDA POR VEZ: a bot_marcar_atacado marca a ÚLTIMA venda do bot. É o que
+// o /atacado precisa, e cobre o caso normal (mensagem de uma linha só). Numa
+// mensagem com várias baixas, só a última vira atacado — por isso a resposta
+// devolve QUAL venda foi marcada, em vez de dizer "pronto" e deixar o resto
+// invisível.
+// ---------------------------------------------------------------------------
+
+// Nunca lança. { ok, ja_marcada, unidades, quando, msg }.
+async function marcarAtacado() {
+  try {
+    const d = await callRpc('bot_marcar_atacado', { p_token: BOT_SYNC_TOKEN });
+    if (!d || d.ok === false) {
+      return { ok: false, msg: (d && (d.erro || d.msg)) || 'Não consegui marcar a venda como atacado.' };
+    }
+    return { ok: true, ja_marcada: !!d.ja_marcada, unidades: d.unidades, quando: d.quando };
+  } catch (err) {
+    console.error('bot_marcar_atacado:', err.message);
+    return {
+      ok: false,
+      msg: rpcAusente(err.message)
+        ? 'A RPC `bot_marcar_atacado` não existe no banco — falta rodar o SQL do atacado.'
+        : 'Erro ao falar com o servidor.',
+    };
+  }
+}
+
+// Quem pode corrigir: o dono e o Rodrigo. Sem ROD_USER_ID configurado só o
+// dono passa — e a recusa mostra o id de quem tentou, que é justamente como o
+// Lucas descobre o número do Rodrigo pra cadastrar no Render.
+function podeMarcarAtacado(userId) {
+  const id = String(userId ?? '');
+  return ehDono(id) || (!!ROD_USER_ID && id === ROD_USER_ID);
+}
+
+async function handleAtacado(chatId, from) {
+  const userId = from && from.id;
+  if (!podeMarcarAtacado(userId)) {
+    await sendTelegram(chatId,
+      `⛔ Só o dono e o Rodrigo podem marcar atacado.\n_(seu id: \`${userId}\` — pra liberar, cadastre em ROD\\_USER\\_ID no Render)_`);
+    return;
+  }
+  const marca = await marcarAtacado();
+  if (!marca.ok) { await sendTelegram(chatId, `⚠️ ${marca.msg}`); return; }
+  if (marca.ja_marcada) {
+    await sendTelegram(chatId, `🏷️ A última venda (${marca.unidades ?? '?'} un · ${escapeMd(String(marca.quando ?? ''))}) já estava marcada como atacado.`);
+    return;
+  }
+  await sendTelegram(chatId,
+    `🏷️ *Marcada como ATACADO*\nÚltima venda: *${marca.unidades ?? '?'}* unidade(s) — ${escapeMd(String(marca.quando ?? ''))}`);
 }
 
 // Diagnóstico: qual commit está no ar e quais comandos ESTA versão conhece.
@@ -1472,7 +1592,7 @@ async function handlePedido(chatId, text) {
   for (const parte of partes) await sendTelegram(chatId, parte);
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado` (ou `/atacado` pra corrigir a última)\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)';
 
 const vendasDoDia = {};
 
@@ -1659,6 +1779,7 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/desanular') { await handleDesanular(chatId, text, fromId); return; }
     if (cmd === '/adicionar') { await handleAdicionar(chatId, text, msg.from); return; }
     if (cmd === '/refazerfechamento') { await handleRefazerFechamento(chatId, text, fromId); return; }
+    if (cmd === '/atacado') { await handleAtacado(chatId, msg.from); return; }
     if (cmd === '/versao') { await handleVersao(chatId, fromId); return; }
 
     // Pedidos: só no grupo de pedidos e no privado do dono (enquanto a chave
@@ -1743,6 +1864,10 @@ module.exports = {
   handlePedido,
   montarFechamento,
   linhaAcerto,
+  linhasQuebraAtacado,
+  extrairAtacado,
+  podeMarcarAtacado,
+  handleAtacado,
   nomeAutor,
   fmtValor,
   handleRefazerFechamento,
