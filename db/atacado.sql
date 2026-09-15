@@ -1,22 +1,27 @@
 -- ===========================================================================
--- Atacado: marcar a última venda do bot
+-- Atacado: marcar UMA VENDA ESPECÍFICA, pelo id
 --
--- A REGRA em si (valor fixo por unidade em vez da taxa da faixa, com as
+-- A regra em si (valor fixo por unidade em vez da taxa da faixa, com as
 -- unidades contando pro volume do ciclo) já vive na bot_comissao, que
 -- identifica a venda pela palavra "atacado" no `notes`. Este Run entrega só a
 -- outra ponta: como essa palavra chega no `notes`.
 --
+-- POR QUE POR ID, E NÃO "A ÚLTIMA": marcar atacado mexe em comissão. "A última
+-- venda" é uma mira que se move sozinha — entre registrar e marcar, outra
+-- venda pode entrar e levar a marca no lugar da certa. Por isso a
+-- bot_marcar_atacado EXIGE p_sale_id: sem id, ela recusa em vez de adivinhar.
+--
+-- Quem descobre o id da venda a corrigir é a bot_ultima_venda, e ela nunca
+-- marca nada — só devolve o candidato pro bot confirmar com o usuário. São
+-- duas funções de propósito: escolher o alvo e disparar são passos separados.
+--
+-- JANELA DE 30 MIN: a bot_ultima_venda só enxerga venda recente. Correção de
+-- atacado é coisa de "esqueci a palavra agora há pouco"; venda de ontem se
+-- corrige no sistema, não por um comando que aponta pro que estiver por último.
+--
 -- POR QUE UMA RPC SEPARADA, E NÃO UM PARÂMETRO NA bot_movimentar_estoque:
 -- a bot_movimentar_estoque já existe no banco e não está versionada neste
--- repo — não dá pra recriá-la aqui sem o corpo dela. Então o bot registra a
--- venda como sempre e, logo em seguida, chama esta função. A mesma função
--- atende o /atacado (correção quando o atendente esquece a palavra), que é
--- exatamente a mesma operação.
---
--- MARCA UMA VENDA SÓ: a mais recente do bot. É o que o /atacado precisa e
--- cobre o caso normal (mensagem de uma linha). A função devolve QUAL venda
--- marcou (unidades e horário) pro bot ecoar no grupo — numa mensagem com
--- várias baixas, dá pra ver na hora que só a última foi marcada.
+-- repo — não dá pra recriá-la aqui sem o corpo dela.
 --
 -- IDEMPOTENTE: rodar duas vezes na mesma venda não duplica a palavra; a
 -- segunda devolve ja_marcada = true.
@@ -28,7 +33,69 @@
 -- ═══ RUN ÚNICO ═════════════════════════════════════════════════════════════
 -- (cole daqui até a linha "FIM DO RUN" e aperte Run)
 
-create or replace function public.bot_marcar_atacado(p_token text)
+-- A assinatura mudou (era só p_token, mirando "a última venda"). Dropar antes
+-- evita o Postgres manter as duas e o PostgREST reclamar de chamada ambígua —
+-- e, pior, evita a versão insegura continuar existindo.
+drop function if exists public.bot_marcar_atacado(text);
+
+-- Candidato à correção manual (/atacado). NÃO marca nada: só devolve o que
+-- seria marcado, pro bot pedir confirmação antes.
+create or replace function public.bot_ultima_venda(p_token text, p_minutos int default 30)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_tok    text;
+  v_id     text;
+  v_notes  text;
+  v_quando text;
+  v_min    int := greatest(1, coalesce(p_minutos, 30));
+  v_un     int;
+begin
+  select value into v_tok from integration_config where key = 'bot_sync_token';
+  if v_tok is null or p_token is distinct from v_tok then
+    return jsonb_build_object('ok', false, 'erro', 'token inválido');
+  end if;
+
+  -- Cancelada fica de fora: marcar uma venda que não existe mais só criaria
+  -- confusão no extrato.
+  select s.id::text,
+         s.notes,
+         to_char(s.sold_at at time zone 'America/Sao_Paulo', 'DD/MM HH24:MI')
+    into v_id, v_notes, v_quando
+    from sales s
+   where s.notes ilike 'bot telegram%'
+     and s.status <> 'cancelada'
+     and s.sold_at >= now() - make_interval(mins => v_min)
+   order by s.sold_at desc, s.id desc
+   limit 1;
+
+  if v_id is null then
+    return jsonb_build_object(
+      'ok', false,
+      'erro', format('nenhuma venda do bot nos últimos %s minutos', v_min)
+    );
+  end if;
+
+  select coalesce(sum(si.qty), 0) into v_un
+    from sale_items si
+   where si.sale_id::text = v_id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'sale_id', v_id,
+    'unidades', v_un,
+    'quando', v_quando,
+    'ja_marcada', (v_notes ilike '%atacado%'),
+    'notes', v_notes
+  );
+end;
+$$;
+
+-- Marca UMA venda, pelo id. Sem id, recusa.
+create or replace function public.bot_marcar_atacado(p_token text, p_sale_id text)
 returns jsonb
 language plpgsql
 security definer
@@ -46,20 +113,23 @@ begin
     return jsonb_build_object('ok', false, 'erro', 'token inválido');
   end if;
 
-  -- Última venda feita pelo bot. Cancelada fica de fora: marcar uma venda que
-  -- não existe mais só criaria confusão no extrato.
+  -- A trava principal deste Run: nada de "a última" como fallback.
+  if p_sale_id is null or btrim(p_sale_id) = '' then
+    return jsonb_build_object('ok', false, 'erro', 'sale_id obrigatório');
+  end if;
+
   select s.id::text,
          s.notes,
          to_char(s.sold_at at time zone 'America/Sao_Paulo', 'DD/MM HH24:MI')
     into v_id, v_notes, v_quando
     from sales s
-   where s.notes ilike 'bot telegram%'
+   where s.id::text = btrim(p_sale_id)
+     and s.notes ilike 'bot telegram%'
      and s.status <> 'cancelada'
-   order by s.sold_at desc, s.id desc
    limit 1;
 
   if v_id is null then
-    return jsonb_build_object('ok', false, 'erro', 'nenhuma venda do bot encontrada');
+    return jsonb_build_object('ok', false, 'erro', 'venda não encontrada');
   end if;
 
   select coalesce(sum(si.qty), 0) into v_un
@@ -85,10 +155,12 @@ begin
 end;
 $$;
 
-grant execute on function public.bot_marcar_atacado(text) to anon, authenticated;
+grant execute on function public.bot_ultima_venda(text, int)      to anon, authenticated;
+grant execute on function public.bot_marcar_atacado(text, text)   to anon, authenticated;
 
 -- Valor pago por unidade no atacado. A bot_comissao lê daqui; este insert só
--- garante que a chave exista com o valor combinado.
+-- garante que a chave exista. `do nothing` de propósito: se você já configurou
+-- outro valor, ele NÃO é sobrescrito.
 insert into public.integration_config (key, value)
 values ('comissao_atacado_valor', '2')
 on conflict (key) do nothing;
@@ -97,17 +169,26 @@ on conflict (key) do nothing;
 
 
 -- ═══ Conferência (trocando <TOKEN>) ════════════════════════════════════════
--- Qual é a última venda do bot (a que o /atacado marcaria):
---   select s.id, s.sold_at at time zone 'America/Sao_Paulo' as quando, s.notes
---     from sales s
---    where s.notes ilike 'bot telegram%' and s.status <> 'cancelada'
---    order by s.sold_at desc, s.id desc limit 3;
+-- Qual venda o /atacado ofereceria agora (e se já está marcada):
+--   select public.bot_ultima_venda('<TOKEN>');
+--   select public.bot_ultima_venda('<TOKEN>', 120);   -- janela maior, só pra olhar
 --
--- Marcar (rodar duas vezes: a segunda tem que vir ja_marcada = true):
---   select public.bot_marcar_atacado('<TOKEN>');
+-- Marcar pelo id devolvido acima (rodar 2x: a segunda vem ja_marcada = true):
+--   select public.bot_marcar_atacado('<TOKEN>', '<SALE_ID>');
+--
+-- Tem que RECUSAR (é o ponto do Run):
+--   select public.bot_marcar_atacado('<TOKEN>', null);
+--   select public.bot_marcar_atacado('<TOKEN>', '');
 --
 -- Conferir a quebra depois de marcar:
 --   select public.bot_comissao('<TOKEN>');
 --
--- Desfazer uma marcação errada (troque <ID> pelo sale_id devolvido acima):
---   update sales set notes = replace(notes, ' atacado', '') where id::text = '<ID>';
+-- Desfazer uma marcação errada:
+--   update sales set notes = replace(notes, ' atacado', '') where id::text = '<SALE_ID>';
+--
+-- ═══ O QUE FALTA PRO PROMPT MOSTRAR O PRODUTO ══════════════════════════════
+-- A confirmação do /atacado mostra "6 unidade(s) — 14:32" em vez de
+-- "6x Elfbar 30000 Cherry" porque este Run só usa colunas que eu posso
+-- garantir que existem (sales.id/notes/status/sold_at e sale_items.sale_id/qty).
+-- O nome do modelo/sabor mora na tabela de produtos, que não está neste repo.
+-- Mandando o schema de sale_items + produtos, viram 3 linhas de join aqui.

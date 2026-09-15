@@ -1268,18 +1268,13 @@ teste('RPC de pedido ausente diz qual SQL falta', async (ctx) => {
 
 // --- Atacado ---------------------------------------------------------------
 
-const BAIXA_OK = {
-  status: 200,
-  body: {
-    resultados: [{
-      status: 'ok', direction: 'baixa', model: 'Elfbar 30000',
-      flavor: 'Cherry', qty: 6, stock_after: 4,
-    }],
-  },
-};
+// Resultado de baixa COM sale_id (é ele que permite marcar a venda certa).
+function baixaOk({ saleId = '77', model = 'Elfbar 30000', flavor = 'Cherry', qty = 6, after = 4 } = {}) {
+  return { status: 'ok', direction: 'baixa', model, flavor, qty, stock_after: after, sale_id: saleId };
+}
 
-teste('venda com "atacado" baixa normal, tira a palavra do produto e marca a venda', async (ctx) => {
-  respostas.bot_movimentar_estoque = BAIXA_OK;
+teste('venda com "atacado" tira a palavra do produto e marca a venda PELO ID', async (ctx) => {
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [baixaOk()] } };
   respostas.bot_marcar_atacado = {
     status: 200, body: { ok: true, ja_marcada: false, sale_id: '77', unidades: 6, quando: '14/09 19:32' },
   };
@@ -1288,17 +1283,18 @@ teste('venda com "atacado" baixa normal, tira a palavra do produto e marca a ven
   // A palavra de controle NÃO pode ir junto na busca do produto.
   const mov = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
   assert.deepStrictEqual(mov[0].body.p_items, [{ produto: 'elfbar 30000 cherry', qty: -6 }]);
-  assert.strictEqual(mov[0].body.p_meta.atacado, true);
 
-  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 1,
-    'deveria marcar a venda como atacado');
+  const marca = chamadas.filter(c => c.fn === 'bot_marcar_atacado');
+  assert.strictEqual(marca.length, 1, 'deveria marcar a venda');
+  assert.strictEqual(marca[0].body.p_sale_id, '77', 'tem que marcar PELO ID da venda registrada');
+
   assert.ok(resp.text.includes('Baixa registrada (ATACADO)'), resp.text);
-  assert.ok(resp.text.includes('Elfbar 30000 – Cherry'), resp.text);
-  assert.ok(resp.text.includes('Saiu: *6*'), resp.text);
+  assert.ok(resp.text.includes('1 venda(s) marcada(s)'), resp.text);
+  assert.ok(resp.text.includes('6x Elfbar 30000 – Cherry'), resp.text);
 });
 
 teste('ATACADO em maiúscula e no meio da linha também vale', async (ctx) => {
-  respostas.bot_movimentar_estoque = BAIXA_OK;
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [baixaOk()] } };
   respostas.bot_marcar_atacado = { status: 200, body: { ok: true } };
   await mandar(ctx.webhook, update('-6 ATACADO elfbar 30000 cherry'));
   const mov = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
@@ -1306,20 +1302,75 @@ teste('ATACADO em maiúscula e no meio da linha também vale', async (ctx) => {
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 1);
 });
 
-teste('venda normal não vira atacado nem chama a RPC de marca', async (ctx) => {
-  respostas.bot_movimentar_estoque = BAIXA_OK;
-  const [resp] = await mandar(ctx.webhook, update('-6 elfbar 30000 cherry'));
+// A trava principal: sem id não dá pra saber QUAL venda marcar, e "a última"
+// erraria o alvo assim que duas vendas encostassem no tempo.
+teste('sem sale_id no retorno, NÃO marca nada e avisa', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: {
+      resultados: [{
+        status: 'ok', direction: 'baixa', model: 'Elfbar 30000',
+        flavor: 'Cherry', qty: 6, stock_after: 4,
+      }],
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('-6 elfbar 30000 cherry atacado'));
 
-  const mov = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
-  assert.deepStrictEqual(mov[0].body.p_items, [{ produto: 'elfbar 30000 cherry', qty: -6 }]);
-  assert.strictEqual(mov[0].body.p_meta.atacado, undefined);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0,
+    'sem id não pode chutar qual venda marcar');
+  assert.ok(resp.text.includes('Baixa registrada (ATACADO)'), resp.text);
+  assert.ok(resp.text.includes('NÃO marquei atacado'), resp.text);
+  assert.ok(resp.text.includes('/atacado'), resp.text);
+});
+
+teste('várias baixas + ATACADO marca TODAS as vendas da mensagem', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: {
+      resultados: [
+        baixaOk({ saleId: '77', model: 'Elfbar 30000', flavor: 'Cherry', qty: 6 }),
+        baixaOk({ saleId: '78', model: 'Ignite 5500', flavor: 'Grape Ice', qty: 2 }),
+      ],
+    },
+  };
+  respostas.bot_marcar_atacado = { status: 200, body: { ok: true, ja_marcada: false } };
+
+  const [resp] = await mandar(ctx.webhook, update('-6 elfbar 30000 cherry atacado\n-2 ignite 5500 grape ice'));
+
+  const marca = chamadas.filter(c => c.fn === 'bot_marcar_atacado');
+  assert.strictEqual(marca.length, 2, 'as DUAS vendas da mensagem têm que ser marcadas');
+  assert.deepStrictEqual(marca.map(c => c.body.p_sale_id).sort(), ['77', '78']);
+  assert.ok(resp.text.includes('2 venda(s) marcada(s)'), resp.text);
+  assert.ok(resp.text.includes('6x Elfbar 30000 – Cherry'), resp.text);
+  assert.ok(resp.text.includes('2x Ignite 5500 – Grape Ice'), resp.text);
+});
+
+teste('várias baixas + ATACADO sem id recusa a marca e manda separar', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: {
+      resultados: [
+        { status: 'ok', direction: 'baixa', model: 'Elfbar 30000', flavor: 'Cherry', qty: 6, stock_after: 4 },
+        { status: 'ok', direction: 'baixa', model: 'Ignite 5500', flavor: 'Grape Ice', qty: 2, stock_after: 7 },
+      ],
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('-6 elfbar 30000 cherry atacado\n-2 ignite 5500 grape ice'));
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
+  assert.ok(resp.text.includes('NÃO marquei atacado'), resp.text);
+  assert.ok(resp.text.includes('Manda uma por vez'), resp.text);
+});
+
+teste('venda normal não vira atacado nem chama a RPC de marca', async (ctx) => {
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [baixaOk()] } };
+  const [resp] = await mandar(ctx.webhook, update('-6 elfbar 30000 cherry'));
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
   assert.ok(resp.text.includes('Baixa registrada!'), resp.text);
   assert.ok(!resp.text.includes('ATACADO'), resp.text);
 });
 
-// Produto que não existe não pode gerar marca de atacado: marcaria a venda
-// ANTERIOR, que não tem nada a ver.
+// Produto que não existe não pode gerar marca: marcaria a venda ANTERIOR.
 teste('atacado em baixa que falhou não marca venda nenhuma', async (ctx) => {
   respostas.bot_movimentar_estoque = {
     status: 200, body: { resultados: [{ status: 'nao_encontrado', input: 'elfbari cherry' }] },
@@ -1338,12 +1389,19 @@ teste('"-6 atacado" (só a palavra) é formato inválido, não venda', async (ct
 });
 
 teste('falha ao marcar atacado avisa no grupo (não some em silêncio)', async (ctx) => {
-  respostas.bot_movimentar_estoque = BAIXA_OK;
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [baixaOk()] } };
   respostas.bot_marcar_atacado = { status: 404, body: { message: 'Could not find the function' } };
   const [resp] = await mandar(ctx.webhook, update('-6 elfbar 30000 cherry atacado'));
   assert.ok(resp.text.includes('Baixa registrada (ATACADO)'), resp.text);
   assert.ok(resp.text.includes('bot_marcar_atacado'), resp.text);
   assert.ok(resp.text.includes('/atacado'), resp.text);
+});
+
+teste('venda já marcada não duplica a palavra, só avisa', async (ctx) => {
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [baixaOk()] } };
+  respostas.bot_marcar_atacado = { status: 200, body: { ok: true, ja_marcada: true } };
+  const [resp] = await mandar(ctx.webhook, update('-6 elfbar 30000 cherry atacado'));
+  assert.ok(resp.text.includes('Já estava marcada'), resp.text);
 });
 
 teste('entrada com a palavra atacado limpa o texto mas não marca nada', async (ctx) => {
@@ -1352,7 +1410,7 @@ teste('entrada com a palavra atacado limpa o texto mas não marca nada', async (
     body: {
       resultados: [{
         status: 'ok', direction: 'entrada', model: 'Elfbar 30000',
-        flavor: 'Cherry', qty: 6, stock_after: 10,
+        flavor: 'Cherry', qty: 6, stock_after: 10, sale_id: '90',
       }],
     },
   };
@@ -1362,40 +1420,93 @@ teste('entrada com a palavra atacado limpa o texto mas não marca nada', async (
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
 });
 
-// --- /atacado (correção) ---------------------------------------------------
+// --- /atacado (correção manual, em duas etapas) ----------------------------
 
-teste('/atacado marca a última venda e diz qual foi', async (ctx) => {
-  respostas.bot_marcar_atacado = {
-    status: 200, body: { ok: true, ja_marcada: false, sale_id: '77', unidades: 6, quando: '14/09 19:32' },
-  };
+const ULTIMA_VENDA = {
+  status: 200,
+  body: { ok: true, sale_id: '77', unidades: 6, quando: '14/09 19:32', ja_marcada: false },
+};
+
+teste('/atacado pede confirmação e NÃO marca nada ainda', async (ctx) => {
+  respostas.bot_ultima_venda = ULTIMA_VENDA;
   const [resp] = await mandar(ctx.webhook, update('/atacado'));
-  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 1);
-  assert.ok(resp.text.includes('Marcada como ATACADO'), resp.text);
-  assert.ok(resp.text.includes('*6* unidade(s)'), resp.text);
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0,
+    '/atacado sozinho não pode marcar');
+  assert.ok(resp.text.includes('Marcar como atacado'), resp.text);
+  assert.ok(resp.text.includes('6 unidade(s)'), resp.text);
   assert.ok(resp.text.includes('14/09 19:32'), resp.text);
+  assert.ok(resp.text.includes('/atacado ok'), resp.text);
 });
 
-teste('/atacado numa venda já marcada não duplica, só avisa', async (ctx) => {
-  respostas.bot_marcar_atacado = {
-    status: 200, body: { ok: true, ja_marcada: true, unidades: 6, quando: '14/09 19:32' },
-  };
-  const [resp] = await mandar(ctx.webhook, update('/atacado'));
-  assert.ok(resp.text.includes('já estava marcada'), resp.text);
+teste('/atacado usa a janela de 30 minutos', async (ctx) => {
+  respostas.bot_ultima_venda = ULTIMA_VENDA;
+  await mandar(ctx.webhook, update('/atacado'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_ultima_venda')[0].body.p_minutos, 30);
 });
 
-teste('/atacado sem venda nenhuma devolve o erro da RPC', async (ctx) => {
-  respostas.bot_marcar_atacado = {
-    status: 200, body: { ok: false, erro: 'nenhuma venda do bot encontrada' },
+teste('/atacado ok marca a venda que foi mostrada', async (ctx) => {
+  respostas.bot_ultima_venda = ULTIMA_VENDA;
+  respostas.bot_marcar_atacado = { status: 200, body: { ok: true, ja_marcada: false } };
+
+  await mandar(ctx.webhook, update('/atacado'));
+  const [resp] = await mandar(ctx.webhook, update('/atacado ok'));
+
+  const marca = chamadas.filter(c => c.fn === 'bot_marcar_atacado');
+  assert.strictEqual(marca.length, 1);
+  assert.strictEqual(marca[0].body.p_sale_id, '77');
+  assert.ok(resp.text.includes('Marcada como ATACADO'), resp.text);
+});
+
+// O motivo de guardar o ID e não "a última": entre mostrar e confirmar, uma
+// venda nova pode entrar — e o alvo tem que continuar sendo o que foi visto.
+teste('venda nova entre o /atacado e o ok não muda o alvo', async (ctx) => {
+  respostas.bot_ultima_venda = ULTIMA_VENDA;
+  respostas.bot_marcar_atacado = { status: 200, body: { ok: true, ja_marcada: false } };
+
+  await mandar(ctx.webhook, update('/atacado'));           // mostra a venda 77
+  respostas.bot_ultima_venda = {                            // entrou a venda 99
+    status: 200, body: { ok: true, sale_id: '99', unidades: 1, quando: '14/09 19:40', ja_marcada: false },
+  };
+  await mandar(ctx.webhook, update('/atacado ok'));
+
+  const marca = chamadas.filter(c => c.fn === 'bot_marcar_atacado');
+  assert.strictEqual(marca[0].body.p_sale_id, '77', 'tinha que marcar a venda confirmada, não a mais nova');
+});
+
+teste('/atacado ok sem nada pendente não marca nada', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/atacado ok'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
+  assert.ok(resp.text.includes('Nada pra confirmar'), resp.text);
+});
+
+teste('/atacado em venda já marcada avisa e nem pede confirmação', async (ctx) => {
+  respostas.bot_ultima_venda = {
+    status: 200, body: { ok: true, sale_id: '77', unidades: 6, quando: '14/09 19:32', ja_marcada: true },
   };
   const [resp] = await mandar(ctx.webhook, update('/atacado'));
-  assert.ok(resp.text.includes('nenhuma venda do bot encontrada'), resp.text);
+  assert.ok(resp.text.includes('já está marcada'), resp.text);
+
+  // E sem pendência armada, um "ok" depois não marca nada.
+  const [depois] = await mandar(ctx.webhook, update('/atacado ok'));
+  assert.ok(depois.text.includes('Nada pra confirmar'), depois.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
+});
+
+teste('/atacado sem venda na janela devolve o erro da RPC', async (ctx) => {
+  respostas.bot_ultima_venda = {
+    status: 200, body: { ok: false, erro: 'nenhuma venda do bot nos últimos 30 minutos' },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/atacado'));
+  assert.ok(resp.text.includes('nenhuma venda do bot nos últimos 30 minutos'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
 });
 
 teste('/atacado do Rodrigo é recusado sem ROD_USER_ID, e a recusa mostra o id dele', async (ctx) => {
   const [resp] = await mandar(ctx.webhook, update('/atacado', { from: FUNCIONARIO }));
   assert.ok(resp.text.includes('Só o dono e o Rodrigo'), resp.text);
   assert.ok(resp.text.includes(String(FUNCIONARIO)), `a recusa tem que mostrar o id: ${resp.text}`);
-  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_ultima_venda').length, 0);
 });
 
 teste('podeMarcarAtacado: dono sempre; outro só com ROD_USER_ID cadastrado', async (ctx) => {
