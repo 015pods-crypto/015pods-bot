@@ -26,6 +26,10 @@
 -- IDEMPOTENTE: rodar duas vezes na mesma venda não duplica a palavra; a
 -- segunda devolve ja_marcada = true.
 --
+-- ATENÇÃO: este Run ganhou a bot_desmarcar_atacado (do /desatacado), que ainda
+-- NÃO está no banco. Precisa rodar de novo. As outras duas funções são
+-- idênticas ao que já está em produção, então recolar o Run inteiro é seguro.
+--
 -- Como rodar: SQL Editor do Supabase, RUN único.
 -- ===========================================================================
 
@@ -172,8 +176,78 @@ begin
 end;
 $$;
 
-grant execute on function public.bot_ultima_venda(text, int)      to anon, authenticated;
-grant execute on function public.bot_marcar_atacado(text, text)   to anon, authenticated;
+-- Desfaz a marca (/desatacado). Tira só o sufixo " atacado" que a função
+-- acima acrescenta — um replace solto poderia comer a palavra no meio de uma
+-- observação escrita à mão.
+create or replace function public.bot_desmarcar_atacado(p_token text, p_sale_id text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_tok    text;
+  v_id     text;
+  v_notes  text;
+  v_novo   text;
+  v_quando text;
+  v_un     int;
+  v_itens  text;
+begin
+  select value into v_tok from integration_config where key = 'bot_sync_token';
+  if v_tok is null or p_token is distinct from v_tok then
+    return jsonb_build_object('ok', false, 'erro', 'token inválido');
+  end if;
+
+  if p_sale_id is null or btrim(p_sale_id) = '' then
+    return jsonb_build_object('ok', false, 'erro', 'sale_id obrigatório');
+  end if;
+
+  select s.id::text,
+         s.notes,
+         to_char(s.sold_at at time zone 'America/Sao_Paulo', 'DD/MM HH24:MI')
+    into v_id, v_notes, v_quando
+    from sales s
+   where s.id::text = btrim(p_sale_id)
+     and s.notes ilike 'bot telegram%'
+     and s.status <> 'cancelada'
+   limit 1;
+
+  if v_id is null then
+    return jsonb_build_object('ok', false, 'erro', 'venda não encontrada');
+  end if;
+
+  select coalesce(sum(si.qty), 0),
+         string_agg(si.qty || 'x ' || m.name || ' ' || f.name, ', ')
+    into v_un, v_itens
+    from sale_items si
+    join flavors f on f.id = si.flavor_id
+    join models  m on m.id = f.model_id
+   where si.sale_id::text = v_id;
+
+  if v_notes !~* '\s+atacado\s*$' then
+    return jsonb_build_object(
+      'ok', true, 'ja_desmarcada', true,
+      'sale_id', v_id, 'unidades', v_un, 'itens', coalesce(v_itens, ''),
+      'quando', v_quando, 'notes', v_notes
+    );
+  end if;
+
+  v_novo := btrim(regexp_replace(v_notes, '(\s+atacado)+\s*$', '', 'i'));
+
+  update sales set notes = v_novo where id::text = v_id;
+
+  return jsonb_build_object(
+    'ok', true, 'ja_desmarcada', false,
+    'sale_id', v_id, 'unidades', v_un, 'itens', coalesce(v_itens, ''),
+    'quando', v_quando, 'notes', v_novo
+  );
+end;
+$$;
+
+grant execute on function public.bot_ultima_venda(text, int)       to anon, authenticated;
+grant execute on function public.bot_marcar_atacado(text, text)    to anon, authenticated;
+grant execute on function public.bot_desmarcar_atacado(text, text) to anon, authenticated;
 
 -- Valor pago por unidade no atacado. A bot_comissao lê daqui; este insert só
 -- garante que a chave exista. `do nothing` de propósito: se você já configurou
@@ -200,8 +274,8 @@ on conflict (key) do nothing;
 -- Conferir a quebra depois de marcar:
 --   select public.bot_comissao('<TOKEN>');
 --
--- Desfazer uma marcação errada:
---   update sales set notes = replace(notes, ' atacado', '') where id::text = '<SALE_ID>';
+-- Desfazer pela RPC (é o que o /desatacado chama; 2x = ja_desmarcada true):
+--   select public.bot_desmarcar_atacado('<TOKEN>', '<SALE_ID>');
 --
 -- ═══ NOTA ══════════════════════════════════════════════════════════════════
 -- Este arquivo é FIEL ao que está em produção — dá pra recolar o Run sem medo

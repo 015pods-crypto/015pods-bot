@@ -37,7 +37,7 @@ const COMANDOS = [
   '/semana', '/reposicao', '/comissao', '/despesas', '/dinheiro', '/geral',
   '/anular', '/desanular', '/adicionar', '/refazerfechamento', '/versao',
   '/chatid', '/setgrupopedidos', '/fornecedor', '/apelido', '/pedido',
-  '/atacado',
+  '/atacado', '/desatacado',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -220,10 +220,13 @@ async function palavrasDespesa() {
   return doBanco.length ? doBanco : PALAVRAS_DESPESA_PADRAO;
 }
 
-// Só pro teste: o cache atravessa casos (TTL 1 min) e faria um teste passar
-// sem nunca consultar o banco.
-function _resetCacheConfig() {
+// Só pro teste: todo estado de módulo que atravessa mensagens (cache de
+// config, lista de fornecedor pendente, última marcação de atacado) vaza de um
+// caso pro outro e faz teste passar — ou falhar — pelo motivo errado.
+function _resetEstadoTeste() {
   cacheConfig.clear();
+  fornecedorPendente.clear();
+  ultimaMarcacao.clear();
 }
 
 // `palavras` é a lista já resolvida (o parser é síncrono de propósito: o
@@ -403,7 +406,7 @@ function mapResultado(r, opFallback) {
   return { ok: false, op: opFallback, msg: `Não processado: "${input}" (${status || 'sem status'})` };
 }
 
-async function handleMovimentos(chatId, lines, messageId) {
+async function handleMovimentos(chatId, lines, messageId, forcarAtacado) {
   const parsed = lines.map(parseMovimentoLine).filter(Boolean);
   if (!parsed.length) return;
 
@@ -413,7 +416,8 @@ async function handleMovimentos(chatId, lines, messageId) {
   // ATACADO é da MENSAGEM inteira, não da linha: a palavra em qualquer lugar
   // marca TODAS as baixas daquela mensagem. Marcar só a linha onde a palavra
   // aparece deixaria as outras como varejo sem ninguém perceber.
-  const pediuAtacado = parsed.some(i => i.atacado);
+  // `forcarAtacado` é o caso do cabeçalho ("/atacado" + pedido colado embaixo).
+  const pediuAtacado = !!forcarAtacado || parsed.some(i => i.atacado);
 
   const items = [];
   const plan = [];
@@ -458,7 +462,7 @@ async function handleMovimentos(chatId, lines, messageId) {
   // A marca só faz sentido nas baixas que de fato entraram: numa baixa que
   // falhou, marcar acertaria a venda ANTERIOR.
   const aMarcar = results.filter(r => r.ok && r.op === 'baixa' && r.atacado);
-  if (aMarcar.length) linhasMsg.push(...(await marcarVendasAtacado(aMarcar)));
+  if (aMarcar.length) linhasMsg.push(...(await marcarVendasAtacado(chatId, aMarcar)));
 
   await sendTelegram(chatId, linhasMsg.join('\n'));
 }
@@ -466,8 +470,9 @@ async function handleMovimentos(chatId, lines, messageId) {
 // Marca cada venda pelo SEU id — uma chamada por baixa, porque cada baixa cria
 // uma venda própria. Uma falha isolada não derruba as outras nem desfaz venda
 // nenhuma: o estoque já saiu, e o que fica pendente é só a marca, item a item.
-async function marcarVendasAtacado(baixas) {
+async function marcarVendasAtacado(chatId, baixas) {
   const marcadas = [];
+  const idsMarcados = [];
   const jaEstavam = [];
   const falhas = [];
   for (const r of baixas) {
@@ -476,11 +481,15 @@ async function marcarVendasAtacado(baixas) {
     // "bot\\_marcar\\_atacado" na tela. Só o nome do produto passa pelo escapeMd.
     if (!m.ok) falhas.push({ nome: `${r.modelo} – ${r.sabor}`, msg: m.msg });
     else if (m.ja_marcada) jaEstavam.push(`${r.modelo} – ${r.sabor}`);
-    else marcadas.push(`${r.qtd}x ${r.modelo} – ${r.sabor}`);
+    else { marcadas.push(`${r.qtd}x ${r.modelo} – ${r.sabor}`); idsMarcados.push(r.saleId); }
   }
 
   const out = [];
-  if (marcadas.length) out.push(`🏷️ *ATACADO:* ${marcadas.map(escapeMd).join(', ')}`);
+  if (marcadas.length) {
+    lembrarMarcacao(chatId, idsMarcados, marcadas.join(', '));
+    out.push(`🏷️ *ATACADO:* ${marcadas.map(escapeMd).join(', ')}`);
+    out.push(`_${AVISO_DESFAZER}_`);
+  }
   if (jaEstavam.length) out.push(`🏷️ _Já estava marcada: ${jaEstavam.map(escapeMd).join(', ')}_`);
   for (const f of falhas) {
     out.push(`⚠️ Não marquei *${escapeMd(f.nome)}*: ${f.msg} Use /atacado.`);
@@ -1117,12 +1126,48 @@ function podeMarcarAtacado(userId) {
 // ontem se corrige no sistema, não por um comando que aponta pro que estiver
 // por último.
 const ATACADO_JANELA_MIN = 30;
-// A confirmação guarda o ID escolhido, não "a última": se outra venda entrar
-// entre o /atacado e o /atacado ok, o alvo continua sendo o que foi mostrado.
-const ATACADO_PENDENTE_MS = 5 * 60 * 1000;
-const atacadoPendente = new Map(); // chatKey -> { at, userId, saleId, texto }
 
-async function handleAtacado(chatId, text, from) {
+// Palavra de controle no COMEÇO de uma linha, com ou sem barra: "/atacado",
+// "atacado", "/atacado@bot". Prefixo e não linha inteira de propósito — assim
+// "/atacado -2 elfbar cherry" (tudo na mesma linha) também funciona, e
+// "/atacado bom dia" não escorrega pro comando de correção.
+// O \b impede casar com "atacadao"; e como exige começar em "atacado",
+// "/desatacado" não casa.
+const RE_CONTROLE_ATACADO = /^\/?atacado(@\S+)?\b[ \t]*/i;
+
+// Separa a palavra de controle do resto da mensagem.
+// -> { controle: bool, linhas: [...] } com as linhas já sem a palavra.
+function separarControleAtacado(texto) {
+  let controle = false;
+  const linhas = [];
+  for (const bruta of String(texto || '').split('\n')) {
+    const linha = bruta.trim();
+    if (!linha) continue;
+    const m = linha.match(RE_CONTROLE_ATACADO);
+    if (!m) { linhas.push(linha); continue; }
+    controle = true;
+    const resto = linha.slice(m[0].length).trim();
+    if (resto) linhas.push(resto);
+  }
+  return { controle, linhas };
+}
+
+// Última marcação feita em cada chat, pro /desatacado saber o que desfazer.
+// Guarda os IDs, não "a última venda" — desfazer também precisa de alvo fixo.
+const ultimaMarcacao = new Map(); // chatKey -> { saleIds, texto, at }
+
+function lembrarMarcacao(chatId, saleIds, texto) {
+  const ids = (saleIds || []).filter(Boolean).map(String);
+  if (!ids.length) return;
+  ultimaMarcacao.set(String(chatId), { saleIds: ids, texto, at: Date.now() });
+}
+
+const AVISO_DESFAZER = 'Se não era essa, responda `/desatacado`.';
+
+// Sem confirmação em duas etapas: marca direto e oferece o desfazer. Pedir
+// "responda ok" no meio do expediente só fazia a correção morrer pela metade —
+// e uma marcação errada tem volta, então travar antes custava mais que desfazer.
+async function handleAtacado(chatId, from) {
   const userId = from && from.id;
   if (!podeMarcarAtacado(userId)) {
     await sendTelegram(chatId,
@@ -1130,40 +1175,64 @@ async function handleAtacado(chatId, text, from) {
     return;
   }
 
-  const chatKey = String(chatId);
-  const confirmou = /^\/atacado(@\S+)?\s+ok\s*$/i.test((text || '').trim());
-
-  if (confirmou) {
-    const p = atacadoPendente.get(chatKey);
-    atacadoPendente.delete(chatKey);
-    if (!p || Date.now() - p.at > ATACADO_PENDENTE_MS || p.userId !== String(userId ?? '')) {
-      await sendTelegram(chatId, '⏳ Nada pra confirmar (ou expirou). Mande `/atacado` de novo.');
-      return;
-    }
-    const marca = await marcarAtacado(p.saleId);
-    if (!marca.ok) { await sendTelegram(chatId, `⚠️ ${marca.msg}`); return; }
-    if (marca.ja_marcada) {
-      await sendTelegram(chatId, `🏷️ Essa venda já estava marcada como atacado (${escapeMd(p.texto)}).`);
-      return;
-    }
-    await sendTelegram(chatId, `🏷️ *Marcada como ATACADO*\n${escapeMd(p.texto)}`);
-    return;
-  }
-
   const venda = await ultimaVenda();
-  if (!venda.ok) { await sendTelegram(chatId, `⚠️ ${venda.msg}`); return; }
-
-  const texto = `${descricaoVenda(venda)} — ${String(venda.quando ?? '')}`;
-  if (venda.ja_marcada) {
-    await sendTelegram(chatId, `🏷️ A última venda (${escapeMd(texto)}) já está marcada como atacado.`);
+  if (!venda.ok) {
+    await sendTelegram(chatId,
+      `⚠️ ${venda.msg}\n_Pra lançar um pedido de atacado agora, mande \`/atacado\` e cole as linhas de baixa embaixo._`);
     return;
   }
 
-  atacadoPendente.set(chatKey, {
-    at: Date.now(), userId: String(userId ?? ''), saleId: String(venda.sale_id), texto,
-  });
-  await sendTelegram(chatId,
-    `🏷️ Marcar como atacado: *${escapeMd(texto)}*?\nResponda \`/atacado ok\` (expira em 5 min).`);
+  const texto = `${descricaoVenda(venda)} (${String(venda.quando ?? '')})`;
+  if (venda.ja_marcada) {
+    lembrarMarcacao(chatId, [venda.sale_id], texto);
+    await sendTelegram(chatId, `🏷️ A última venda já estava marcada como atacado: *${escapeMd(texto)}*.\n${AVISO_DESFAZER}`);
+    return;
+  }
+
+  const marca = await marcarAtacado(venda.sale_id);
+  if (!marca.ok) { await sendTelegram(chatId, `⚠️ ${marca.msg}`); return; }
+
+  lembrarMarcacao(chatId, [venda.sale_id], texto);
+  await sendTelegram(chatId, `🏷️ Marquei como atacado: *${escapeMd(texto)}*.\n${AVISO_DESFAZER}`);
+}
+
+// /desatacado — tira a marca da última venda (ou vendas) que ESTE chat marcou.
+async function handleDesatacado(chatId, from) {
+  const userId = from && from.id;
+  if (!podeMarcarAtacado(userId)) {
+    await sendTelegram(chatId, '⛔ Só o dono e o Rodrigo podem desfazer a marca de atacado.');
+    return;
+  }
+  const m = ultimaMarcacao.get(String(chatId));
+  if (!m) {
+    await sendTelegram(chatId, '🤷 Não tenho marcação recente pra desfazer neste chat.');
+    return;
+  }
+
+  const desfeitas = [];
+  const falhas = [];
+  for (const id of m.saleIds) {
+    let d = null;
+    try {
+      d = await callRpc('bot_desmarcar_atacado', { p_token: BOT_SYNC_TOKEN, p_sale_id: String(id) });
+    } catch (err) {
+      console.error('bot_desmarcar_atacado:', err.message);
+      falhas.push(rpcAusente(err.message)
+        ? 'a RPC `bot_desmarcar_atacado` não existe no banco — falta rodar o SQL do atacado'
+        : 'erro ao falar com o servidor');
+      continue;
+    }
+    if (!d || d.ok === false) { falhas.push((d && (d.erro || d.msg)) || 'não consegui desfazer'); continue; }
+    desfeitas.push(id);
+  }
+
+  if (desfeitas.length) ultimaMarcacao.delete(String(chatId));
+  const linhas = [];
+  if (desfeitas.length) {
+    linhas.push(`↩️ Marca de atacado removida: *${escapeMd(m.texto)}*. Voltou a valer como varejo.`);
+  }
+  for (const f of falhas) linhas.push(`⚠️ Não consegui desfazer: ${f}.`);
+  await sendTelegram(chatId, linhas.join('\n'));
 }
 
 // Diagnóstico: qual commit está no ar e quais comandos ESTA versão conhece.
@@ -1693,7 +1762,7 @@ async function handlePedido(chatId, text) {
   for (const parte of partes) await sendTelegram(chatId, parte);
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado` (ou `/atacado` pra corrigir a última)\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)';
 
 const vendasDoDia = {};
 
@@ -1813,10 +1882,17 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    // "/atacado" (ou "atacado") numa linha própria é CABEÇALHO, não comando,
+    // quando a mensagem traz itens embaixo. Era exatamente este o bug: o
+    // comando vencia, as linhas de baixa sumiam SEM AVISO e o bot ainda ia
+    // mexer na venda ANTERIOR — pedido não debitado e comissão marcada errada.
+    const { controle: controleAtacado, linhas: linhasSemControle } = separarControleAtacado(text);
+    const temItem = linhasSemControle.some(l => l.charAt(0) === '-' || l.charAt(0) === '+');
+
     // Movimentos com prefixo: cada grupo aceita só o seu sinal.
     //   VENDAS: só baixa (-). REPOSIÇÃO: só entrada (+). Privado: os dois.
-    if (text.charAt(0) === '-' || text.charAt(0) === '+') {
-      const todas = text.split('\n').map(l => l.trim());
+    if (text.charAt(0) === '-' || text.charAt(0) === '+' || (controleAtacado && temItem)) {
+      const todas = linhasSemControle;
 
       // Despesa ("+25 ENTREGA"), dinheiro ("+100 DINHEIRO") e os estornos dos
       // dois ("-25 ENTREGA", "-50 DINHEIRO") saem da fila ANTES do estoque: as
@@ -1848,7 +1924,28 @@ app.post('/webhook', async (req, res) => {
       }
 
       const permitidas = isVendas ? baixas : isReposicao ? entradas : [...baixas, ...entradas];
-      if (permitidas.length) await handleMovimentos(chatId, permitidas, msg.message_id);
+      if (permitidas.length) {
+        await handleMovimentos(chatId, permitidas, msg.message_id, controleAtacado);
+      } else if (controleAtacado && !registros.length) {
+        // Mensagem com cabeçalho de atacado cujas linhas foram todas barradas
+        // pela regra de grupo. Ficar calado aqui é como o bug original passou.
+        await sendTelegram(chatId, '⚠️ Não processei nenhum item dessa mensagem (veja o aviso de grupo acima). Nada foi marcado como atacado.');
+      }
+      return;
+    }
+
+    // "/atacado" (ou "atacado") SOZINHO: correção da última venda.
+    if (controleAtacado && !linhasSemControle.length) {
+      await handleAtacado(chatId, msg.from);
+      return;
+    }
+    // Cabeçalho de atacado com texto que não é item nenhum: explicar, nunca
+    // ficar mudo nem cair na venda anterior.
+    if (controleAtacado) {
+      await sendTelegram(chatId,
+        '🤔 Não reconheci item nenhum nessa mensagem.\n' +
+        'Pra lançar: `/atacado` e as linhas de baixa embaixo (`-2 Elfbar 30000 Cherry`).\n' +
+        'Pra corrigir a última venda: mande `/atacado` sozinho.');
       return;
     }
 
@@ -1880,7 +1977,8 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/desanular') { await handleDesanular(chatId, text, fromId); return; }
     if (cmd === '/adicionar') { await handleAdicionar(chatId, text, msg.from); return; }
     if (cmd === '/refazerfechamento') { await handleRefazerFechamento(chatId, text, fromId); return; }
-    if (cmd === '/atacado') { await handleAtacado(chatId, text, msg.from); return; }
+    if (cmd === '/atacado') { await handleAtacado(chatId, msg.from); return; }
+    if (cmd === '/desatacado') { await handleDesatacado(chatId, msg.from); return; }
     if (cmd === '/versao') { await handleVersao(chatId, fromId); return; }
 
     // Pedidos: só no grupo de pedidos e no privado do dono (enquanto a chave
@@ -1953,7 +2051,7 @@ module.exports = {
   palavrasDespesa,
   lerConfig,
   gravarConfig,
-  _resetCacheConfig,
+  _resetEstadoTeste,
   parseListaFornecedor,
   pareceListaFornecedor,
   podePedidos,
@@ -1971,6 +2069,8 @@ module.exports = {
   handleAtacado,
   marcarVendasAtacado,
   descricaoVenda,
+  handleDesatacado,
+  separarControleAtacado,
   nomeAutor,
   fmtValor,
   handleRefazerFechamento,
