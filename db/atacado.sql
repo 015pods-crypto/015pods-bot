@@ -53,6 +53,7 @@ declare
   v_quando text;
   v_min    int := greatest(1, coalesce(p_minutos, 30));
   v_un     int;
+  v_itens  text;
 begin
   select value into v_tok from integration_config where key = 'bot_sync_token';
   if v_tok is null or p_token is distinct from v_tok then
@@ -79,14 +80,21 @@ begin
     );
   end if;
 
-  select coalesce(sum(si.qty), 0) into v_un
+  -- `itens` sai daqui já legível ("1x Oxbar 30000 White Grape"): é o que o bot
+  -- mostra na confirmação do /atacado, em vez de "1 unidade(s)".
+  select coalesce(sum(si.qty), 0),
+         string_agg(si.qty || 'x ' || m.name || ' ' || f.name, ', ')
+    into v_un, v_itens
     from sale_items si
+    join flavors f on f.id = si.flavor_id
+    join models  m on m.id = f.model_id
    where si.sale_id::text = v_id;
 
   return jsonb_build_object(
     'ok', true,
     'sale_id', v_id,
     'unidades', v_un,
+    'itens', coalesce(v_itens, ''),
     'quando', v_quando,
     'ja_marcada', (v_notes ilike '%atacado%'),
     'notes', v_notes
@@ -107,6 +115,7 @@ declare
   v_notes  text;
   v_quando text;
   v_un     int;
+  v_itens  text;
 begin
   select value into v_tok from integration_config where key = 'bot_sync_token';
   if v_tok is null or p_token is distinct from v_tok then
@@ -132,14 +141,21 @@ begin
     return jsonb_build_object('ok', false, 'erro', 'venda não encontrada');
   end if;
 
-  select coalesce(sum(si.qty), 0) into v_un
+  -- `itens` sai daqui já legível ("1x Oxbar 30000 White Grape"): é o que o bot
+  -- mostra na confirmação do /atacado, em vez de "1 unidade(s)".
+  select coalesce(sum(si.qty), 0),
+         string_agg(si.qty || 'x ' || m.name || ' ' || f.name, ', ')
+    into v_un, v_itens
     from sale_items si
+    join flavors f on f.id = si.flavor_id
+    join models  m on m.id = f.model_id
    where si.sale_id::text = v_id;
 
   if v_notes ilike '%atacado%' then
     return jsonb_build_object(
       'ok', true, 'ja_marcada', true,
-      'sale_id', v_id, 'unidades', v_un, 'quando', v_quando, 'notes', v_notes
+      'sale_id', v_id, 'unidades', v_un, 'itens', coalesce(v_itens, ''),
+      'quando', v_quando, 'notes', v_notes
     );
   end if;
 
@@ -149,7 +165,8 @@ begin
 
   return jsonb_build_object(
     'ok', true, 'ja_marcada', false,
-    'sale_id', v_id, 'unidades', v_un, 'quando', v_quando,
+    'sale_id', v_id, 'unidades', v_un, 'itens', coalesce(v_itens, ''),
+    'quando', v_quando,
     'notes', v_notes || ' atacado'
   );
 end;
@@ -187,9 +204,7 @@ on conflict (key) do nothing;
 --   update sales set notes = replace(notes, ' atacado', '') where id::text = '<SALE_ID>';
 --
 -- ═══ NOTA ══════════════════════════════════════════════════════════════════
--- As versões que já estão no banco devolvem também um campo `itens` legível
--- ("6x Elfbar 30000 Cherry"), com o nome do produto. O bot usa esse campo na
--- confirmação do /atacado e só cai em "6 unidade(s)" se ele vier vazio.
--- Este arquivo não reproduz esse join porque a tabela de produtos não está
--- versionada neste repo — se for recolar este Run, confira antes se não vai
--- sobrescrever a versão do banco com uma sem o `itens`.
+-- Este arquivo é FIEL ao que está em produção — dá pra recolar o Run sem medo
+-- de rebaixar as funções. O campo `itens` ("1x Oxbar 30000 White Grape") vem do
+-- join sale_items → flavors → models; o bot usa ele na confirmação do /atacado
+-- e só cai em "N unidade(s)" se vier vazio.
