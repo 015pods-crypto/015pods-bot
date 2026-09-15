@@ -37,7 +37,7 @@ const COMANDOS = [
   '/semana', '/reposicao', '/comissao', '/despesas', '/dinheiro', '/geral',
   '/anular', '/desanular', '/adicionar', '/refazerfechamento', '/versao',
   '/chatid', '/setgrupopedidos', '/fornecedor', '/apelido', '/pedido',
-  '/atacado', '/desatacado',
+  '/atacado', '/desatacado', '/caixa',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -1762,7 +1762,265 @@ async function handlePedido(chatId, text) {
   for (const parte of partes) await sendTelegram(chatId, parte);
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)';
+// ---------------------------------------------------------------------------
+// Comprovantes de pagamento (foto/PDF no grupo de VENDAS)
+//
+// Foto entra → Gemini lê o valor → RPC registra e soma no caixa do dia, e de
+// quebra acusa comprovante reenviado (mesmo código de transação). É o que pega
+// o golpe de reenviar o comprovante de ontem pra levar pedido novo.
+//
+// REGRA DE OURO: nunca registrar valor sem confiança. Leitura errada de valor
+// vira caixa errado, e caixa errado só aparece no fim do dia — quando ninguém
+// mais lembra de qual foto era. Na dúvida, o bot pergunta.
+// ---------------------------------------------------------------------------
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_API_BASE = process.env.GEMINI_API_BASE || 'https://generativelanguage.googleapis.com';
+// Nome do modelo em env var porque ele muda de geração sem avisar; trocar não
+// pode depender de deploy.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+
+// Acima disso não vale a pena tentar: o getFile do Telegram para em 20 MB e o
+// Gemini recusa inline data grande. Melhor pedir o valor na hora.
+const COMPROVANTE_MAX_BYTES = 15 * 1024 * 1024;
+
+// Valores fora desta faixa entram, mas com aviso: é venda atípica ou erro de
+// leitura, e os dois merecem um olho humano.
+const COMPROVANTE_MIN = 20;
+const COMPROVANTE_MAX = 2000;
+
+const MIMES_COMPROVANTE = ['image/jpeg', 'image/png', 'application/pdf'];
+
+const PEDE_VALOR = '🤔 Não consegui ler o valor desse comprovante. Confere e me diz o valor?';
+
+// Foto ou documento que vale a pena tentar ler. Sticker, vídeo e áudio ficam de
+// fora. Da foto pegamos o MAIOR tamanho: o Telegram manda várias resoluções e
+// as menores borram o valor.
+function arquivoComprovante(msg) {
+  if (!msg) return null;
+  if (Array.isArray(msg.photo) && msg.photo.length) {
+    const maior = msg.photo.reduce((a, b) => ((b.file_size || 0) > (a.file_size || 0) ? b : a));
+    return { fileId: maior.file_id, mime: 'image/jpeg', size: maior.file_size || 0 };
+  }
+  const doc = msg.document;
+  if (doc && MIMES_COMPROVANTE.includes(String(doc.mime_type || '').toLowerCase())) {
+    return { fileId: doc.file_id, mime: String(doc.mime_type).toLowerCase(), size: doc.file_size || 0 };
+  }
+  return null;
+}
+
+// Uma legenda que é comando ou movimento continua sendo comando/movimento: a
+// foto vira só um anexo. Sem isso, mandar a foto com "-2 elfbar cherry" na
+// legenda deixaria de dar baixa.
+function legendaEhComando(texto) {
+  const t = (texto || '').trim();
+  if (!t) return false;
+  const c = t.charAt(0);
+  return c === '/' || c === '+' || c === '-';
+}
+
+async function baixarArquivoTelegram(fileId) {
+  const fetch = (await import('node-fetch')).default;
+  const resp = await fetch(`${TELEGRAM_API}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  if (!resp.ok) throw new Error(`getFile HTTP ${resp.status}`);
+  const data = await resp.json();
+  const caminho = data && data.result && data.result.file_path;
+  if (!caminho) throw new Error('getFile sem file_path');
+
+  const arq = await fetch(`${TELEGRAM_API_BASE}/file/bot${TELEGRAM_TOKEN}/${caminho}`);
+  if (!arq.ok) throw new Error(`download HTTP ${arq.status}`);
+  const buf = Buffer.from(await arq.arrayBuffer());
+  if (!buf.length) throw new Error('arquivo vazio');
+  return buf;
+}
+
+const PROMPT_COMPROVANTE = [
+  'Você recebe a imagem de um comprovante de pagamento brasileiro (Pix, TED, transferência ou cartão).',
+  'Responda SOMENTE com JSON puro, sem texto em volta e sem blocos de código, neste formato:',
+  '{"valor": 150.00, "codigo": "E12345...", "pago_em": "2026-09-15T16:42:00", "pagador": "Fulano", "banco": "Nubank", "confianca": "alta"}',
+  '- "valor": valor pago em reais, número com ponto decimal e sem separador de milhar.',
+  '- "codigo": identificador da transação (E2E do Pix, ID da transação ou autenticação); null se não houver.',
+  '- "pago_em": data e hora do pagamento em ISO 8601; null se não houver.',
+  '- "pagador": nome de quem pagou; null se não houver.',
+  '- "banco": instituição do comprovante; null se não houver.',
+  '- "confianca": "alta", "media" ou "baixa".',
+  'Se não conseguir ler o valor com segurança, responda {"valor": null, "confianca": "baixa"}.',
+  'Se a imagem não for um comprovante de pagamento, responda {"valor": null, "confianca": "baixa"}.',
+].join('\n');
+
+// O modelo às vezes embrulha o JSON em ```json apesar do pedido; tirar a cerca
+// é mais barato que perder a leitura.
+function parseJsonModelo(texto) {
+  const limpo = String(texto || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  try { return JSON.parse(limpo); } catch (_) { return null; }
+}
+
+// Lê o comprovante. Nunca lança: erro vira null e o chamador pede o valor.
+async function lerComprovante(buffer, mime) {
+  if (!GEMINI_API_KEY) { console.error('comprovante: GEMINI_API_KEY não definida'); return null; }
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const url = `${GEMINI_API_BASE}/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { text: PROMPT_COMPROVANTE },
+            { inline_data: { mime_type: mime, data: buffer.toString('base64') } },
+          ],
+        }],
+        // temperature 0 + responseMimeType: o valor de um comprovante não é
+        // lugar pra criatividade, e JSON forçado evita parse de texto solto.
+        generationConfig: { temperature: 0, responseMimeType: 'application/json' },
+      }),
+    });
+    if (!resp.ok) {
+      const detalhe = await resp.text().catch(() => '');
+      console.error(`gemini HTTP ${resp.status}: ${detalhe.slice(0, 300)}`);
+      return null;
+    }
+    const data = await resp.json();
+    const texto = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!texto) { console.error('gemini: resposta sem texto', JSON.stringify(data).slice(0, 300)); return null; }
+    return parseJsonModelo(texto);
+  } catch (err) {
+    console.error('gemini:', err.message);
+    return null;
+  }
+}
+
+// Valor só vale com confiança alta/média E número positivo. "baixa" é o próprio
+// modelo dizendo que chutou — registrar isso seria pior que não ler.
+function valorConfiavel(lido) {
+  if (!lido) return null;
+  const conf = String(lido.confianca || '').toLowerCase();
+  if (conf !== 'alta' && conf !== 'media' && conf !== 'média') return null;
+  const valor = Number(lido.valor);
+  if (!Number.isFinite(valor) || valor <= 0) return null;
+  return valor;
+}
+
+async function handleComprovante(chatId, msg) {
+  const arquivo = arquivoComprovante(msg);
+  if (!arquivo) return;
+
+  if (arquivo.size > COMPROVANTE_MAX_BYTES) {
+    await sendTelegram(chatId, `📎 Esse arquivo é grande demais pra eu ler. ${PEDE_VALOR}`);
+    return;
+  }
+
+  let lido = null;
+  try {
+    const buffer = await baixarArquivoTelegram(arquivo.fileId);
+    lido = await lerComprovante(buffer, arquivo.mime);
+  } catch (err) {
+    console.error('comprovante:', err.message);
+  }
+
+  const valor = valorConfiavel(lido);
+  if (valor == null) {
+    // Inclui imagem que nem é comprovante: sem valor, não registra nada.
+    await sendTelegram(chatId, PEDE_VALOR);
+    return;
+  }
+
+  let r = null;
+  try {
+    r = await callRpc('bot_comprovante_registrar', {
+      p_token: BOT_SYNC_TOKEN,
+      p_valor: valor,
+      p_codigo: lido.codigo ?? null,
+      p_pago_em: lido.pago_em ?? null,
+      p_pagador: lido.pagador ?? null,
+      p_banco: lido.banco ?? null,
+      p_chat_id: chatId,
+      p_message_id: msg.message_id,
+      p_arquivo_id: arquivo.fileId,
+      p_bruto: lido,
+    });
+  } catch (err) {
+    console.error('bot_comprovante_registrar:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC `bot_comprovante_registrar` não existe no banco — falta rodar o SQL do comprovante.'
+      : `⚠️ Li R$ ${fmtBR(valor)}, mas não consegui registrar. Tente reenviar em instantes.`);
+    return;
+  }
+  if (!r || r.ok === false) {
+    const detalhe = r && (r.erro || r.msg);
+    await sendTelegram(chatId, `⚠️ ${detalhe || `Li R$ ${fmtBR(valor)}, mas não consegui registrar.`}`);
+    return;
+  }
+
+  await sendTelegram(chatId, textoComprovante(r, valor));
+}
+
+// Monta a resposta do grupo a partir do retorno da RPC.
+function textoComprovante(r, valor) {
+  const quando = escapeMd(String(r.quando ?? r.anterior_em ?? ''));
+  const valorDup = fmtBR(r.valor ?? valor);
+
+  if (r.duplicado) {
+    return r.motivo === 'codigo'
+      ? `⚠️ *COMPROVANTE JÁ ENVIADO* — esse mesmo código de transação apareceu em ${quando}, no valor de R$ ${valorDup}. Confira antes de liberar o pedido.`
+      : `⚠️ Já entrou um comprovante de R$ ${valorDup} há pouco (${quando}). Se for outro pagamento, tudo bem; se não, confira.`;
+  }
+
+  const linhas = [
+    `💰 Comprovante lido: *R$ ${fmtBR(valor)}* · total do dia: R$ ${fmtBR(r.total_dia)} (${r.qtd_dia ?? 0} comprovantes)`,
+  ];
+  if (valor > COMPROVANTE_MAX || valor < COMPROVANTE_MIN) {
+    linhas.push('⚠️ _valor fora do padrão, confere aí_');
+  }
+  return linhas.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// /caixa — comprovantes x vendas do dia
+// ---------------------------------------------------------------------------
+
+// `data` ISO (YYYY-MM-DD) ou null = hoje. Nunca lança.
+async function textoCaixa(data) {
+  let d = null;
+  try {
+    const body = { p_token: BOT_SYNC_TOKEN };
+    if (data) body.p_data = data;
+    d = await callRpc('bot_caixa_dia', body);
+  } catch (err) {
+    console.error('bot_caixa_dia:', err.message);
+    return rpcAusente(err.message)
+      ? '⚠️ A RPC `bot_caixa_dia` não existe no banco — falta rodar o SQL do comprovante.'
+      : '⚠️ Erro ao consultar o caixa do dia.';
+  }
+  if (!d || d.ok === false) return `⚠️ ${(d && (d.erro || d.msg)) || 'Erro ao consultar o caixa do dia.'}`;
+
+  const dia = d.dia || d.data || (data ? data.split('-').reverse().slice(0, 2).join('/') : 'hoje');
+  const diferenca = Number(d.diferenca) || 0;
+  const linhas = [
+    `💵 *CAIXA DE ${escapeMd(String(dia))}*`,
+    `Comprovantes: R$ ${fmtBR(d.comprovantes_total)} (${d.comprovantes_qtd ?? 0})`,
+    `Vendas registradas: R$ ${fmtBR(d.vendas_total)} (${d.vendas_unidades ?? 0} un)`,
+    `Diferença: R$ ${fmtBR(diferenca)}`,
+  ];
+  // A diferença é o ponto do comando: sem a explicação, um número solto no
+  // grupo não diz a ninguém o que fazer com ele.
+  if (Math.abs(diferenca) >= 0.005) {
+    linhas.push('_confira se todas as vendas foram dadas baixa ou se falta comprovante_');
+  }
+  return linhas.join('\n');
+}
+
+async function handleCaixa(chatId, text) {
+  const arg = (text || '').trim().split(/\s+/)[1];
+  if (arg && !parseDataComando(text)) {
+    await sendTelegram(chatId, 'Uso: /caixa (hoje) ou /caixa 15/09');
+    return;
+  }
+  await sendTelegram(chatId, await textoCaixa(parseDataComando(text)));
+}
+
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — comprovantes x vendas do dia (ou `/caixa 15/09`)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)';
 
 const vendasDoDia = {};
 
@@ -1791,8 +2049,10 @@ async function enviarResumoVendas() {
     }
     linhas.push('', `Total: *${total}* unidades saíram hoje`);
   }
-  // Bloco final: comissão (com cabeçalho de FECHAMENTO no último dia do período).
+  // Bloco final: comissão (com cabeçalho de FECHAMENTO no último dia do período)
+  // e o caixa do dia — é o fechamento de dinheiro ao lado do de unidades.
   linhas.push('', await textoComissaoRelatorio());
+  linhas.push('', await textoCaixa(null));
   await sendTelegram(VENDAS_CHAT_ID, linhas.join('\n'));
 }
 
@@ -1846,8 +2106,9 @@ app.post('/webhook', async (req, res) => {
 
     const chatId = msg.chat.id;
     const text = (msg.text || msg.caption || '').trim();
-    if (!text) return;
-    const cmd = text.split(/\s+/)[0].toLowerCase().split('@')[0];
+    // O `if (!text) return` desceu pra depois do gate: comprovante chega SEM
+    // legenda, e parar aqui era ignorar a foto inteira.
+    const cmd = text ? text.split(/\s+/)[0].toLowerCase().split('@')[0] : '';
 
     const chatKey = String(chatId);
     const fromId = msg.from && msg.from.id;
@@ -1870,6 +2131,15 @@ app.post('/webhook', async (req, res) => {
       msg.chat.type === 'private' && String(msg.from && msg.from.id) === LUCAS_USER_ID;
     const isPedidos = !!pedidosId && chatKey === String(pedidosId);
     if (!isVendas && !isReposicao && !isPrivadoLucas && !isPedidos) return;
+
+    // Comprovante: foto/PDF no grupo de VENDAS, sem legenda de comando. Com
+    // legenda de comando ou movimento, a foto é só anexo e o texto manda.
+    if (isVendas && arquivoComprovante(msg) && !legendaEhComando(text)) {
+      await handleComprovante(chatId, msg);
+      return;
+    }
+
+    if (!text) return;
 
     // Onde /fornecedor, /apelido e /pedido valem.
     const pedidosAqui = podePedidos(chatKey, isPrivadoLucas, pedidosId);
@@ -1979,6 +2249,7 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/refazerfechamento') { await handleRefazerFechamento(chatId, text, fromId); return; }
     if (cmd === '/atacado') { await handleAtacado(chatId, msg.from); return; }
     if (cmd === '/desatacado') { await handleDesatacado(chatId, msg.from); return; }
+    if (cmd === '/caixa') { await handleCaixa(chatId, text); return; }
     if (cmd === '/versao') { await handleVersao(chatId, fromId); return; }
 
     // Pedidos: só no grupo de pedidos e no privado do dono (enquanto a chave
@@ -2071,6 +2342,14 @@ module.exports = {
   descricaoVenda,
   handleDesatacado,
   separarControleAtacado,
+  arquivoComprovante,
+  legendaEhComando,
+  parseJsonModelo,
+  valorConfiavel,
+  textoComprovante,
+  handleComprovante,
+  textoCaixa,
+  handleCaixa,
   nomeAutor,
   fmtValor,
   handleRefazerFechamento,

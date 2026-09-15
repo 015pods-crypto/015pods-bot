@@ -7,9 +7,17 @@
 const http = require('http');
 const assert = require('assert');
 
-const enviadas = [];     // mensagens que o bot mandou pro Telegram
-const chamadas = [];     // { fn, body } de cada RPC recebida
-let respostas = {};      // { [fn]: { status, body } } — o que o Supabase falso devolve
+const enviadas = [];      // mensagens que o bot mandou pro Telegram
+const chamadas = [];      // { fn, body } de cada RPC recebida
+let respostas = {};       // { [fn]: { status, body } } — o que o Supabase falso devolve
+const chamadasGemini = []; // { url, body } de cada leitura de comprovante
+let respostaGemini = null; // o que o Gemini falso devolve (null = valor padrão)
+
+// Envelope de resposta do Gemini: o JSON do comprovante vem como TEXTO dentro
+// de candidates[0].content.parts[0].text.
+function geminiJson(obj) {
+  return { candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] };
+}
 
 function servidorFalso(handler) {
   return new Promise(resolve => {
@@ -24,6 +32,18 @@ function servidorFalso(handler) {
 
 async function subirFalsos() {
   const telegram = await servidorFalso((req, raw, res) => {
+    const url = req.url || '';
+    // getFile + download do arquivo: o caminho que o bot usa pra ler comprovante.
+    if (url.includes('/getFile')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, result: { file_path: 'photos/comprovante.jpg' } }));
+      return;
+    }
+    if (url.includes('/file/bot')) {
+      res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+      res.end(Buffer.from('bytes-falsos-da-foto'));
+      return;
+    }
     try { enviadas.push(JSON.parse(raw)); } catch (_) { enviadas.push({ text: raw }); }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end('{"ok":true}');
@@ -42,10 +62,20 @@ async function subirFalsos() {
     res.end(JSON.stringify(r.body));
   });
 
+  const gemini = await servidorFalso((req, raw, res) => {
+    let body = null;
+    try { body = JSON.parse(raw); } catch (_) {}
+    chamadasGemini.push({ url: req.url, body });
+    const r = respostaGemini || { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
+    res.writeHead(r.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(r.body));
+  });
+
   return {
     telegram: `http://127.0.0.1:${telegram.address().port}`,
     supabase: `http://127.0.0.1:${supabase.address().port}`,
-    fechar: () => { telegram.close(); supabase.close(); },
+    gemini: `http://127.0.0.1:${gemini.address().port}`,
+    fechar: () => { telegram.close(); supabase.close(); gemini.close(); },
   };
 }
 
@@ -67,6 +97,25 @@ function update(text, { from = DONO, chat = GRUPO_VENDAS, tipo = 'group', nome }
       text,
     },
   };
+}
+
+// Mensagem com foto (o Telegram manda várias resoluções; o bot pega a maior)
+// ou com documento.
+function updateArquivo({ chat = GRUPO_VENDAS, from = DONO, caption, doc, size = 1024 } = {}) {
+  const message = {
+    message_id: updateId,
+    from: { id: from },
+    chat: { id: chat, type: 'group' },
+  };
+  if (caption) message.caption = caption;
+  if (doc) message.document = { file_id: 'doc-1', mime_type: doc, file_size: size };
+  else {
+    message.photo = [
+      { file_id: 'foto-peq', file_size: 200 },
+      { file_id: 'foto-grande', file_size: size },
+    ];
+  }
+  return { update_id: updateId++, message };
 }
 
 // Manda o update e espera o bot responder (o webhook devolve 200 antes de
@@ -1747,6 +1796,265 @@ teste('fechamento mostra a quebra de atacado', async (ctx) => {
   assert.ok(texto.includes('Total a pagar: R$ 2.274,00'), texto);
 });
 
+// --- Comprovantes de pagamento --------------------------------------------
+
+const REGISTRO_OK = {
+  status: 200,
+  body: { ok: true, duplicado: false, total_dia: 450, qtd_dia: 3 },
+};
+
+teste('foto de comprovante é lida, registrada e somada no caixa do dia', async (ctx) => {
+  respostaGemini = {
+    status: 200,
+    body: geminiJson({
+      valor: 150.0, codigo: 'E12345ABC', pago_em: '2026-09-15T16:42:00',
+      pagador: 'Fulano', banco: 'Nubank', confianca: 'alta',
+    }),
+  };
+  respostas.bot_comprovante_registrar = REGISTRO_OK;
+
+  const [resp] = await mandar(ctx.webhook, updateArquivo());
+
+  // Leu a foto MAIOR (a pequena borra o valor).
+  assert.strictEqual(chamadasGemini.length, 1, 'deveria chamar o Gemini uma vez');
+  const partes = chamadasGemini[0].body.contents[0].parts;
+  assert.ok(partes[0].text.includes('comprovante de pagamento brasileiro'), 'faltou o prompt');
+  assert.strictEqual(partes[1].inline_data.mime_type, 'image/jpeg');
+  assert.ok(partes[1].inline_data.data.length > 0, 'faltou a imagem em base64');
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_comprovante_registrar');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_valor, 150);
+  assert.strictEqual(rpc[0].body.p_codigo, 'E12345ABC');
+  assert.strictEqual(rpc[0].body.p_pagador, 'Fulano');
+  assert.strictEqual(rpc[0].body.p_banco, 'Nubank');
+  assert.strictEqual(rpc[0].body.p_arquivo_id, 'foto-grande');
+  assert.strictEqual(rpc[0].body.p_bruto.codigo, 'E12345ABC', 'p_bruto tem que levar o JSON inteiro');
+
+  assert.strictEqual(resp.text,
+    '💰 Comprovante lido: *R$ 150,00* · total do dia: R$ 450,00 (3 comprovantes)');
+});
+
+teste('comprovante reenviado (mesmo código) vira alerta de duplicado', async (ctx) => {
+  respostaGemini = { status: 200, body: geminiJson({ valor: 150, codigo: 'E12345ABC', confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = {
+    status: 200,
+    body: { ok: true, duplicado: true, motivo: 'codigo', valor: 150, quando: '14/09 16:31' },
+  };
+  const [resp] = await mandar(ctx.webhook, updateArquivo());
+  assert.ok(resp.text.includes('COMPROVANTE JÁ ENVIADO'), resp.text);
+  assert.ok(resp.text.includes('14/09 16:31'), resp.text);
+  assert.ok(resp.text.includes('R$ 150,00'), resp.text);
+  assert.ok(resp.text.includes('antes de liberar o pedido'), resp.text);
+});
+
+teste('mesmo valor repetido vira aviso mais leve', async (ctx) => {
+  respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = {
+    status: 200,
+    body: { ok: true, duplicado: true, motivo: 'valor_repetido', valor: 150, quando: '16:20' },
+  };
+  const [resp] = await mandar(ctx.webhook, updateArquivo());
+  assert.ok(resp.text.includes('Já entrou um comprovante de R$ 150,00'), resp.text);
+  assert.ok(resp.text.includes('Se for outro pagamento, tudo bem'), resp.text);
+  assert.ok(!resp.text.includes('JÁ ENVIADO'), resp.text);
+});
+
+teste('confiança baixa NÃO registra e pede o valor', async (ctx) => {
+  respostaGemini = { status: 200, body: geminiJson({ valor: null, confianca: 'baixa' }) };
+  const [resp] = await mandar(ctx.webhook, updateArquivo());
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0,
+    'sem confiança não pode registrar');
+  assert.ok(resp.text.includes('Não consegui ler o valor'), resp.text);
+});
+
+// Valor com confiança baixa é o modelo dizendo que chutou.
+teste('valor lido com confiança baixa também é recusado', async (ctx) => {
+  respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'baixa' }) };
+  const [resp] = await mandar(ctx.webhook, updateArquivo());
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
+  assert.ok(resp.text.includes('Não consegui ler o valor'), resp.text);
+});
+
+teste('confiança média é aceita', async (ctx) => {
+  respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'media' }) };
+  respostas.bot_comprovante_registrar = REGISTRO_OK;
+  await mandar(ctx.webhook, updateArquivo());
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 1);
+});
+
+// Foto que não é comprovante: o modelo não acha valor, e o bot só não registra.
+teste('imagem que não é comprovante não registra nada', async (ctx) => {
+  respostaGemini = { status: 200, body: geminiJson({ valor: null, confianca: 'baixa' }) };
+  const [resp] = await mandar(ctx.webhook, updateArquivo());
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
+  assert.ok(resp.text.includes('Confere e me diz o valor'), resp.text);
+});
+
+teste('falha da API do Gemini não quebra o bot: pede o valor', async (ctx) => {
+  respostaGemini = { status: 429, body: { error: { message: 'quota exceeded' } } };
+  const [resp] = await mandar(ctx.webhook, updateArquivo());
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
+  assert.ok(resp.text.includes('Não consegui ler o valor'), resp.text);
+  assert.ok(!resp.text.includes('quota'), 'não vaza o erro cru da API');
+
+  // E o bot segue vivo depois.
+  respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = REGISTRO_OK;
+  const [depois] = await mandar(ctx.webhook, updateArquivo());
+  assert.ok(depois.text.includes('Comprovante lido'), depois.text);
+});
+
+teste('resposta do modelo embrulhada em ```json ainda é lida', async (ctx) => {
+  respostaGemini = {
+    status: 200,
+    body: { candidates: [{ content: { parts: [{ text: '```json\n{"valor": 99.9, "confianca": "alta"}\n```' }] } }] },
+  };
+  respostas.bot_comprovante_registrar = REGISTRO_OK;
+  await mandar(ctx.webhook, updateArquivo());
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar')[0].body.p_valor, 99.9);
+});
+
+teste('resposta do modelo que não é JSON pede o valor', async (ctx) => {
+  respostaGemini = {
+    status: 200,
+    body: { candidates: [{ content: { parts: [{ text: 'não consegui ver direito' }] } }] },
+  };
+  const [resp] = await mandar(ctx.webhook, updateArquivo());
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
+  assert.ok(resp.text.includes('Não consegui ler o valor'), resp.text);
+});
+
+teste('valor fora do padrão registra, mas avisa', async (ctx) => {
+  respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 2500, qtd_dia: 1 } };
+
+  respostaGemini = { status: 200, body: geminiJson({ valor: 2500, confianca: 'alta' }) };
+  const [alto] = await mandar(ctx.webhook, updateArquivo());
+  assert.ok(alto.text.includes('Comprovante lido'), alto.text);
+  assert.ok(alto.text.includes('valor fora do padrão'), alto.text);
+
+  respostaGemini = { status: 200, body: geminiJson({ valor: 10, confianca: 'alta' }) };
+  const [baixo] = await mandar(ctx.webhook, updateArquivo());
+  assert.ok(baixo.text.includes('valor fora do padrão'), baixo.text);
+
+  // Dentro da faixa não leva aviso nenhum.
+  respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
+  const [normal] = await mandar(ctx.webhook, updateArquivo());
+  assert.ok(!normal.text.includes('fora do padrão'), normal.text);
+});
+
+teste('PDF é aceito; sticker e vídeo são ignorados', async (ctx) => {
+  respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = REGISTRO_OK;
+
+  await mandar(ctx.webhook, updateArquivo({ doc: 'application/pdf' }));
+  assert.strictEqual(chamadasGemini[0].body.contents[0].parts[1].inline_data.mime_type, 'application/pdf');
+
+  chamadas.length = 0; chamadasGemini.length = 0; enviadas.length = 0;
+  await mandar(ctx.webhook, updateArquivo({ doc: 'video/mp4' }), { esperaResposta: false });
+  assert.strictEqual(chamadasGemini.length, 0, 'vídeo não é comprovante');
+  assert.strictEqual(enviadas.length, 0);
+});
+
+// Foto com legenda de comando/movimento: o texto manda, a foto é só anexo.
+teste('foto com legenda de baixa continua dando baixa, não vira comprovante', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: {
+      resultados: [{
+        status: 'ok', direction: 'baixa', model: 'Elfbar 30000',
+        flavor: 'Cherry', qty: 2, stock_after: 8, sale_id: '77',
+      }],
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-2 elfbar 30000 cherry' }));
+  assert.strictEqual(chamadasGemini.length, 0, 'legenda de movimento tem prioridade');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1);
+  assert.ok(resp.text.includes('Baixa registrada'), resp.text);
+});
+
+teste('foto no grupo de reposição não é tratada como comprovante', async (ctx) => {
+  await mandar(ctx.webhook, updateArquivo({ chat: GRUPO_REPOSICAO }), { esperaResposta: false });
+  assert.strictEqual(chamadasGemini.length, 0);
+  assert.strictEqual(enviadas.length, 0);
+});
+
+teste('RPC de comprovante ausente diz qual SQL falta', async (ctx) => {
+  respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = { status: 404, body: { message: 'Could not find the function' } };
+  const [resp] = await mandar(ctx.webhook, updateArquivo());
+  assert.ok(resp.text.includes('bot_comprovante_registrar'), resp.text);
+  assert.ok(resp.text.includes('falta rodar o SQL'), resp.text);
+});
+
+// --- /caixa ----------------------------------------------------------------
+
+teste('/caixa mostra comprovantes, vendas e a diferença', async (ctx) => {
+  respostas.bot_caixa_dia = {
+    status: 200,
+    body: {
+      ok: true, dia: '15/09', comprovantes_total: 450, comprovantes_qtd: 3,
+      vendas_total: 520, vendas_unidades: 8, diferenca: -70,
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  assert.ok(resp.text.includes('CAIXA DE 15/09'), resp.text);
+  assert.ok(resp.text.includes('Comprovantes: R$ 450,00 (3)'), resp.text);
+  assert.ok(resp.text.includes('Vendas registradas: R$ 520,00 (8 un)'), resp.text);
+  assert.ok(resp.text.includes('Diferença: R$ -70,00'), resp.text);
+  assert.ok(resp.text.includes('confira se todas as vendas foram dadas baixa'), resp.text);
+});
+
+teste('/caixa com diferença zero não pede conferência', async (ctx) => {
+  respostas.bot_caixa_dia = {
+    status: 200,
+    body: {
+      ok: true, dia: '15/09', comprovantes_total: 450, comprovantes_qtd: 3,
+      vendas_total: 450, vendas_unidades: 6, diferenca: 0,
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  assert.ok(resp.text.includes('Diferença: R$ 0,00'), resp.text);
+  assert.ok(!resp.text.includes('confira se todas'), resp.text);
+});
+
+teste('/caixa 15/09 consulta o dia pedido', async (ctx) => {
+  respostas.bot_caixa_dia = { status: 200, body: { ok: true, dia: '15/09', diferenca: 0 } };
+  await mandar(ctx.webhook, update('/caixa 15/09'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_dia')[0].body.p_data, '2026-09-15');
+});
+
+teste('/caixa com data inválida mostra o uso', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/caixa ontem'));
+  assert.ok(resp.text.includes('Uso: /caixa'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_dia').length, 0);
+});
+
+teste('/caixa com a RPC fora do ar avisa em vez de calar', async (ctx) => {
+  respostas.bot_caixa_dia = { status: 500, body: { message: 'boom' } };
+  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  assert.ok(resp.text.includes('Erro ao consultar o caixa'), resp.text);
+  assert.ok(!resp.text.includes('boom'), resp.text);
+});
+
+teste('o resumo diário das 23:59 leva o caixa junto', async (ctx) => {
+  respostas.bot_comissao = {
+    status: 200,
+    body: { ok: true, mes: '21/08 → 20/09', unidades_hoje: 4, unidades_mes: 120, taxa_atual: 1.5, comissao: 180 },
+  };
+  respostas.bot_caixa_dia = {
+    status: 200,
+    body: {
+      ok: true, dia: '15/09', comprovantes_total: 450, comprovantes_qtd: 3,
+      vendas_total: 450, vendas_unidades: 6, diferenca: 0,
+    },
+  };
+  await ctx.mod.enviarResumoVendas();
+  const noGrupo = enviadas.find(e => String(e.chat_id) === String(GRUPO_VENDAS));
+  assert.ok(noGrupo.text.includes('CAIXA DE 15/09'), noGrupo.text);
+  assert.ok(noGrupo.text.includes('Comprovantes: R$ 450,00 (3)'), noGrupo.text);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {
@@ -1756,6 +2064,8 @@ async function main() {
   process.env.TELEGRAM_TOKEN = 'token-de-teste';
   process.env.TELEGRAM_API_BASE = falsos.telegram;
   process.env.SUPABASE_URL = falsos.supabase;
+  process.env.GEMINI_API_BASE = falsos.gemini;
+  process.env.GEMINI_API_KEY = 'chave-de-teste';
   process.env.SUPABASE_ANON_KEY = 'anon-de-teste';
   process.env.BOT_SYNC_TOKEN = 'token-de-teste';
   process.env.ADMIN_USER_ID = String(DONO);
@@ -1776,7 +2086,9 @@ async function main() {
   for (const t of testes) {
     enviadas.length = 0;
     chamadas.length = 0;
+    chamadasGemini.length = 0;
     respostas = {};
+    respostaGemini = null;
     mod._resetEstadoTeste(); // config, fornecedor pendente e marcação de atacado
     try {
       await t.fn(ctx);
