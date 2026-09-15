@@ -612,9 +612,10 @@ teste('palavra nova no bot_despesa_palavras funciona sem deploy', async (ctx) =>
 
   const [resp] = await mandar(ctx.webhook, update('+15 ALMOÇO', { chat: GRUPO_REPOSICAO }));
 
-  const cfg = chamadas.filter(c => c.fn === 'bot_config');
+  // Agora o webhook consulta mais de uma chave (grupo de pedidos, palavras):
+  // procurar a chave certa em vez de assumir a ordem das chamadas.
+  const cfg = chamadas.filter(c => c.fn === 'bot_config' && c.body.p_key === 'bot_despesa_palavras');
   assert.ok(cfg.length >= 1, 'deveria consultar a lista no banco');
-  assert.strictEqual(cfg[0].body.p_key, 'bot_despesa_palavras');
   const rpc = chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar');
   assert.strictEqual(rpc.length, 1, 'ALMOÇO deveria ter virado despesa');
   assert.strictEqual(rpc[0].body.p_descricao, 'ALMOÇO');
@@ -932,6 +933,309 @@ teste('semanal: o agendamento cai domingo às 14h de Brasília', async (ctx) => 
   assert.ok(/14:00/.test(emSP), `deveria cair às 14:00: ${emSP}`);
 });
 
+// --- Grupo de pedidos: /chatid e /setgrupopedidos --------------------------
+
+teste('/chatid responde o id do chat ao dono, em qualquer chat', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/chatid', { chat: -777, nome: 'Lucas' }));
+  assert.ok(resp.text.includes('-777'), resp.text);
+  assert.ok(resp.text.includes('Chat atual'), resp.text);
+});
+
+// É o ponto do comando: o grupo novo ainda NÃO está na lista de chats
+// atendidos, e mesmo assim o /chatid tem que responder lá dentro.
+teste('/chatid funciona em grupo que o bot ainda não atende', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/chatid', { chat: -999888 }));
+  assert.ok(resp.text.includes('-999888'), resp.text);
+});
+
+teste('/chatid ignora quem não é dono (chat aleatório não faz o bot falar)', async (ctx) => {
+  await mandar(ctx.webhook, update('/chatid', { chat: -999888, from: FUNCIONARIO }), { esperaResposta: false });
+  assert.strictEqual(enviadas.length, 0, `não devia responder: ${JSON.stringify(enviadas)}`);
+});
+
+teste('/setgrupopedidos sem argumento grava o chat atual', async (ctx) => {
+  respostas.bot_config_set = { status: 200, body: { ok: true } };
+  const [resp] = await mandar(ctx.webhook, update('/setgrupopedidos', { chat: -4321 }));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_config_set');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_key, 'telegram_grupo_pedidos');
+  assert.strictEqual(rpc[0].body.p_valor, '-4321');
+  assert.ok(resp.text.includes('Grupo de pedidos definido'), resp.text);
+});
+
+teste('/setgrupopedidos aceita id explícito e recusa não-dono', async (ctx) => {
+  respostas.bot_config_set = { status: 200, body: { ok: true } };
+  await mandar(ctx.webhook, update('/setgrupopedidos -100123'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_config_set')[0].body.p_valor, '-100123');
+
+  chamadas.length = 0;
+  await mandar(ctx.webhook, update('/setgrupopedidos', { from: FUNCIONARIO }), { esperaResposta: false });
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_config_set').length, 0);
+});
+
+teste('com grupo de pedidos configurado, /pedido é recusado no grupo de VENDAS', async (ctx) => {
+  respostas.bot_config = (body) => body.p_key === 'telegram_grupo_pedidos'
+    ? { status: 200, body: { ok: true, valor: '-4321' } }
+    : { status: 200, body: { ok: true, valor: 'ENTREGA,UBER' } };
+
+  const [resp] = await mandar(ctx.webhook, update('/pedido'));
+  assert.ok(resp.text.includes('grupo de pedidos'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_montar_pedido').length, 0);
+});
+
+teste('sem a chave configurada, /pedido responde onde for chamado', async (ctx) => {
+  respostas.bot_montar_pedido = { status: 200, body: { ok: true, itens: [], usou_lista_fornecedor: true } };
+  const [resp] = await mandar(ctx.webhook, update('/pedido'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_montar_pedido').length, 1);
+  assert.ok(resp.text.includes('Nada a pedir'), resp.text);
+});
+
+// --- Parse da lista do fornecedor -----------------------------------------
+
+// Trecho no formato real: emojis, negrito, recados e separadores no meio.
+const LISTA_REAL = [
+  '━━━━━━━━━━━━━━━',
+  '🃏 *IGNITE 5500 (V55)* 🃏',
+  '• Strawberry Ice',
+  '• Grape Ice',
+  '- Blueberry Ice',
+  '',
+  '📣 RECADOS AOS QUERIDOS CLIENTES',
+  'NÃO ACEITAMOS DEVOLUÇÃO',
+  'AGRADECEMOS A PREFERÊNCIA 🙏',
+  '━━━━━━━━━━━━━━━',
+  '🔱 *ELFBAR 30000* 🔱',
+  '* Watermelon Bubblegum',
+  '• Cherry Cola',
+  '',
+  '🔥 PROMOÇÃO: leve 10 por R$ 250',
+  'Faça seu pedido pelo WhatsApp',
+  '🃏 LOST MARY MT 20k 🃏',
+  '• Hawaii juice',
+  '🎉',
+].join('\n');
+
+teste('parse da lista real: pega modelos e sabores, descarta recado e separador', async (ctx) => {
+  const itens = ctx.mod.parseListaFornecedor(LISTA_REAL);
+  assert.deepStrictEqual(itens, [
+    { modelo: 'IGNITE 5500 (V55)', sabor: 'Strawberry Ice' },
+    { modelo: 'IGNITE 5500 (V55)', sabor: 'Grape Ice' },
+    { modelo: 'IGNITE 5500 (V55)', sabor: 'Blueberry Ice' },
+    { modelo: 'ELFBAR 30000', sabor: 'Watermelon Bubblegum' },
+    { modelo: 'ELFBAR 30000', sabor: 'Cherry Cola' },
+    { modelo: 'LOST MARY MT 20k', sabor: 'Hawaii juice' },
+  ]);
+});
+
+teste('parse: sabor antes de qualquer modelo é descartado, e repetido não duplica', async (ctx) => {
+  const itens = ctx.mod.parseListaFornecedor(
+    '• Orfao sem modelo\n🃏 IGNITE 5500 🃏\n• Grape\n• Grape\n• grape',
+  );
+  assert.deepStrictEqual(itens, [{ modelo: 'IGNITE 5500', sabor: 'Grape' }]);
+});
+
+teste('/fornecedor com a lista na mesma mensagem importa e resume', async (ctx) => {
+  respostas.bot_fornecedor_importar = {
+    status: 200,
+    body: {
+      ok: true, total: 337, casaram: 295,
+      modelos_sem_cadastro: ['ADJUST ICE 40K', 'V400 MIX SLIM'],
+      sabores_sem_cadastro: [{ modelo: 'LOST MARY MT 20k', sabor: 'Hawaii juice' }],
+      sabores_sem_cadastro_total: 42,
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update(`/fornecedor\n${LISTA_REAL}`));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_fornecedor_importar');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_itens.length, 6);
+  assert.deepStrictEqual(rpc[0].body.p_itens[0], { modelo: 'IGNITE 5500 (V55)', sabor: 'Strawberry Ice' });
+
+  assert.ok(resp.text.includes('295 de 337 itens casaram (88%)'), resp.text);
+  assert.ok(resp.text.includes('ADJUST ICE 40K, V400 MIX SLIM'), resp.text);
+  assert.ok(resp.text.includes('42 sabores sem cadastro'), resp.text);
+  assert.ok(resp.text.includes('/apelido'), resp.text);
+});
+
+teste('/fornecedor sozinho espera a lista na mensagem seguinte', async (ctx) => {
+  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, total: 6, casaram: 6 } };
+
+  const [aviso] = await mandar(ctx.webhook, update('/fornecedor'));
+  assert.ok(aviso.text.includes('próxima mensagem'), aviso.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_fornecedor_importar').length, 0);
+
+  const [resp] = await mandar(ctx.webhook, update(LISTA_REAL));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_fornecedor_importar').length, 1);
+  assert.ok(resp.text.includes('Lista importada'), resp.text);
+});
+
+// A lista tem dezenas de linhas começando com "-": sem o desvio, a primeira
+// delas cairia na rota de BAIXA DE ESTOQUE.
+teste('lista pendente não é confundida com baixa de estoque', async (ctx) => {
+  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, total: 6, casaram: 6 } };
+  await mandar(ctx.webhook, update('/fornecedor'));
+  await mandar(ctx.webhook, update(LISTA_REAL));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0,
+    'a lista não podia virar movimento de estoque');
+});
+
+teste('conversa curta depois do /fornecedor NÃO é tratada como lista', async (ctx) => {
+  await mandar(ctx.webhook, update('/fornecedor'));
+  chamadas.length = 0;
+  await mandar(ctx.webhook, update('beleza, já mando'), { esperaResposta: false });
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_fornecedor_importar').length, 0);
+});
+
+teste('/fornecedor com lista sem nenhum item reconhecível avisa em vez de importar', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update(
+    '/fornecedor\nbom dia\ncomo vai\ntudo certo por aí\nabraço\nfalou mesmo\n' + 'x'.repeat(200),
+  ));
+  assert.ok(resp.text.includes('Não achei nenhum item'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_fornecedor_importar').length, 0);
+});
+
+teste('/fornecedor é recusado pro funcionário', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update(`/fornecedor\n${LISTA_REAL}`, { from: FUNCIONARIO }));
+  assert.ok(resp.text.includes('Só o dono'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_fornecedor_importar').length, 0);
+});
+
+// --- /apelido --------------------------------------------------------------
+
+teste('/apelido TE 30K = Elfbar 30000 grava os dois lados', async (ctx) => {
+  respostas.bot_fornecedor_apelido = { status: 200, body: { ok: true } };
+  const [resp] = await mandar(ctx.webhook, update('/apelido TE 30K = Elfbar 30000'));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_fornecedor_apelido');
+  assert.strictEqual(rpc[0].body.p_apelido, 'TE 30K');
+  assert.strictEqual(rpc[0].body.p_modelo, 'Elfbar 30000');
+  assert.ok(resp.text.includes('Apelido gravado'), resp.text);
+});
+
+teste('/apelido sem o "=" mostra o uso', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/apelido TE 30K Elfbar'));
+  assert.ok(resp.text.includes('Uso:'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_fornecedor_apelido').length, 0);
+});
+
+// --- /pedido ---------------------------------------------------------------
+
+const PEDIDO_OK = {
+  ok: true, usou_lista_fornecedor: true, total_unidades: 252, custo_total: 14969,
+  itens: [
+    { modelo: 'IGNITE 5500 (V55)', sabor: 'Strawberry Ice', qtd: 4, estoque: 1, vendidos: 12 },
+    { modelo: 'IGNITE 5500 (V55)', sabor: 'Grape Ice', qtd: 3, estoque: 0, vendidos: 9 },
+    { modelo: 'ELFBAR 30000', sabor: 'Cherry Cola', qtd: 2, estoque: 0, vendidos: 4 },
+  ],
+};
+
+teste('/pedido sai no formato de encaminhar pro fornecedor', async (ctx) => {
+  respostas.bot_montar_pedido = { status: 200, body: PEDIDO_OK };
+  const [resp] = await mandar(ctx.webhook, update('/pedido'));
+
+  assert.ok(resp.text.includes('*PEDIDO SUGERIDO*'), resp.text);
+  assert.ok(resp.text.includes('_252 un · R$ 14.969 de custo_'), resp.text);
+  assert.ok(resp.text.includes('\n4 Strawberry Ice\n3 Grape Ice'), resp.text);
+  assert.ok(resp.text.includes('*ELFBAR 30000*'), resp.text);
+  // Sem estoque/vendas na mensagem principal — é o que vai pro fornecedor.
+  assert.ok(!resp.text.includes('tem 1'), resp.text);
+  assert.ok(!resp.text.includes('vendeu'), resp.text);
+});
+
+teste('/pedido passa teto e semanas pra RPC (padrão 4 semanas)', async (ctx) => {
+  respostas.bot_montar_pedido = { status: 200, body: PEDIDO_OK };
+
+  await mandar(ctx.webhook, update('/pedido'));
+  let b = chamadas.filter(c => c.fn === 'bot_montar_pedido').pop().body;
+  assert.strictEqual(b.p_teto, null);
+  assert.strictEqual(b.p_semanas, 4);
+  assert.strictEqual(b.p_so_fornecedor, true);
+
+  await mandar(ctx.webhook, update('/pedido 15000'));
+  b = chamadas.filter(c => c.fn === 'bot_montar_pedido').pop().body;
+  assert.strictEqual(b.p_teto, 15000);
+  assert.strictEqual(b.p_semanas, 4);
+
+  await mandar(ctx.webhook, update('/pedido 15000 8'));
+  b = chamadas.filter(c => c.fn === 'bot_montar_pedido').pop().body;
+  assert.strictEqual(b.p_teto, 15000);
+  assert.strictEqual(b.p_semanas, 8);
+});
+
+teste('/pedido detalhe 15000 mostra estoque e vendas, e respeita o teto', async (ctx) => {
+  respostas.bot_montar_pedido = { status: 200, body: PEDIDO_OK };
+  const [resp] = await mandar(ctx.webhook, update('/pedido detalhe 15000'));
+
+  const b = chamadas.filter(c => c.fn === 'bot_montar_pedido').pop().body;
+  assert.strictEqual(b.p_teto, 15000, 'o teto tem que chegar na RPC mesmo com "detalhe"');
+  assert.ok(resp.text.includes('4 Strawberry Ice (tem 1 · vendeu 12)'), resp.text);
+  assert.ok(resp.text.includes('3 Grape Ice (tem 0 · vendeu 9)'), resp.text);
+});
+
+teste('zerado aparece com a quantidade que a RPC mandou', async (ctx) => {
+  respostas.bot_montar_pedido = {
+    status: 200,
+    body: {
+      ok: true, usou_lista_fornecedor: true, total_unidades: 2, custo_total: 100,
+      itens: [{ modelo: 'ELFBAR 30000', sabor: 'Cherry Cola', qtd: 2, estoque: 0, vendidos: 0 }],
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/pedido'));
+  assert.ok(resp.text.includes('2 Cherry Cola'), resp.text);
+});
+
+teste('/pedido sem lista de fornecedor ativa avisa NO TOPO', async (ctx) => {
+  respostas.bot_montar_pedido = {
+    status: 200, body: { ...PEDIDO_OK, usou_lista_fornecedor: false },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/pedido'));
+  assert.ok(resp.text.startsWith('⚠️ Sem lista de fornecedor ativa'), resp.text);
+  assert.ok(resp.text.includes('Use /fornecedor antes'), resp.text);
+});
+
+teste('/pedido longo quebra em várias mensagens sem cortar bloco de modelo', async (ctx) => {
+  const itens = [];
+  for (let m = 0; m < 40; m++) {
+    for (let s = 0; s < 8; s++) {
+      itens.push({ modelo: `MODELO NUMERO ${m} COM NOME COMPRIDO`, sabor: `Sabor comprido numero ${s}`, qtd: 3 });
+    }
+  }
+  respostas.bot_montar_pedido = {
+    status: 200, body: { ok: true, usou_lista_fornecedor: true, total_unidades: 960, custo_total: 50000, itens },
+  };
+
+  const antes = enviadas.length;
+  await mandar(ctx.webhook, update('/pedido'));
+  await new Promise(r => setTimeout(r, 400));
+  const partes = enviadas.slice(antes);
+
+  assert.ok(partes.length > 1, `devia ter quebrado em várias mensagens (${partes.length})`);
+  for (const p of partes) {
+    assert.ok(p.text.length <= 4096, `mensagem passou de 4096: ${p.text.length}`);
+  }
+  // Nenhuma parte pode começar com linha de sabor solta: isso é bloco cortado.
+  for (const p of partes.slice(1)) {
+    assert.ok(/^🃏/.test(p.text.trim()), `parte começa no meio de um bloco:\n${p.text.slice(0, 80)}`);
+  }
+  // E nenhum item pode ter sumido na quebra.
+  const juntas = partes.map(p => p.text).join('\n');
+  assert.strictEqual((juntas.match(/Sabor comprido numero/g) || []).length, 320);
+});
+
+teste('/pedido não encosta no estoque', async (ctx) => {
+  respostas.bot_montar_pedido = { status: 200, body: PEDIDO_OK };
+  await mandar(ctx.webhook, update('/pedido 15000'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('RPC de pedido ausente diz qual SQL falta', async (ctx) => {
+  respostas.bot_montar_pedido = { status: 404, body: { message: 'Could not find the function' } };
+  const [resp] = await mandar(ctx.webhook, update('/pedido'));
+  assert.ok(resp.text.includes('bot_montar_pedido'), resp.text);
+  assert.ok(resp.text.includes('falta rodar o SQL'), resp.text);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {
@@ -962,7 +1266,7 @@ async function main() {
     enviadas.length = 0;
     chamadas.length = 0;
     respostas = {};
-    mod._resetCachePalavras(); // o cache de palavras atravessa testes (TTL 1 min)
+    mod._resetCacheConfig(); // o cache de config atravessa testes (TTL 1 min)
     try {
       await t.fn(ctx);
       console.log(`✅ ${t.nome}`);

@@ -32,6 +32,7 @@ const COMANDOS = [
   '/start', '/ajuda', '/estoque', '/zerados', '/baixo', '/relatorio',
   '/semana', '/reposicao', '/comissao', '/despesas', '/dinheiro', '/geral',
   '/anular', '/desanular', '/adicionar', '/refazerfechamento', '/versao',
+  '/chatid', '/setgrupopedidos', '/fornecedor', '/apelido', '/pedido',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -169,34 +170,55 @@ const PALAVRA_DINHEIRO = 'DINHEIRO';
 // deploy) — esta lista existe só pra não deixar o Rod sem registrar nada.
 const PALAVRAS_DESPESA_PADRAO = ['ENTREGA', 'UBER', 'GASOLINA'];
 
-// Cache da lista vinda do banco (~1 min). O fallback TAMBÉM é cacheado: desde
-// que o "-" entrou na rota, toda linha de venda passa por aqui, e sem cachear a
-// falha o bot pagaria um round-trip morto a cada baixa com o banco fora do ar.
-// Recuperar em até 1 min é o mesmo prazo de uma palavra nova no config.
-let cachePalavras = { at: 0, lista: null };
-const PALAVRAS_TTL_MS = 60 * 1000;
+// Cache das chaves de configuração (~1 min). A falha TAMBÉM é cacheada: desde
+// que o "-" entrou na rota das despesas, toda linha de venda passa por aqui, e
+// sem cachear o erro o bot pagaria um round-trip morto a cada baixa com o banco
+// fora do ar. Recuperar em até 1 min é o mesmo prazo de uma mudança no config.
+const CONFIG_TTL_MS = 60 * 1000;
+const cacheConfig = new Map(); // key -> { at, valor }
 
-async function palavrasDespesa() {
-  if (cachePalavras.lista && Date.now() - cachePalavras.at < PALAVRAS_TTL_MS) {
-    return cachePalavras.lista;
-  }
-  let lista = null;
+// Valor de uma chave da integration_config. Nunca lança: erro vira '' (e o
+// chamador decide o fallback).
+async function lerConfig(key) {
+  const cache = cacheConfig.get(key);
+  if (cache && Date.now() - cache.at < CONFIG_TTL_MS) return cache.valor;
+  let valor = '';
   try {
-    const d = await callRpc('bot_config', { p_token: BOT_SYNC_TOKEN, p_key: 'bot_despesa_palavras' });
-    const csv = d && d.ok !== false ? String(d.valor ?? '') : '';
-    const doBanco = csv.split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
-    if (doBanco.length) lista = doBanco;
+    const d = await callRpc('bot_config', { p_token: BOT_SYNC_TOKEN, p_key: key });
+    if (d && d.ok !== false) valor = String(d.valor ?? '');
   } catch (err) {
-    console.error('bot_config bot_despesa_palavras:', err.message);
+    console.error(`bot_config ${key}:`, err.message);
   }
-  cachePalavras = { at: Date.now(), lista: lista || PALAVRAS_DESPESA_PADRAO };
-  return cachePalavras.lista;
+  cacheConfig.set(key, { at: Date.now(), valor });
+  return valor;
 }
 
-// Só pro teste: como o cache agora guarda também o fallback, sem zerar ele
-// entre casos o teste da lista do banco passaria sem nunca consultar o banco.
-function _resetCachePalavras() {
-  cachePalavras = { at: 0, lista: null };
+// Grava uma chave e já invalida o cache — senão o /setgrupopedidos levaria até
+// um minuto pra valer, e o dono testaria no grupo achando que não funcionou.
+async function gravarConfig(key, valor) {
+  try {
+    const d = await callRpc('bot_config_set', {
+      p_token: BOT_SYNC_TOKEN, p_key: key, p_valor: String(valor),
+    });
+    if (!d || d.ok === false) return false;
+    cacheConfig.set(key, { at: Date.now(), valor: String(valor) });
+    return true;
+  } catch (err) {
+    console.error(`bot_config_set ${key}:`, err.message);
+    return false;
+  }
+}
+
+async function palavrasDespesa() {
+  const csv = await lerConfig('bot_despesa_palavras');
+  const doBanco = csv.split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+  return doBanco.length ? doBanco : PALAVRAS_DESPESA_PADRAO;
+}
+
+// Só pro teste: o cache atravessa casos (TTL 1 min) e faria um teste passar
+// sem nunca consultar o banco.
+function _resetCacheConfig() {
+  cacheConfig.clear();
 }
 
 // `palavras` é a lista já resolvida (o parser é síncrono de propósito: o
@@ -1073,7 +1095,415 @@ async function enviarRelatorioSemanal() {
   await sendTelegram(VENDAS_CHAT_ID, await textoRelatorioSemanal());
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`';
+// ---------------------------------------------------------------------------
+// Grupo de PEDIDOS + lista do fornecedor + sugestão de compra
+//
+// O dono cria um grupo novo, chama /chatid lá dentro e guarda o id com
+// /setgrupopedidos. O id mora em integration_config ('telegram_grupo_pedidos'),
+// não em env var: assim trocar de grupo não pede deploy.
+//
+// ENQUANTO A CHAVE NÃO EXISTIR os três comandos respondem em qualquer chat que
+// o bot já atende — senão o /setgrupopedidos seria impossível de usar (o bot
+// ignoraria o grupo novo e o dono não teria como configurar de lá).
+// ---------------------------------------------------------------------------
+
+const CONFIG_GRUPO_PEDIDOS = 'telegram_grupo_pedidos';
+
+// Chat de pedidos configurado ('' quando ainda não foi). Cacheado junto com o
+// resto da config.
+async function chatPedidos() {
+  return (await lerConfig(CONFIG_GRUPO_PEDIDOS)).trim();
+}
+
+// Onde os comandos de pedido valem. Sem chave configurada, valem onde forem
+// chamados (ver cabeçalho); com chave, só no grupo de pedidos e no privado.
+function podePedidos(chatKey, isPrivadoLucas, pedidosId) {
+  if (!pedidosId) return true;
+  return String(chatKey) === String(pedidosId) || isPrivadoLucas;
+}
+
+// /chatid - id do chat atual. Só o dono, e liberado em QUALQUER chat (é o
+// único jeito de descobrir o id de um grupo que o bot ainda não atende).
+async function handleChatId(chatId, msg) {
+  if (!ehDono(msg && msg.from && msg.from.id)) return;
+  const chat = (msg && msg.chat) || {};
+  const nome = chat.title || chat.username || '(privado)';
+  await sendTelegram(chatId,
+    `\u{1F194} *Chat atual*\nid: \`${chatId}\`\ntipo: ${chat.type || '?'}\nnome: ${escapeMd(String(nome))}` +
+    '\n\nPra usar este chat como grupo de pedidos: /setgrupopedidos');
+}
+
+// /setgrupopedidos [id] - sem argumento usa o chat atual (é o caso normal:
+// o dono manda de dentro do grupo novo). Também liberado em qualquer chat.
+async function handleSetGrupoPedidos(chatId, text, from) {
+  if (!ehDono(from && from.id)) {
+    await sendTelegram(chatId, '⛔ Só o dono pode definir o grupo de pedidos.');
+    return;
+  }
+  const arg = (text || '').trim().split(/\s+/)[1];
+  const alvo = arg ? arg.trim() : String(chatId);
+  if (!/^-?\d+$/.test(alvo)) {
+    await sendTelegram(chatId, 'Uso: /setgrupopedidos (no grupo desejado) ou /setgrupopedidos -1001234567890');
+    return;
+  }
+  const ok = await gravarConfig(CONFIG_GRUPO_PEDIDOS, alvo);
+  if (!ok) {
+    await sendTelegram(chatId, '⚠️ Não consegui gravar a configuração. Tente de novo em instantes.');
+    return;
+  }
+  await sendTelegram(chatId,
+    `✅ Grupo de pedidos definido: \`${alvo}\`\n/fornecedor, /apelido e /pedido passam a valer aqui e no seu privado.`);
+}
+
+// ---------------------------------------------------------------------------
+// Parser da lista do fornecedor
+//
+// A lista vem colada do WhatsApp: modelos marcados com carta/tridente, sabores
+// em bullet, e um monte de recado no meio. Três regras, nesta ordem — ruído
+// primeiro, senão um "RECADOS" com emoji viraria modelo e levaria os sabores
+// seguintes junto.
+// ---------------------------------------------------------------------------
+
+const RE_EMOJI = /\p{Extended_Pictographic}|\uFE0F|\u200D/gu;
+const RE_LINHA_MODELO = /[\u{1F0CF}\u{1F531}]/u;   // carta 🃏 ou tridente 🔱
+const RE_BULLET = /^[•*\-–—]\s*/;
+// Linha só de traço/igual/emoji: separador visual, não tem conteúdo.
+const RE_SEPARADOR = /^[\s━─—–\-=_*•~.]+$/;
+
+// Recados e chamadas de venda que aparecem no meio da lista. Comparados sem
+// acento e em maiúsculas, então bastam as formas simples aqui.
+const RUIDO_FORNECEDOR = [
+  'RECADOS', 'QUERIDOS CLIENTES', 'NAO ACEITAMOS', 'AGRADECEMOS',
+  'NOVIDADES', 'MELHORES', 'OBRIGADO', 'OBRIGADA', 'FACA SEU PEDIDO',
+  'PROMOCAO', 'PROMOCOES', 'ATENCAO', 'PEDIDO MINIMO',
+];
+
+function semAcento(s) {
+  return (s || '').normalize('NFD').replace(/[\u0300-\u036F]/g, '');
+}
+
+function limparNome(s) {
+  return (s || '')
+    .replace(RE_EMOJI, ' ')
+    .replace(/[*_`]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// `ehBullet` afrouxa a regra do preço: uma linha de sabor com preço colado no
+// fim ainda é um sabor. Recado continua sendo recado mesmo em bullet.
+function ehRuidoFornecedor(linha, ehBullet) {
+  const limpa = semAcento(limparNome(linha)).toUpperCase();
+  if (!limpa) return true;
+  if (RUIDO_FORNECEDOR.some(p => limpa.includes(p))) return true;
+  if (!ehBullet && /R\$/.test(linha)) return true;
+  return false;
+}
+
+// Devolve [{ modelo, sabor }]. Sabor antes do primeiro modelo é descartado:
+// sem modelo não dá pra dizer de que produto ele é.
+function parseListaFornecedor(texto) {
+  const itens = [];
+  const vistos = new Set();
+  let modelo = null;
+
+  for (const bruta of String(texto || '').split('\n')) {
+    const linha = bruta.trim();
+    if (!linha || RE_SEPARADOR.test(linha)) continue;
+
+    const ehBullet = RE_BULLET.test(linha);
+    if (ehRuidoFornecedor(linha, ehBullet)) continue;
+
+    if (RE_LINHA_MODELO.test(linha)) {
+      const nome = limparNome(linha);
+      if (nome) modelo = nome;
+      continue;
+    }
+
+    if (ehBullet) {
+      if (!modelo) continue;
+      const sabor = limparNome(linha.replace(RE_BULLET, ''));
+      if (!sabor) continue;
+      const chave = `${modelo} ${sabor}`.toLowerCase();
+      if (vistos.has(chave)) continue;
+      vistos.add(chave);
+      itens.push({ modelo, sabor });
+    }
+  }
+  return itens;
+}
+
+// Heurística de "isto é a lista, não conversa": lista de fornecedor tem dezenas
+// de linhas. O piso alto é de propósito — mensagem curta solta no grupo não
+// pode ser confundida com lista.
+function pareceListaFornecedor(texto) {
+  const t = String(texto || '');
+  const linhas = t.split('\n').filter(l => l.trim()).length;
+  return linhas >= 5 && t.length >= 200;
+}
+
+// /fornecedor sem lista junto arma a espera: a PRÓXIMA mensagem longa daquele
+// mesmo chat/autor é tratada como a lista. Expira sozinho.
+const FORNECEDOR_PENDENTE_MS = 10 * 60 * 1000;
+const fornecedorPendente = new Map(); // chatKey -> { at, userId }
+
+function armarFornecedorPendente(chatKey, userId) {
+  fornecedorPendente.set(String(chatKey), { at: Date.now(), userId: String(userId ?? '') });
+}
+
+function consumirFornecedorPendente(chatKey, userId, texto) {
+  const p = fornecedorPendente.get(String(chatKey));
+  if (!p) return false;
+  if (Date.now() - p.at > FORNECEDOR_PENDENTE_MS) {
+    fornecedorPendente.delete(String(chatKey));
+    return false;
+  }
+  if (p.userId && p.userId !== String(userId ?? '')) return false;
+  if (!pareceListaFornecedor(texto)) return false;
+  fornecedorPendente.delete(String(chatKey));
+  return true;
+}
+
+// Itens sem cadastro podem vir como string ou como {modelo, sabor}.
+function rotuloItem(x) {
+  if (x == null) return '';
+  if (typeof x === 'string') return x;
+  const mod = x.modelo || x.model || '';
+  const sab = x.sabor || x.flavor || '';
+  return [mod, sab].filter(Boolean).join(' · ') || String(x);
+}
+
+const DICA_APELIDO =
+  '_Se quiser vender algum, cadastre no sistema. Para corrigir nome: /apelido NOME DO FORNECEDOR = Nome no sistema_';
+
+async function handleFornecedor(chatId, texto, from) {
+  if (!ehDono(from && from.id)) {
+    await sendTelegram(chatId, '⛔ Só o dono pode importar a lista do fornecedor.');
+    return;
+  }
+
+  const itens = parseListaFornecedor(texto);
+  if (!itens.length) {
+    await sendTelegram(chatId,
+      '❌ Não achei nenhum item nessa lista.\nA lista precisa ter os modelos marcados com \u{1F0CF} (ou \u{1F531}) e os sabores em `•`, `*` ou `-`.');
+    return;
+  }
+
+  let r = null;
+  try {
+    r = await callRpc('bot_fornecedor_importar', { p_token: BOT_SYNC_TOKEN, p_itens: itens });
+  } catch (err) {
+    console.error('bot_fornecedor_importar:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC `bot_fornecedor_importar` não existe no banco — falta rodar o SQL do fornecedor.'
+      : '⚠️ Erro ao importar a lista. Tente de novo em instantes.');
+    return;
+  }
+  if (!r || r.ok === false) {
+    const detalhe = r && (r.erro || r.msg);
+    await sendTelegram(chatId, `⚠️ ${detalhe || 'Não consegui importar a lista.'}`);
+    return;
+  }
+
+  const total = Number(r.total ?? r.itens_total ?? itens.length) || 0;
+  const casaram = Number(r.casaram ?? r.itens_casaram ?? 0) || 0;
+  const pct = total ? Math.round((casaram * 100) / total) : 0;
+  const modelosSem = r.modelos_sem_cadastro || r.modelos_nao_encontrados || [];
+  const saboresSem = r.sabores_sem_cadastro || r.sabores_nao_encontrados || [];
+  const saboresSemTotal = Number(r.sabores_sem_cadastro_total ?? saboresSem.length) || 0;
+
+  const linhas = [`✅ *Lista importada* — ${casaram} de ${total} itens casaram (${pct}%)`];
+
+  if (modelosSem.length) {
+    linhas.push(`⚠️ Modelos que você não tem cadastrado: ${modelosSem.map(rotuloItem).map(escapeMd).join(', ')}`);
+  }
+  if (saboresSemTotal) {
+    const exemplos = saboresSem.slice(0, 10).map(rotuloItem).map(escapeMd).join(' · ');
+    const reticencia = saboresSem.length > 10 || saboresSemTotal > saboresSem.length ? ' …' : '';
+    linhas.push(`⚠️ ${saboresSemTotal} sabores sem cadastro${exemplos ? ` (ex.: ${exemplos}${reticencia})` : ''}`);
+  }
+  if (modelosSem.length || saboresSemTotal) linhas.push('', DICA_APELIDO);
+
+  await sendTelegram(chatId, linhas.join('\n'));
+}
+
+// /apelido TE 30K = Elfbar 30000
+async function handleApelido(chatId, text, from) {
+  if (!ehDono(from && from.id)) {
+    await sendTelegram(chatId, '⛔ Só o dono pode cadastrar apelido.');
+    return;
+  }
+  const corpo = (text || '').replace(/^\/apelido(@\S+)?\s*/i, '');
+  const corte = corpo.indexOf('=');
+  const apelido = corte >= 0 ? corpo.slice(0, corte).trim() : '';
+  const modelo = corte >= 0 ? corpo.slice(corte + 1).trim() : '';
+  if (!apelido || !modelo) {
+    await sendTelegram(chatId, 'Uso: `/apelido TE 30K = Elfbar 30000`\n(nome do fornecedor = nome no sistema)');
+    return;
+  }
+
+  let r = null;
+  try {
+    r = await callRpc('bot_fornecedor_apelido', {
+      p_token: BOT_SYNC_TOKEN, p_apelido: apelido, p_modelo: modelo,
+    });
+  } catch (err) {
+    console.error('bot_fornecedor_apelido:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC `bot_fornecedor_apelido` não existe no banco — falta rodar o SQL do fornecedor.'
+      : '⚠️ Erro ao gravar o apelido. Tente de novo em instantes.');
+    return;
+  }
+  if (!r || r.ok === false) {
+    const detalhe = r && (r.erro || r.msg);
+    await sendTelegram(chatId, `⚠️ ${detalhe || `Não consegui ligar "${apelido}" a "${modelo}".`}`);
+    return;
+  }
+  await sendTelegram(chatId, `\u{1F517} Apelido gravado: *${escapeMd(apelido)}* → *${escapeMd(modelo)}*`);
+}
+
+// ---------------------------------------------------------------------------
+// /pedido - sugestão de compra
+//
+// SÓ SUGESTÃO: não encosta no estoque. Estoque continua mudando só pelo fluxo
+// de reposição.
+// ---------------------------------------------------------------------------
+
+const PEDIDO_SEMANAS_PADRAO = 4;
+
+// "/pedido", "/pedido 15000", "/pedido 15000 8", "/pedido detalhe 15000".
+function parseArgsPedido(text) {
+  const tokens = (text || '').trim().split(/\s+/).slice(1);
+  let detalhe = false;
+  if (tokens.length && /^detalhe$/i.test(tokens[0])) { detalhe = true; tokens.shift(); }
+  const nums = tokens.filter(t => /^\d+$/.test(t)).map(Number);
+  return {
+    detalhe,
+    teto: nums.length ? nums[0] : null,
+    semanas: nums.length > 1 ? nums[1] : PEDIDO_SEMANAS_PADRAO,
+  };
+}
+
+// A RPC pode devolver a lista achatada ou já agrupada por modelo (é o formato
+// do bot_ler_estoque). Os dois viram [{ modelo, sabores: [...] }], SEMPRE na
+// ordem em que vieram — a ordem é decisão da RPC, não daqui.
+function agruparItensPedido(itens) {
+  const grupos = [];
+  const porModelo = new Map();
+  for (const it of itens || []) {
+    if (!it) continue;
+    const modelo = String(it.modelo || it.model || '(sem modelo)').trim();
+    if (!porModelo.has(modelo)) {
+      const g = { modelo, sabores: [] };
+      porModelo.set(modelo, g);
+      grupos.push(g);
+    }
+    const alvo = porModelo.get(modelo);
+    const aninhados = it.sabores || it.flavors;
+    if (Array.isArray(aninhados)) {
+      for (const s of aninhados) {
+        alvo.sabores.push({
+          sabor: String(s.sabor || s.flavor || '').trim(),
+          qtd: Number(s.qtd ?? s.qty ?? s.quantidade ?? 0) || 0,
+          estoque: s.estoque ?? s.stock ?? null,
+          vendidos: s.vendidos ?? s.vendas ?? s.sold ?? null,
+        });
+      }
+    } else {
+      alvo.sabores.push({
+        sabor: String(it.sabor || it.flavor || '').trim(),
+        qtd: Number(it.qtd ?? it.qty ?? it.quantidade ?? 0) || 0,
+        estoque: it.estoque ?? it.stock ?? null,
+        vendidos: it.vendidos ?? it.vendas ?? it.sold ?? null,
+      });
+    }
+  }
+  return grupos;
+}
+
+// Cada modelo vira um bloco de texto; o corte em mensagens é feito por BLOCO,
+// nunca no meio de um — a mensagem é encaminhada pro fornecedor inteira.
+function blocosPedido(grupos, detalhe) {
+  return grupos.map(g => {
+    const linhas = [`\u{1F0CF} *${escapeMd(g.modelo)}* \u{1F0CF}`];
+    for (const s of g.sabores) {
+      if (!s.qtd) continue;
+      let linha = `${s.qtd} ${escapeMd(s.sabor)}`;
+      if (detalhe) {
+        const tem = s.estoque != null ? s.estoque : '?';
+        const vendeu = s.vendidos != null ? s.vendidos : '?';
+        linha += ` (tem ${tem} · vendeu ${vendeu})`;
+      }
+      linhas.push(linha);
+    }
+    return linhas.join('\n');
+  }).filter(b => b.includes('\n')); // modelo sem nenhum sabor sugerido não entra
+}
+
+// Junta os blocos em mensagens de até `max`, sem quebrar bloco. Bloco que
+// sozinho passa do limite cai no splitMessage (aí não tem escolha).
+function dividirBlocos(blocos, max = 3800) {
+  const msgs = [];
+  let buf = '';
+  for (const bloco of blocos) {
+    if (bloco.length > max) {
+      if (buf) { msgs.push(buf); buf = ''; }
+      msgs.push(...splitMessage(bloco, max));
+      continue;
+    }
+    const candidato = buf ? `${buf}\n\n${bloco}` : bloco;
+    if (candidato.length > max) { msgs.push(buf); buf = bloco; }
+    else { buf = candidato; }
+  }
+  if (buf) msgs.push(buf);
+  return msgs;
+}
+
+async function handlePedido(chatId, text) {
+  const { detalhe, teto, semanas } = parseArgsPedido(text);
+
+  let r = null;
+  try {
+    r = await callRpc('bot_montar_pedido', {
+      p_token: BOT_SYNC_TOKEN,
+      p_teto: teto,
+      p_semanas: semanas,
+      p_so_fornecedor: true,
+    });
+  } catch (err) {
+    console.error('bot_montar_pedido:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC `bot_montar_pedido` não existe no banco — falta rodar o SQL do pedido.'
+      : '⚠️ Erro ao montar o pedido. Tente de novo em instantes.');
+    return;
+  }
+  if (!r || r.ok === false) {
+    const detalheErro = r && (r.erro || r.msg);
+    await sendTelegram(chatId, `⚠️ ${detalheErro || 'Não consegui montar o pedido.'}`);
+    return;
+  }
+
+  const grupos = agruparItensPedido(r.itens || r.pedido || []);
+  const blocos = blocosPedido(grupos, detalhe);
+  if (!blocos.length) {
+    await sendTelegram(chatId, '\u{1F4E6} Nada a pedir: nenhum item passou dos critérios (teto, giro e lista do fornecedor).');
+    return;
+  }
+
+  const unidades = Number(r.total_unidades ?? r.unidades ?? 0) || 0;
+  const custo = Number(r.custo_total ?? r.custo ?? 0) || 0;
+  const cabecalho = ['\u{1F4E6} *PEDIDO SUGERIDO*', `_${unidades} un · R$ ${fmtBR(custo, 0)} de custo_`];
+  // O aviso vai NO TOPO: sem lista ativa a sugestão é do catálogo inteiro e
+  // pode conter item que o fornecedor não tem — quem encaminha precisa ver.
+  if (r.usou_lista_fornecedor === false) {
+    cabecalho.unshift('⚠️ Sem lista de fornecedor ativa — montei com o catálogo inteiro. Use /fornecedor antes.', '');
+  }
+
+  const partes = dividirBlocos([`${cabecalho.join('\n')}\n\n${blocos[0]}`, ...blocos.slice(1)]);
+  for (const parte of partes) await sendTelegram(chatId, parte);
+}
+
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)';
 
 const vendasDoDia = {};
 
@@ -1160,14 +1590,38 @@ app.post('/webhook', async (req, res) => {
     if (!text) return;
     const cmd = text.split(/\s+/)[0].toLowerCase().split('@')[0];
 
-    // Só os dois grupos e o privado do Lucas são atendidos; o resto é ignorado.
     const chatKey = String(chatId);
     const fromId = msg.from && msg.from.id;
+
+    // BOOTSTRAP: estes dois valem em QUALQUER chat, porque são o que permite
+    // configurar um grupo que o bot ainda não atende. Seguros por serem só do
+    // dono — chat aleatório não faz o bot falar sem ele.
+    if (cmd === '/chatid') { await handleChatId(chatId, msg); return; }
+    if (cmd === '/setgrupopedidos') {
+      if (ehDono(fromId)) { await handleSetGrupoPedidos(chatId, text, msg.from); return; }
+      return;
+    }
+
+    // Os dois grupos, o privado do Lucas e o grupo de pedidos são atendidos;
+    // o resto é ignorado.
+    const pedidosId = await chatPedidos();
     const isVendas = chatKey === VENDAS_CHAT_ID;
     const isReposicao = chatKey === REPOSICAO_CHAT_ID;
     const isPrivadoLucas =
       msg.chat.type === 'private' && String(msg.from && msg.from.id) === LUCAS_USER_ID;
-    if (!isVendas && !isReposicao && !isPrivadoLucas) return;
+    const isPedidos = !!pedidosId && chatKey === String(pedidosId);
+    if (!isVendas && !isReposicao && !isPrivadoLucas && !isPedidos) return;
+
+    // Onde /fornecedor, /apelido e /pedido valem.
+    const pedidosAqui = podePedidos(chatKey, isPrivadoLucas, pedidosId);
+
+    // A lista colada depois do /fornecedor vem ANTES de tudo: ela tem dezenas
+    // de linhas em bullet, e várias começam com "-" — no fluxo normal a
+    // primeira delas cairia direto na rota de baixa de estoque.
+    if (!cmd.startsWith('/') && consumirFornecedorPendente(chatKey, fromId, text)) {
+      await handleFornecedor(chatId, text, msg.from);
+      return;
+    }
 
     // Movimentos com prefixo: cada grupo aceita só o seu sinal.
     //   VENDAS: só baixa (-). REPOSIÇÃO: só entrada (+). Privado: os dois.
@@ -1238,6 +1692,25 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/refazerfechamento') { await handleRefazerFechamento(chatId, text, fromId); return; }
     if (cmd === '/versao') { await handleVersao(chatId, fromId); return; }
 
+    // Pedidos: só no grupo de pedidos e no privado do dono (enquanto a chave
+    // não existir, valem onde forem chamados — ver podePedidos).
+    if (cmd === '/fornecedor' || cmd === '/apelido' || cmd === '/pedido') {
+      if (!pedidosAqui) {
+        await sendTelegram(chatId, '📦 Esse comando é no grupo de pedidos (ou no privado do dono).');
+        return;
+      }
+      if (cmd === '/apelido') { await handleApelido(chatId, text, msg.from); return; }
+      if (cmd === '/pedido') { await handlePedido(chatId, text); return; }
+
+      // /fornecedor: lista na mesma mensagem, ou arma a espera pela próxima.
+      const lista = text.replace(/^\/fornecedor(@\S+)?[ \t]*/i, '');
+      if (pareceListaFornecedor(lista)) { await handleFornecedor(chatId, lista, msg.from); return; }
+      if (!ehDono(fromId)) { await sendTelegram(chatId, '⛔ Só o dono pode importar a lista do fornecedor.'); return; }
+      armarFornecedorPendente(chatKey, fromId);
+      await sendTelegram(chatId, '📋 Manda a lista do fornecedor na próxima mensagem (colada inteira). Expira em 10 min.');
+      return;
+    }
+
     // Nenhum comando bateu. Sem isso o bot fica MUDO em comando desconhecido —
     // que é exatamente como um deploy velho se disfarça de bug no código.
     // Só o dono é avisado, pra não encher os grupos com quem digita "/" à toa.
@@ -1287,7 +1760,19 @@ module.exports = {
   handleGeral,
   parseRegistroRod,
   palavrasDespesa,
-  _resetCachePalavras,
+  lerConfig,
+  gravarConfig,
+  _resetCacheConfig,
+  parseListaFornecedor,
+  pareceListaFornecedor,
+  podePedidos,
+  parseArgsPedido,
+  agruparItensPedido,
+  blocosPedido,
+  dividirBlocos,
+  handleFornecedor,
+  handleApelido,
+  handlePedido,
   montarFechamento,
   linhaAcerto,
   nomeAutor,
