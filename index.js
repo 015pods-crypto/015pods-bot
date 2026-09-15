@@ -1305,24 +1305,27 @@ async function handleFornecedor(chatId, texto, from) {
     return;
   }
 
-  const total = Number(r.total ?? r.itens_total ?? itens.length) || 0;
-  const casaram = Number(r.casaram ?? r.itens_casaram ?? 0) || 0;
+  // Contrato da RPC: { casaram, nao_casaram, modelos_novos[], sabores_novos[] }.
+  // O total não vem pronto — é a soma dos dois contadores.
+  const casaram = Number(r.casaram) || 0;
+  const naoCasaram = Number(r.nao_casaram) || 0;
+  const total = casaram + naoCasaram;
   const pct = total ? Math.round((casaram * 100) / total) : 0;
-  const modelosSem = r.modelos_sem_cadastro || r.modelos_nao_encontrados || [];
-  const saboresSem = r.sabores_sem_cadastro || r.sabores_nao_encontrados || [];
-  const saboresSemTotal = Number(r.sabores_sem_cadastro_total ?? saboresSem.length) || 0;
+  const modelosNovos = Array.isArray(r.modelos_novos) ? r.modelos_novos : [];
+  // sabores_novos vem truncado em 30; quem conta de verdade é o nao_casaram.
+  const saboresNovos = Array.isArray(r.sabores_novos) ? r.sabores_novos : [];
 
   const linhas = [`✅ *Lista importada* — ${casaram} de ${total} itens casaram (${pct}%)`];
 
-  if (modelosSem.length) {
-    linhas.push(`⚠️ Modelos que você não tem cadastrado: ${modelosSem.map(rotuloItem).map(escapeMd).join(', ')}`);
+  if (modelosNovos.length) {
+    linhas.push(`⚠️ Modelos que você não tem cadastrado: ${modelosNovos.map(rotuloItem).map(escapeMd).join(', ')}`);
   }
-  if (saboresSemTotal) {
-    const exemplos = saboresSem.slice(0, 10).map(rotuloItem).map(escapeMd).join(' · ');
-    const reticencia = saboresSem.length > 10 || saboresSemTotal > saboresSem.length ? ' …' : '';
-    linhas.push(`⚠️ ${saboresSemTotal} sabores sem cadastro${exemplos ? ` (ex.: ${exemplos}${reticencia})` : ''}`);
+  if (naoCasaram) {
+    const exemplos = saboresNovos.slice(0, 10).map(rotuloItem).map(escapeMd).join(' · ');
+    const reticencia = saboresNovos.length > 10 || naoCasaram > saboresNovos.length ? ' …' : '';
+    linhas.push(`⚠️ ${naoCasaram} sabores sem cadastro${exemplos ? ` (ex.: ${exemplos}${reticencia})` : ''}`);
   }
-  if (modelosSem.length || saboresSemTotal) linhas.push('', DICA_APELIDO);
+  if (modelosNovos.length || naoCasaram) linhas.push('', DICA_APELIDO);
 
   await sendTelegram(chatId, linhas.join('\n'));
 }
@@ -1384,54 +1387,21 @@ function parseArgsPedido(text) {
   };
 }
 
-// A RPC pode devolver a lista achatada ou já agrupada por modelo (é o formato
-// do bot_ler_estoque). Os dois viram [{ modelo, sabores: [...] }], SEMPRE na
-// ordem em que vieram — a ordem é decisão da RPC, não daqui.
-function agruparItensPedido(itens) {
-  const grupos = [];
-  const porModelo = new Map();
-  for (const it of itens || []) {
-    if (!it) continue;
-    const modelo = String(it.modelo || it.model || '(sem modelo)').trim();
-    if (!porModelo.has(modelo)) {
-      const g = { modelo, sabores: [] };
-      porModelo.set(modelo, g);
-      grupos.push(g);
-    }
-    const alvo = porModelo.get(modelo);
-    const aninhados = it.sabores || it.flavors;
-    if (Array.isArray(aninhados)) {
-      for (const s of aninhados) {
-        alvo.sabores.push({
-          sabor: String(s.sabor || s.flavor || '').trim(),
-          qtd: Number(s.qtd ?? s.qty ?? s.quantidade ?? 0) || 0,
-          estoque: s.estoque ?? s.stock ?? null,
-          vendidos: s.vendidos ?? s.vendas ?? s.sold ?? null,
-        });
-      }
-    } else {
-      alvo.sabores.push({
-        sabor: String(it.sabor || it.flavor || '').trim(),
-        qtd: Number(it.qtd ?? it.qty ?? it.quantidade ?? 0) || 0,
-        estoque: it.estoque ?? it.stock ?? null,
-        vendidos: it.vendidos ?? it.vendas ?? it.sold ?? null,
-      });
-    }
-  }
-  return grupos;
-}
-
-// Cada modelo vira um bloco de texto; o corte em mensagens é feito por BLOCO,
-// nunca no meio de um — a mensagem é encaminhada pro fornecedor inteira.
+// Cada grupo da RPC ({ modelo, itens: [{ sabor, qtd, estoque, vendas }] }) vira
+// um bloco de texto. A ORDEM não é mexida aqui: os grupos já vêm por prioridade
+// de giro e os itens de cada grupo por quantidade — reordenar seria desfazer o
+// cálculo da RPC. O corte em mensagens é por BLOCO, nunca no meio de um: a
+// mensagem é encaminhada pro fornecedor inteira.
 function blocosPedido(grupos, detalhe) {
-  return grupos.map(g => {
-    const linhas = [`\u{1F0CF} *${escapeMd(g.modelo)}* \u{1F0CF}`];
-    for (const s of g.sabores) {
-      if (!s.qtd) continue;
-      let linha = `${s.qtd} ${escapeMd(s.sabor)}`;
+  return (grupos || []).map(g => {
+    const linhas = [`\u{1F0CF} *${escapeMd(String(g.modelo ?? ''))}* \u{1F0CF}`];
+    for (const it of g.itens || []) {
+      const qtd = Number(it.qtd) || 0;
+      if (!qtd) continue;
+      let linha = `${qtd} ${escapeMd(String(it.sabor ?? ''))}`;
       if (detalhe) {
-        const tem = s.estoque != null ? s.estoque : '?';
-        const vendeu = s.vendidos != null ? s.vendidos : '?';
+        const tem = it.estoque != null ? it.estoque : '?';
+        const vendeu = it.vendas != null ? it.vendas : '?';
         linha += ` (tem ${tem} · vendeu ${vendeu})`;
       }
       linhas.push(linha);
@@ -1483,15 +1453,14 @@ async function handlePedido(chatId, text) {
     return;
   }
 
-  const grupos = agruparItensPedido(r.itens || r.pedido || []);
-  const blocos = blocosPedido(grupos, detalhe);
+  const blocos = blocosPedido(r.grupos, detalhe);
   if (!blocos.length) {
     await sendTelegram(chatId, '\u{1F4E6} Nada a pedir: nenhum item passou dos critérios (teto, giro e lista do fornecedor).');
     return;
   }
 
-  const unidades = Number(r.total_unidades ?? r.unidades ?? 0) || 0;
-  const custo = Number(r.custo_total ?? r.custo ?? 0) || 0;
+  const unidades = Number(r.unidades) || 0;
+  const custo = Number(r.total_custo) || 0;
   const cabecalho = ['\u{1F4E6} *PEDIDO SUGERIDO*', `_${unidades} un · R$ ${fmtBR(custo, 0)} de custo_`];
   // O aviso vai NO TOPO: sem lista ativa a sugestão é do catálogo inteiro e
   // pode conter item que o fornecedor não tem — quem encaminha precisa ver.
@@ -1767,7 +1736,6 @@ module.exports = {
   pareceListaFornecedor,
   podePedidos,
   parseArgsPedido,
-  agruparItensPedido,
   blocosPedido,
   dividirBlocos,
   handleFornecedor,

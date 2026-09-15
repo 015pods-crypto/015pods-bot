@@ -985,7 +985,7 @@ teste('com grupo de pedidos configurado, /pedido é recusado no grupo de VENDAS'
 });
 
 teste('sem a chave configurada, /pedido responde onde for chamado', async (ctx) => {
-  respostas.bot_montar_pedido = { status: 200, body: { ok: true, itens: [], usou_lista_fornecedor: true } };
+  respostas.bot_montar_pedido = { status: 200, body: { ok: true, grupos: [], usou_lista_fornecedor: true } };
   const [resp] = await mandar(ctx.webhook, update('/pedido'));
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_montar_pedido').length, 1);
   assert.ok(resp.text.includes('Nada a pedir'), resp.text);
@@ -1036,13 +1036,14 @@ teste('parse: sabor antes de qualquer modelo é descartado, e repetido não dupl
 });
 
 teste('/fornecedor com a lista na mesma mensagem importa e resume', async (ctx) => {
+  // Corpo real da RPC (números do import de verdade: 295 de 337).
   respostas.bot_fornecedor_importar = {
     status: 200,
     body: {
-      ok: true, total: 337, casaram: 295,
-      modelos_sem_cadastro: ['ADJUST ICE 40K', 'V400 MIX SLIM'],
-      sabores_sem_cadastro: [{ modelo: 'LOST MARY MT 20k', sabor: 'Hawaii juice' }],
-      sabores_sem_cadastro_total: 42,
+      ok: true, lista_id: '11111111-2222-3333-4444-555555555555',
+      casaram: 295, nao_casaram: 42,
+      modelos_novos: ['ADJUST ICE 40K - BY ELFBAR', 'V400 MIX SLIM'],
+      sabores_novos: [{ modelo: 'LOST MARY MT 20k', sabor: 'Hawaii juice' }],
     },
   };
   const [resp] = await mandar(ctx.webhook, update(`/fornecedor\n${LISTA_REAL}`));
@@ -1052,14 +1053,16 @@ teste('/fornecedor com a lista na mesma mensagem importa e resume', async (ctx) 
   assert.strictEqual(rpc[0].body.p_itens.length, 6);
   assert.deepStrictEqual(rpc[0].body.p_itens[0], { modelo: 'IGNITE 5500 (V55)', sabor: 'Strawberry Ice' });
 
+  // 337 = casaram + nao_casaram (a RPC não manda o total pronto).
   assert.ok(resp.text.includes('295 de 337 itens casaram (88%)'), resp.text);
-  assert.ok(resp.text.includes('ADJUST ICE 40K, V400 MIX SLIM'), resp.text);
+  assert.ok(resp.text.includes('ADJUST ICE 40K - BY ELFBAR, V400 MIX SLIM'), resp.text);
   assert.ok(resp.text.includes('42 sabores sem cadastro'), resp.text);
+  assert.ok(resp.text.includes('LOST MARY MT 20k · Hawaii juice'), resp.text);
   assert.ok(resp.text.includes('/apelido'), resp.text);
 });
 
 teste('/fornecedor sozinho espera a lista na mensagem seguinte', async (ctx) => {
-  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, total: 6, casaram: 6 } };
+  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, casaram: 6, nao_casaram: 0 } };
 
   const [aviso] = await mandar(ctx.webhook, update('/fornecedor'));
   assert.ok(aviso.text.includes('próxima mensagem'), aviso.text);
@@ -1073,7 +1076,7 @@ teste('/fornecedor sozinho espera a lista na mensagem seguinte', async (ctx) => 
 // A lista tem dezenas de linhas começando com "-": sem o desvio, a primeira
 // delas cairia na rota de BAIXA DE ESTOQUE.
 teste('lista pendente não é confundida com baixa de estoque', async (ctx) => {
-  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, total: 6, casaram: 6 } };
+  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, casaram: 6, nao_casaram: 0 } };
   await mandar(ctx.webhook, update('/fornecedor'));
   await mandar(ctx.webhook, update(LISTA_REAL));
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0,
@@ -1104,13 +1107,23 @@ teste('/fornecedor é recusado pro funcionário', async (ctx) => {
 // --- /apelido --------------------------------------------------------------
 
 teste('/apelido TE 30K = Elfbar 30000 grava os dois lados', async (ctx) => {
-  respostas.bot_fornecedor_apelido = { status: 200, body: { ok: true } };
+  respostas.bot_fornecedor_apelido = {
+    status: 200, body: { ok: true, apelido: 'TE 30K', modelo: 'Elfbar 30000' },
+  };
   const [resp] = await mandar(ctx.webhook, update('/apelido TE 30K = Elfbar 30000'));
 
   const rpc = chamadas.filter(c => c.fn === 'bot_fornecedor_apelido');
   assert.strictEqual(rpc[0].body.p_apelido, 'TE 30K');
   assert.strictEqual(rpc[0].body.p_modelo, 'Elfbar 30000');
   assert.ok(resp.text.includes('Apelido gravado'), resp.text);
+});
+
+teste('/apelido com modelo inexistente mostra o erro da RPC', async (ctx) => {
+  respostas.bot_fornecedor_apelido = {
+    status: 200, body: { ok: false, erro: 'modelo não encontrado no sistema' },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/apelido TE 30K = Naoexiste 999'));
+  assert.ok(resp.text.includes('modelo não encontrado no sistema'), resp.text);
 });
 
 teste('/apelido sem o "=" mostra o uso', async (ctx) => {
@@ -1121,12 +1134,22 @@ teste('/apelido sem o "=" mostra o uso', async (ctx) => {
 
 // --- /pedido ---------------------------------------------------------------
 
+// Corpo real da RPC: grupos[] já ordenados por giro, itens[] por quantidade.
 const PEDIDO_OK = {
-  ok: true, usou_lista_fornecedor: true, total_unidades: 252, custo_total: 14969,
-  itens: [
-    { modelo: 'IGNITE 5500 (V55)', sabor: 'Strawberry Ice', qtd: 4, estoque: 1, vendidos: 12 },
-    { modelo: 'IGNITE 5500 (V55)', sabor: 'Grape Ice', qtd: 3, estoque: 0, vendidos: 9 },
-    { modelo: 'ELFBAR 30000', sabor: 'Cherry Cola', qtd: 2, estoque: 0, vendidos: 4 },
+  ok: true, usou_lista_fornecedor: true, teto: 15000, semanas: 4,
+  total_custo: 14969.0, unidades: 252,
+  grupos: [
+    {
+      modelo: 'Ignite 5500 (V55)', unidades: 7, valor: 350.0,
+      itens: [
+        { sabor: 'Strawberry Ice', qtd: 4, estoque: 1, vendas: 12 },
+        { sabor: 'Grape Ice', qtd: 3, estoque: 0, vendas: 9 },
+      ],
+    },
+    {
+      modelo: 'ELFBAR 30000', unidades: 2, valor: 100.0,
+      itens: [{ sabor: 'Cherry Cola', qtd: 2, estoque: 0, vendas: 4 }],
+    },
   ],
 };
 
@@ -1138,6 +1161,8 @@ teste('/pedido sai no formato de encaminhar pro fornecedor', async (ctx) => {
   assert.ok(resp.text.includes('_252 un · R$ 14.969 de custo_'), resp.text);
   assert.ok(resp.text.includes('\n4 Strawberry Ice\n3 Grape Ice'), resp.text);
   assert.ok(resp.text.includes('*ELFBAR 30000*'), resp.text);
+  // A ordem dos grupos é a da RPC (prioridade de giro): Ignite antes de Elfbar.
+  assert.ok(resp.text.indexOf('Ignite 5500') < resp.text.indexOf('ELFBAR 30000'), resp.text);
   // Sem estoque/vendas na mensagem principal — é o que vai pro fornecedor.
   assert.ok(!resp.text.includes('tem 1'), resp.text);
   assert.ok(!resp.text.includes('vendeu'), resp.text);
@@ -1177,8 +1202,11 @@ teste('zerado aparece com a quantidade que a RPC mandou', async (ctx) => {
   respostas.bot_montar_pedido = {
     status: 200,
     body: {
-      ok: true, usou_lista_fornecedor: true, total_unidades: 2, custo_total: 100,
-      itens: [{ modelo: 'ELFBAR 30000', sabor: 'Cherry Cola', qtd: 2, estoque: 0, vendidos: 0 }],
+      ok: true, usou_lista_fornecedor: true, unidades: 2, total_custo: 100,
+      grupos: [{
+        modelo: 'ELFBAR 30000', unidades: 2, valor: 100,
+        itens: [{ sabor: 'Cherry Cola', qtd: 2, estoque: 0, vendas: 0 }],
+      }],
     },
   };
   const [resp] = await mandar(ctx.webhook, update('/pedido'));
@@ -1195,14 +1223,16 @@ teste('/pedido sem lista de fornecedor ativa avisa NO TOPO', async (ctx) => {
 });
 
 teste('/pedido longo quebra em várias mensagens sem cortar bloco de modelo', async (ctx) => {
-  const itens = [];
+  const grupos = [];
   for (let m = 0; m < 40; m++) {
+    const itens = [];
     for (let s = 0; s < 8; s++) {
-      itens.push({ modelo: `MODELO NUMERO ${m} COM NOME COMPRIDO`, sabor: `Sabor comprido numero ${s}`, qtd: 3 });
+      itens.push({ sabor: `Sabor comprido numero ${s}`, qtd: 3, estoque: 0, vendas: 1 });
     }
+    grupos.push({ modelo: `MODELO NUMERO ${m} COM NOME COMPRIDO`, unidades: 24, valor: 1200, itens });
   }
   respostas.bot_montar_pedido = {
-    status: 200, body: { ok: true, usou_lista_fornecedor: true, total_unidades: 960, custo_total: 50000, itens },
+    status: 200, body: { ok: true, usou_lista_fornecedor: true, unidades: 960, total_custo: 50000, grupos },
   };
 
   const antes = enviadas.length;
