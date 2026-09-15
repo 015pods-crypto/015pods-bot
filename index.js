@@ -361,14 +361,13 @@ function mapResultado(r, opFallback) {
 
   if (status === 'ok') {
     const op = r.direction === 'entrada' ? 'entrada' : 'baixa';
-    // saleId é o que permite marcar atacado na venda CERTA. Se a RPC não
-    // devolver, fica undefined e o fluxo automático recusa marcar (ver
-    // handleMovimentos) em vez de mirar "a última venda".
-    const saleId = r.sale_id ?? r.venda_id ?? r.id;
+    // sale_id vem em todo item ok de BAIXA (entrada não tem: não é venda).
+    // É ele que permite marcar atacado na venda certa — cada baixa cria uma
+    // venda própria, então numa mensagem com 3 baixas são 3 ids diferentes.
     return {
       ok: true, op, modelo: r.model, sabor: r.flavor, qtd: r.qty,
       restante: r.stock_after,
-      saleId: saleId != null ? String(saleId) : undefined,
+      saleId: r.sale_id != null ? String(r.sale_id) : undefined,
     };
   }
   if (status === 'nao_encontrado') {
@@ -464,20 +463,10 @@ async function handleMovimentos(chatId, lines, messageId) {
   await sendTelegram(chatId, linhasMsg.join('\n'));
 }
 
-// Marca cada venda pelo SEU id. Sem id não marca nada: mirar "a última venda"
-// daqui erraria o alvo assim que duas vendas encostassem no tempo — e é
-// comissão, não dá pra errar e descobrir depois.
+// Marca cada venda pelo SEU id — uma chamada por baixa, porque cada baixa cria
+// uma venda própria. Uma falha isolada não derruba as outras nem desfaz venda
+// nenhuma: o estoque já saiu, e o que fica pendente é só a marca, item a item.
 async function marcarVendasAtacado(baixas) {
-  const semId = baixas.filter(r => !r.saleId);
-  if (semId.length) {
-    // A venda ENTROU (estoque é estoque); o que não aconteceu foi a marca.
-    return baixas.length > 1
-      ? ['⚠️ *Vendas registradas, mas NÃO marquei atacado.*',
-         '_Mensagem com várias baixas e ATACADO junto. Manda uma por vez pra eu não marcar errado._']
-      : ['⚠️ *Venda registrada, mas NÃO marquei atacado.*',
-         '_Não recebi o id da venda pra marcar a certa. Use /atacado pra corrigir._'];
-  }
-
   const marcadas = [];
   const jaEstavam = [];
   const falhas = [];
@@ -491,9 +480,7 @@ async function marcarVendasAtacado(baixas) {
   }
 
   const out = [];
-  if (marcadas.length) {
-    out.push(`🏷️ *ATACADO* — ${marcadas.length} venda(s) marcada(s): ${marcadas.map(escapeMd).join(', ')}`);
-  }
+  if (marcadas.length) out.push(`🏷️ *ATACADO:* ${marcadas.map(escapeMd).join(', ')}`);
   if (jaEstavam.length) out.push(`🏷️ _Já estava marcada: ${jaEstavam.map(escapeMd).join(', ')}_`);
   for (const f of falhas) {
     out.push(`⚠️ Não marquei *${escapeMd(f.nome)}*: ${f.msg} Use /atacado.`);
@@ -1087,6 +1074,15 @@ async function marcarAtacado(saleId) {
   }
 }
 
+// A RPC devolve `itens` já legível ("6x Elfbar 30000 Cherry"). O fallback pra
+// unidades existe só pra uma venda sem item; nunca mostrar "undefined" no grupo.
+function descricaoVenda(d) {
+  const itens = d && d.itens;
+  if (Array.isArray(itens) && itens.length) return itens.join(', ');
+  if (typeof itens === 'string' && itens.trim()) return itens.trim();
+  return `${d && d.unidades != null ? d.unidades : '?'} unidade(s)`;
+}
+
 // Candidato da correção manual: última venda do bot dentro da janela. Não marca
 // nada — só diz qual é.
 async function ultimaVenda() {
@@ -1157,7 +1153,7 @@ async function handleAtacado(chatId, text, from) {
   const venda = await ultimaVenda();
   if (!venda.ok) { await sendTelegram(chatId, `⚠️ ${venda.msg}`); return; }
 
-  const texto = `${venda.unidades ?? '?'} unidade(s) — ${String(venda.quando ?? '')}`;
+  const texto = `${descricaoVenda(venda)} — ${String(venda.quando ?? '')}`;
   if (venda.ja_marcada) {
     await sendTelegram(chatId, `🏷️ A última venda (${escapeMd(texto)}) já está marcada como atacado.`);
     return;
@@ -1974,6 +1970,7 @@ module.exports = {
   podeMarcarAtacado,
   handleAtacado,
   marcarVendasAtacado,
+  descricaoVenda,
   nomeAutor,
   fmtValor,
   handleRefazerFechamento,

@@ -186,9 +186,10 @@ on conflict (key) do nothing;
 -- Desfazer uma marcação errada:
 --   update sales set notes = replace(notes, ' atacado', '') where id::text = '<SALE_ID>';
 --
--- ═══ O QUE FALTA PRO PROMPT MOSTRAR O PRODUTO ══════════════════════════════
--- A confirmação do /atacado mostra "6 unidade(s) — 14:32" em vez de
--- "6x Elfbar 30000 Cherry" porque este Run só usa colunas que eu posso
--- garantir que existem (sales.id/notes/status/sold_at e sale_items.sale_id/qty).
--- O nome do modelo/sabor mora na tabela de produtos, que não está neste repo.
--- Mandando o schema de sale_items + produtos, viram 3 linhas de join aqui.
+-- ═══ NOTA ══════════════════════════════════════════════════════════════════
+-- As versões que já estão no banco devolvem também um campo `itens` legível
+-- ("6x Elfbar 30000 Cherry"), com o nome do produto. O bot usa esse campo na
+-- confirmação do /atacado e só cai em "6 unidade(s)" se ele vier vazio.
+-- Este arquivo não reproduz esse join porque a tabela de produtos não está
+-- versionada neste repo — se for recolar este Run, confira antes se não vai
+-- sobrescrever a versão do banco com uma sem o `itens`.
