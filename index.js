@@ -38,6 +38,7 @@ const COMANDOS = [
   '/anular', '/desanular', '/adicionar', '/refazerfechamento', '/versao',
   '/chatid', '/setgrupopedidos', '/fornecedor', '/apelido', '/pedido',
   '/atacado', '/desatacado', '/caixa',
+  '/setgrupofaturamento', '/faturamento',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -227,6 +228,7 @@ function _resetEstadoTeste() {
   cacheConfig.clear();
   fornecedorPendente.clear();
   ultimaMarcacao.clear();
+  caixaListado.clear();
 }
 
 // `palavras` é a lista já resolvida (o parser é síncrono de propósito: o
@@ -2048,16 +2050,397 @@ async function textoCaixa(data, { compacto = false } = {}) {
   return linhas.join('\n');
 }
 
-async function handleCaixa(chatId, text) {
-  const arg = (text || '').trim().split(/\s+/)[1];
-  if (arg && !parseDataComando(text)) {
-    await sendTelegram(chatId, 'Uso: /caixa (hoje) ou /caixa 15/09');
+async function handleCaixa(chatId, text, from) {
+  const tokens = (text || '').trim().split(/\s+/).slice(1);
+  const sub = (tokens[0] || '').toLowerCase();
+
+  // /caixa corrigir [DD/MM]
+  if (sub === 'corrigir') {
+    const data = tokens[1] ? parseDataComando(`x ${tokens[1]}`) : null;
+    if (tokens[1] && !data) { await sendTelegram(chatId, 'Uso: /caixa corrigir (hoje) ou /caixa corrigir 15/09'); return; }
+    await handleCaixaCorrigir(chatId, data);
+    return;
+  }
+
+  // /caixa apagar N
+  if (sub === 'apagar') {
+    const n = parseInt(tokens[1], 10);
+    if (!n || n < 1) { await sendTelegram(chatId, 'Uso: /caixa apagar 2 (o número vem da lista do `/caixa corrigir`)'); return; }
+    await handleCaixaApagar(chatId, n, from);
+    return;
+  }
+
+  // /caixa valor N 235
+  if (sub === 'valor') {
+    const n = parseInt(tokens[1], 10);
+    const valor = parseValorArg(tokens[2]);
+    if (!n || n < 1 || valor == null) {
+      await sendTelegram(chatId, 'Uso: /caixa valor 2 235 (número da lista + valor novo)');
+      return;
+    }
+    await handleCaixaValor(chatId, n, valor, from);
+    return;
+  }
+
+  if (tokens[0] && !parseDataComando(text)) {
+    await sendTelegram(chatId, 'Uso: /caixa · /caixa 15/09 · /caixa corrigir');
     return;
   }
   await sendTelegram(chatId, await textoCaixa(parseDataComando(text)));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)';
+// ---------------------------------------------------------------------------
+// Grupo de FATURAMENTO (números do dinheiro, círculo pequeno)
+//
+// Os comprovantes continuam chegando no grupo de VENDAS — aqui só entram os
+// TOTAIS. É a razão de ser do grupo: quem vê faturamento não precisa ver (nem
+// deve ver) o fluxo de foto e baixa do dia.
+//
+// Mesmo mecanismo do grupo de pedidos: o id mora em integration_config
+// ('telegram_grupo_faturamento'), então trocar de grupo não pede deploy.
+// ---------------------------------------------------------------------------
+
+const CONFIG_GRUPO_FATURAMENTO = 'telegram_grupo_faturamento';
+
+async function chatFaturamento() {
+  return (await lerConfig(CONFIG_GRUPO_FATURAMENTO)).trim();
+}
+
+// Onde /faturamento e /relatorio mes valem: grupo de faturamento e privado do
+// dono. Sem a chave configurada, SÓ o privado do dono — ao contrário dos
+// pedidos, que valem em qualquer lugar enquanto não são configurados. Aqui o
+// vazamento é o risco: faturamento caindo no grupo de vendas é exatamente o
+// que este grupo existe pra evitar.
+function podeFaturamento(chatKey, isPrivadoLucas, faturamentoId) {
+  if (isPrivadoLucas) return true;
+  return !!faturamentoId && String(chatKey) === String(faturamentoId);
+}
+
+async function handleSetGrupoFaturamento(chatId, text, from) {
+  if (!ehDono(from && from.id)) {
+    await sendTelegram(chatId, '⛔ Só o dono pode definir o grupo de faturamento.');
+    return;
+  }
+  const arg = (text || '').trim().split(/\s+/)[1];
+  const alvo = arg ? arg.trim() : String(chatId);
+  if (!/^-?\d+$/.test(alvo)) {
+    await sendTelegram(chatId, 'Uso: /setgrupofaturamento (no grupo desejado) ou /setgrupofaturamento -1001234567890');
+    return;
+  }
+  const ok = await gravarConfig(CONFIG_GRUPO_FATURAMENTO, alvo);
+  if (!ok) {
+    await sendTelegram(chatId, '⚠️ Não consegui gravar a configuração. Tente de novo em instantes.');
+    return;
+  }
+  await sendTelegram(chatId,
+    `✅ Grupo de faturamento definido: \`${alvo}\`\n/faturamento e /relatorio mes passam a valer aqui e no seu privado.\nO resumo automático das 23:30 vem pra cá.`);
+}
+
+// Data de hoje em São Paulo, ISO (YYYY-MM-DD). 'en-CA' já devolve nesse
+// formato — mais seguro que montar na mão a partir do pt-BR.
+function hojeISO() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+}
+
+// "09/2026" -> "2026-09-01". Null quando não veio ou não casa.
+function parseMesComando(text) {
+  const arg = (text || '').trim().split(/\s+/)[1];
+  if (!arg) return null;
+  const m = arg.match(/^(\d{1,2})\/(\d{4})$/);
+  if (!m) return null;
+  const mes = parseInt(m[1], 10);
+  if (mes < 1 || mes > 12) return null;
+  return `${m[2]}-${String(mes).padStart(2, '0')}-01`;
+}
+
+// "2026-09-12" ou "12/09" -> "12/09". A RPC pode mandar nos dois formatos.
+function diaCurto(valor) {
+  const s = String(valor ?? '');
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return iso ? `${iso[3]}/${iso[2]}` : s;
+}
+
+// Busca o mês na RPC bot_caixa_mes. Nunca lança: erro vira { erro: texto }.
+async function dadosFaturamento(ref) {
+  try {
+    const body = { p_token: BOT_SYNC_TOKEN };
+    if (ref) body.p_ref = ref;
+    const d = await callRpc('bot_caixa_mes', body);
+    if (!d || d.ok === false) return { erro: `⚠️ ${(d && (d.erro || d.msg)) || 'Não consegui consultar o faturamento.'}` };
+    return { dados: d };
+  } catch (err) {
+    console.error('bot_caixa_mes:', err.message);
+    return {
+      erro: rpcAusente(err.message)
+        ? '⚠️ A RPC `bot_caixa_mes` não existe no banco — falta rodar o SQL do faturamento.'
+        : '⚠️ Erro ao consultar o faturamento.',
+    };
+  }
+}
+
+// Mês fechado = o período já acabou. "Hoje" e "projeção" não fazem sentido num
+// mês passado: hoje seria sempre 0 e a projeção, o próprio total.
+function mesFechado(d) {
+  const ate = String(d.ate ?? '');
+  return /^\d{4}-\d{2}-\d{2}/.test(ate) && ate.slice(0, 10) < hojeISO();
+}
+
+function formatFaturamento(d) {
+  const hoje = d.hoje || {};
+  const fechado = mesFechado(d);
+  const linhas = [];
+
+  if (fechado) {
+    linhas.push(`💰 *FATURAMENTO · ${escapeMd(String(d.mes ?? ''))}*`);
+  } else {
+    linhas.push(`💰 *FATURAMENTO · ${escapeMd(diaCurto(hojeISO()))}*`);
+    linhas.push(`Hoje: *R$ ${fmtBR(hoje.total)}* (${hoje.qtd ?? 0} pagamentos)`);
+    linhas.push('');
+    linhas.push(`📅 *${escapeMd(String(d.mes ?? ''))} até agora*`);
+  }
+
+  linhas.push(`Total: *R$ ${fmtBR(d.mes_total)}*`);
+  linhas.push(`Média por dia: R$ ${fmtBR(d.media_dia)}`);
+
+  const melhor = d.melhor_dia || {};
+  if (melhor.dia) {
+    linhas.push(`Melhor dia: ${escapeMd(diaCurto(melhor.dia))} com R$ ${fmtBR(melhor.total)}`);
+  }
+
+  const projecao = Number(d.projecao) || 0;
+  if (!fechado) linhas.push(`Projeção do mês: R$ ${fmtBR(projecao)}`);
+
+  // Mês anterior zerado (primeiro mês de operação) não vira linha: comparar com
+  // nada só ocupa espaço e ainda daria "📈 acima" sempre.
+  const anterior = Number(d.mes_anterior) || 0;
+  if (anterior > 0) {
+    linhas.push('');
+    linhas.push(`_Mês passado fechou em R$ ${fmtBR(anterior)}_`);
+    const comparar = fechado ? Number(d.mes_total) || 0 : projecao;
+    linhas.push(comparar >= anterior ? '📈 acima do mês passado' : '📉 abaixo do mês passado');
+  }
+
+  return linhas.join('\n');
+}
+
+// /faturamento — resumo do mês (o mesmo texto do automático das 23:30).
+async function textoFaturamento(ref) {
+  const { dados, erro } = await dadosFaturamento(ref);
+  return erro || formatFaturamento(dados);
+}
+
+// /relatorio mes — dia a dia. Devolve uma LISTA de mensagens: mês cheio passa
+// dos 4096 do Telegram, e a quebra é por linha inteira.
+async function textosFaturamentoDetalhe(ref) {
+  const { dados, erro } = await dadosFaturamento(ref);
+  if (erro) return [erro];
+
+  const dias = Array.isArray(dados.dias) ? dados.dias : [];
+  const linhas = [`📅 *${escapeMd(String(dados.mes ?? '').toUpperCase())} · dia a dia*`, ''];
+  for (const it of dias) {
+    const total = Number(it.total) || 0;
+    const qtd = Number(it.qtd) || 0;
+    linhas.push(total > 0 || qtd > 0
+      ? `${escapeMd(diaCurto(it.dia))} · R$ ${fmtBR(total)} (${qtd})`
+      : `${escapeMd(diaCurto(it.dia))} · — sem movimento`);
+  }
+  linhas.push('');
+  linhas.push(`*Total: R$ ${fmtBR(dados.mes_total)} · ${dados.mes_qtd ?? 0} pagamentos*`);
+  return splitMessage(linhas.join('\n'));
+}
+
+async function handleFaturamento(chatId, text) {
+  const tokens = (text || '').trim().split(/\s+/).slice(1);
+  const detalhe = tokens.length && /^detalhes?$/i.test(tokens[0]);
+  const arg = tokens.find(t => /^\d{1,2}\/\d{4}$/.test(t));
+  // parseMesComando lê o 2º token; com "detalhe" na frente, reescreve o texto
+  // pra ele achar o mês no lugar certo.
+  const ref = arg ? parseMesComando(`x ${arg}`) : null;
+
+  if (tokens.length && !detalhe && !arg) {
+    await sendTelegram(chatId, 'Uso: /faturamento · /faturamento 09/2026 · /faturamento detalhe');
+    return;
+  }
+
+  if (detalhe) {
+    for (const parte of await textosFaturamentoDetalhe(ref)) await sendTelegram(chatId, parte);
+    return;
+  }
+  await sendTelegram(chatId, await textoFaturamento(ref));
+}
+
+// Resumo automático das 23:30, só no grupo de faturamento. Sem grupo
+// configurado não manda nada (não tem pra onde: o privado do dono seria
+// spam diário não pedido).
+const CRON_FATURAMENTO = '30 23 * * *';
+
+async function enviarFaturamentoDiario() {
+  const grupo = await chatFaturamento();
+  if (!grupo) { console.log('faturamento: grupo não configurado, resumo não enviado'); return; }
+  await sendTelegram(grupo, await textoFaturamento(null));
+}
+
+// ---------------------------------------------------------------------------
+// Corrigir comprovante lido errado
+//
+// Acontece de a foto ser de outra compra e o valor entrar errado no caixa. Até
+// aqui só dava pra arrumar por SQL.
+//
+// SEMPRE PELO ID QUE VEIO DA LISTA: nunca por valor e nunca "o último". Dois
+// comprovantes do mesmo valor no dia são comuns, e "o último" muda de alvo
+// entre o momento em que a pessoa lê a lista e o momento em que ela digita.
+// ---------------------------------------------------------------------------
+
+// Lista numerada do dia, guardada por chat pro /caixa apagar N e /caixa valor N.
+// N é a POSIÇÃO na lista; o que viaja pra RPC é o id. Expira junto com a
+// memória do processo — o Render reinicia, e aí é só pedir a lista de novo.
+const caixaListado = new Map(); // chatKey -> { at, data, itens: [{id, hora, valor}] }
+
+const CAIXA_LISTA_MS = 30 * 60 * 1000;
+
+function guardarListaCaixa(chatId, data, itens) {
+  caixaListado.set(String(chatId), { at: Date.now(), data, itens });
+}
+
+// Resolve "N" na lista guardada. Devolve { erro } ou { item }.
+function itemDaLista(chatId, n) {
+  const l = caixaListado.get(String(chatId));
+  if (!l || Date.now() - l.at > CAIXA_LISTA_MS) {
+    return { erro: '⏳ Não tenho a lista aberta aqui. Mande `/caixa corrigir` primeiro.' };
+  }
+  const item = l.itens[n - 1];
+  if (!item) {
+    return { erro: `❌ Não existe o número ${n} na lista. Mande \`/caixa corrigir\` pra ver de novo.` };
+  }
+  return { item, data: l.data };
+}
+
+// Busca os comprovantes de um dia (RPC bot_comprovantes_dia). Nunca lança.
+async function comprovantesDoDia(data) {
+  try {
+    const body = { p_token: BOT_SYNC_TOKEN };
+    if (data) body.p_data = data;
+    const d = await callRpc('bot_comprovantes_dia', body);
+    if (!d || d.ok === false) return { erro: `⚠️ ${(d && (d.erro || d.msg)) || 'Não consegui listar os comprovantes.'}` };
+    return { dados: d };
+  } catch (err) {
+    console.error('bot_comprovantes_dia:', err.message);
+    return {
+      erro: rpcAusente(err.message)
+        ? '⚠️ A RPC `bot_comprovantes_dia` não existe no banco — falta rodar o SQL da correção.'
+        : '⚠️ Erro ao listar os comprovantes.',
+    };
+  }
+}
+
+async function handleCaixaCorrigir(chatId, data) {
+  const { dados, erro } = await comprovantesDoDia(data);
+  if (erro) { await sendTelegram(chatId, erro); return; }
+
+  const itens = (Array.isArray(dados.itens) ? dados.itens : [])
+    .filter(it => it && it.id != null)
+    .map(it => ({ id: String(it.id), hora: String(it.hora ?? ''), valor: Number(it.valor) || 0 }));
+
+  const dia = dados.dia || dados.data || (data ? diaCurto(data) : 'HOJE');
+  if (!itens.length) {
+    await sendTelegram(chatId, `💵 *COMPROVANTES DE ${escapeMd(String(dia).toUpperCase())}*\n\nNenhum comprovante registrado.`);
+    return;
+  }
+
+  guardarListaCaixa(chatId, data, itens);
+
+  const linhas = [`💵 *COMPROVANTES DE ${escapeMd(String(dia).toUpperCase())}*`, ''];
+  itens.forEach((it, i) => {
+    linhas.push(`${i + 1} · ${escapeMd(it.hora)} · R$ ${fmtBR(it.valor)}`);
+  });
+  linhas.push('', `_Apagar: /caixa apagar 1 · Corrigir valor: /caixa valor 1 235_`);
+  await sendTelegram(chatId, linhas.join('\n'));
+}
+
+// Depois de mexer, o total do dia tem que sair na mesma mensagem: é ele que
+// diz se a correção resolveu.
+async function totalDoDia(data) {
+  const { dados } = await comprovantesDoDia(data);
+  if (!dados) return null;
+  const qtd = Number(dados.comprovantes_qtd ?? (Array.isArray(dados.itens) ? dados.itens.length : 0)) || 0;
+  const total = Number(dados.comprovantes_total ?? 0) || 0;
+  return `Novo total do dia: *R$ ${fmtBR(total)}* (${qtd} comprovantes)`;
+}
+
+async function handleCaixaApagar(chatId, n, from) {
+  if (!podeMarcarAtacado(from && from.id)) {
+    await sendTelegram(chatId, '⛔ Só o dono e o Rodrigo podem mexer nos comprovantes.');
+    return;
+  }
+  const { item, data, erro } = itemDaLista(chatId, n);
+  if (erro) { await sendTelegram(chatId, erro); return; }
+
+  let r = null;
+  try {
+    r = await callRpc('bot_comprovante_apagar', { p_token: BOT_SYNC_TOKEN, p_id: item.id });
+  } catch (err) {
+    console.error('bot_comprovante_apagar:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC `bot_comprovante_apagar` não existe no banco — falta rodar o SQL da correção.'
+      : '⚠️ Erro ao apagar o comprovante.');
+    return;
+  }
+  if (!r || r.ok === false) {
+    await sendTelegram(chatId, `⚠️ ${(r && (r.erro || r.msg)) || 'Não consegui apagar esse comprovante.'}`);
+    return;
+  }
+
+  // A lista guardada acabou de ficar velha: as posições mudaram.
+  caixaListado.delete(String(chatId));
+  const linhas = [`🗑️ Apagado: ${escapeMd(item.hora)} · R$ ${fmtBR(item.valor)}`];
+  const total = await totalDoDia(data);
+  if (total) linhas.push(total);
+  await sendTelegram(chatId, linhas.join('\n'));
+}
+
+async function handleCaixaValor(chatId, n, valor, from) {
+  if (!podeMarcarAtacado(from && from.id)) {
+    await sendTelegram(chatId, '⛔ Só o dono e o Rodrigo podem mexer nos comprovantes.');
+    return;
+  }
+  const { item, data, erro } = itemDaLista(chatId, n);
+  if (erro) { await sendTelegram(chatId, erro); return; }
+
+  let r = null;
+  try {
+    r = await callRpc('bot_comprovante_valor', {
+      p_token: BOT_SYNC_TOKEN, p_id: item.id, p_valor: valor,
+    });
+  } catch (err) {
+    console.error('bot_comprovante_valor:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC `bot_comprovante_valor` não existe no banco — falta rodar o SQL da correção.'
+      : '⚠️ Erro ao corrigir o valor.');
+    return;
+  }
+  if (!r || r.ok === false) {
+    await sendTelegram(chatId, `⚠️ ${(r && (r.erro || r.msg)) || 'Não consegui corrigir esse comprovante.'}`);
+    return;
+  }
+
+  // O valor mudou; a hora e o id não. Atualiza a lista em vez de jogar fora:
+  // corrigir dois seguidos é comum.
+  item.valor = valor;
+  const linhas = [
+    `✏️ Corrigido: ${escapeMd(item.hora)} · R$ ${fmtBR(r.valor_anterior ?? item.valor)} → *R$ ${fmtBR(valor)}*`,
+  ];
+  const total = await totalDoDia(data);
+  if (total) linhas.push(total);
+  await sendTelegram(chatId, linhas.join('\n'));
+}
+
+// "235", "235.00", "235,00" -> 235. Null quando não é valor.
+function parseValorArg(txt) {
+  const v = parseFloat(String(txt ?? '').replace(',', '.'));
+  return Number.isFinite(v) && v > 0 ? Math.round(v * 100) / 100 : null;
+}
+
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 23:30)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -2096,6 +2479,11 @@ async function enviarResumoVendas() {
 cron.schedule('59 23 * * *', async () => {
   try { await enviarResumoVendas(); }
   catch (err) { console.error('Erro no resumo de vendas:', err); }
+}, { timezone: 'America/Sao_Paulo' });
+
+cron.schedule(CRON_FATURAMENTO, async () => {
+  try { await enviarFaturamentoDiario(); }
+  catch (err) { console.error('Erro no faturamento diário:', err); }
 }, { timezone: 'America/Sao_Paulo' });
 
 cron.schedule('0 0 * * *', () => {
@@ -2158,16 +2546,22 @@ app.post('/webhook', async (req, res) => {
       if (ehDono(fromId)) { await handleSetGrupoPedidos(chatId, text, msg.from); return; }
       return;
     }
+    if (cmd === '/setgrupofaturamento') {
+      if (ehDono(fromId)) { await handleSetGrupoFaturamento(chatId, text, msg.from); return; }
+      return;
+    }
 
     // Os dois grupos, o privado do Lucas e o grupo de pedidos são atendidos;
     // o resto é ignorado.
     const pedidosId = await chatPedidos();
+    const faturamentoId = await chatFaturamento();
     const isVendas = chatKey === VENDAS_CHAT_ID;
     const isReposicao = chatKey === REPOSICAO_CHAT_ID;
     const isPrivadoLucas =
       msg.chat.type === 'private' && String(msg.from && msg.from.id) === LUCAS_USER_ID;
     const isPedidos = !!pedidosId && chatKey === String(pedidosId);
-    if (!isVendas && !isReposicao && !isPrivadoLucas && !isPedidos) return;
+    const isFaturamento = !!faturamentoId && chatKey === String(faturamentoId);
+    if (!isVendas && !isReposicao && !isPrivadoLucas && !isPedidos && !isFaturamento) return;
 
     // Comprovante: foto/PDF no grupo de VENDAS.
     //   sem legenda          -> só o comprovante
@@ -2188,6 +2582,8 @@ app.post('/webhook', async (req, res) => {
 
     // Onde /fornecedor, /apelido e /pedido valem.
     const pedidosAqui = podePedidos(chatKey, isPrivadoLucas, pedidosId);
+    // Onde /faturamento e /relatorio mes valem.
+    const faturamentoAqui = podeFaturamento(chatKey, isPrivadoLucas, faturamentoId);
 
     // A lista colada depois do /fornecedor vem ANTES de tudo: ela tem dezenas
     // de linhas em bullet, e várias começam com "-" — no fluxo normal a
@@ -2283,6 +2679,13 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/estoque') { await handleEstoque(chatId); return; }
     if (cmd === '/zerados') { await handleZerados(chatId); return; }
     if (cmd === '/baixo') { await handleBaixo(chatId); return; }
+    // "/relatorio mes" é faturamento, não estoque — e por isso respeita o
+    // grupo restrito em vez de responder onde o /relatorio normal responde.
+    if (cmd === '/relatorio' && /^mes|^mês/i.test((text.split(/\s+/)[1] || ''))) {
+      if (!faturamentoAqui) { await sendTelegram(chatId, '💰 Esse comando é no grupo de faturamento (ou no privado do dono).'); return; }
+      for (const parte of await textosFaturamentoDetalhe(null)) await sendTelegram(chatId, parte);
+      return;
+    }
     if (cmd === '/relatorio') { await handleRelatorio(chatId); return; }
     if (cmd === '/semana') { await handleRelatorioSemanal(chatId); return; }
     if (cmd === '/reposicao') { await handleReposicao(chatId); return; }
@@ -2298,7 +2701,12 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/refazerfechamento') { await handleRefazerFechamento(chatId, text, fromId); return; }
     if (cmd === '/atacado') { await handleAtacado(chatId, msg.from); return; }
     if (cmd === '/desatacado') { await handleDesatacado(chatId, msg.from); return; }
-    if (cmd === '/caixa') { await handleCaixa(chatId, text); return; }
+    if (cmd === '/caixa') { await handleCaixa(chatId, text, msg.from); return; }
+    if (cmd === '/faturamento') {
+      if (!faturamentoAqui) { await sendTelegram(chatId, '💰 Esse comando é no grupo de faturamento (ou no privado do dono).'); return; }
+      await handleFaturamento(chatId, text);
+      return;
+    }
     if (cmd === '/versao') { await handleVersao(chatId, fromId); return; }
 
     // Pedidos: só no grupo de pedidos e no privado do dono (enquanto a chave
@@ -2400,6 +2808,16 @@ module.exports = {
   lerERegistrarComprovante,
   textoCaixa,
   handleCaixa,
+  chatFaturamento,
+  podeFaturamento,
+  parseMesComando,
+  formatFaturamento,
+  textoFaturamento,
+  textosFaturamentoDetalhe,
+  enviarFaturamentoDiario,
+  CRON_FATURAMENTO,
+  parseValorArg,
+  handleCaixaCorrigir,
   nomeAutor,
   fmtValor,
   handleRefazerFechamento,

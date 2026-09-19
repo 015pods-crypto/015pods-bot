@@ -1925,7 +1925,7 @@ teste('resposta do modelo que não é JSON pede o valor', async (ctx) => {
   assert.ok(resp.text.includes('Não consegui ler o valor'), resp.text);
 });
 
-teste('valor fora do padrão registra, mas avisa', async (ctx) => {
+teste('valor fora da faixa registra, mas avisa', async (ctx) => {
   respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 2500, qtd_dia: 1 } };
 
   respostaGemini = { status: 200, body: geminiJson({ valor: 2500, confianca: 'alta' }) };
@@ -1941,6 +1941,18 @@ teste('valor fora do padrão registra, mas avisa', async (ctx) => {
   respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
   const [normal] = await mandar(ctx.webhook, updateArquivo());
   assert.ok(!normal.text.includes('fora do padrão'), normal.text);
+});
+
+// Valor alto entra DIRETO: não existe confirmação no meio do caminho.
+teste('valor alto é registrado na hora, sem perguntar nada', async (ctx) => {
+  respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 3500, qtd_dia: 1 } };
+  respostaGemini = { status: 200, body: geminiJson({ valor: 3500, confianca: 'alta' }) };
+
+  const [resp] = await mandar(ctx.webhook, updateArquivo());
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 1);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar')[0].body.p_valor, 3500);
+  assert.ok(resp.text.includes('Comprovante lido: *R$ 3.500,00*'), resp.text);
+  assert.ok(!resp.text.includes('Confirma'), resp.text);
 });
 
 teste('PDF é aceito; sticker e vídeo são ignorados', async (ctx) => {
@@ -2173,6 +2185,315 @@ teste('o resumo diário das 23:59 leva o caixa junto', async (ctx) => {
   // comparação nenhuma com as vendas.
   assert.ok(!noGrupo.text.includes('16:42 · R$ 150,00'), noGrupo.text);
   assert.ok(!/Diferen[çc]a/i.test(noGrupo.text), noGrupo.text);
+});
+
+// --- Grupo de faturamento --------------------------------------------------
+
+const GRUPO_FATURAMENTO = -300;
+
+// Config falsa com o grupo de faturamento já configurado.
+function configComFaturamento(id = GRUPO_FATURAMENTO) {
+  respostas.bot_config = (body) => body.p_key === 'telegram_grupo_faturamento'
+    ? { status: 200, body: { ok: true, valor: String(id) } }
+    : { status: 200, body: { ok: true, valor: '' } };
+}
+
+const CAIXA_MES = {
+  ok: true, mes: 'Setembro', de: '2026-09-01', ate: '2026-09-30',
+  hoje: { total: 1470, qtd: 10 },
+  mes_total: 24380, mes_qtd: 165, ticket: 147.76,
+  media_dia: 1283.15, projecao: 38494.5,
+  melhor_dia: { dia: '2026-09-12', total: 2140 },
+  mes_anterior: 31200,
+  dias: [
+    { dia: '2026-09-01', total: 1240, qtd: 8 },
+    { dia: '2026-09-02', total: 980, qtd: 6 },
+    { dia: '2026-09-03', total: 0, qtd: 0 },
+  ],
+};
+
+teste('/setgrupofaturamento grava a chave do grupo', async (ctx) => {
+  respostas.bot_config_set = { status: 200, body: { ok: true } };
+  const [resp] = await mandar(ctx.webhook, update('/setgrupofaturamento', { chat: GRUPO_FATURAMENTO }));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_config_set');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_key, 'telegram_grupo_faturamento');
+  assert.strictEqual(rpc[0].body.p_valor, String(GRUPO_FATURAMENTO));
+  assert.ok(resp.text.includes('Grupo de faturamento definido'), resp.text);
+});
+
+teste('/setgrupofaturamento é recusado pro funcionário', async (ctx) => {
+  await mandar(ctx.webhook, update('/setgrupofaturamento', { from: FUNCIONARIO }), { esperaResposta: false });
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_config_set').length, 0);
+});
+
+teste('/faturamento responde no grupo de faturamento', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES };
+
+  const [resp] = await mandar(ctx.webhook, update('/faturamento', { chat: GRUPO_FATURAMENTO }));
+  assert.ok(resp.text.includes('FATURAMENTO'), resp.text);
+  assert.ok(resp.text.includes('Hoje: *R$ 1.470,00* (10 pagamentos)'), resp.text);
+  assert.ok(resp.text.includes('Total: *R$ 24.380,00*'), resp.text);
+  assert.ok(resp.text.includes('Média por dia: R$ 1.283,15'), resp.text);
+  assert.ok(resp.text.includes('Melhor dia: 12/09 com R$ 2.140,00'), resp.text);
+  assert.ok(resp.text.includes('Projeção do mês: R$ 38.494,50'), resp.text);
+  assert.ok(resp.text.includes('Mês passado fechou em R$ 31.200,00'), resp.text);
+  assert.ok(resp.text.includes('📈 acima do mês passado'), resp.text);
+});
+
+// O ponto do grupo: faturamento não pode vazar pro grupo de vendas.
+teste('/faturamento é recusado no grupo de VENDAS', async (ctx) => {
+  configComFaturamento();
+  const [resp] = await mandar(ctx.webhook, update('/faturamento'));
+  assert.ok(resp.text.includes('grupo de faturamento'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_mes').length, 0);
+});
+
+// Sem a chave configurada vale SÓ o privado do dono — ao contrário dos
+// pedidos, que valem em qualquer lugar enquanto não são configurados.
+teste('sem grupo configurado, /faturamento só responde no privado do dono', async (ctx) => {
+  respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES };
+
+  const [noGrupo] = await mandar(ctx.webhook, update('/faturamento'));
+  assert.ok(noGrupo.text.includes('grupo de faturamento'), noGrupo.text);
+
+  const [noPrivado] = await mandar(ctx.webhook, update('/faturamento', { chat: DONO, tipo: 'private' }));
+  assert.ok(noPrivado.text.includes('FATURAMENTO'), noPrivado.text);
+});
+
+teste('projeção abaixo do mês passado vira seta pra baixo', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: { ...CAIXA_MES, projecao: 28000 } };
+  const [resp] = await mandar(ctx.webhook, update('/faturamento', { chat: GRUPO_FATURAMENTO }));
+  assert.ok(resp.text.includes('📉 abaixo do mês passado'), resp.text);
+});
+
+teste('mês anterior zerado não vira linha nenhuma', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: { ...CAIXA_MES, mes_anterior: 0 } };
+  const [resp] = await mandar(ctx.webhook, update('/faturamento', { chat: GRUPO_FATURAMENTO }));
+  assert.ok(!resp.text.includes('Mês passado'), resp.text);
+  assert.ok(!resp.text.includes('📈'), resp.text);
+  assert.ok(!resp.text.includes('📉'), resp.text);
+});
+
+teste('/faturamento 08/2026 consulta o mês pedido', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = {
+    status: 200,
+    body: { ...CAIXA_MES, mes: 'Agosto', de: '2026-08-01', ate: '2026-08-31', mes_total: 31200 },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/faturamento 08/2026', { chat: GRUPO_FATURAMENTO }));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_mes')[0].body.p_ref, '2026-08-01');
+  // Mês fechado: "hoje" e "projeção" não fazem sentido.
+  assert.ok(!resp.text.includes('Hoje:'), resp.text);
+  assert.ok(!resp.text.includes('Projeção'), resp.text);
+  assert.ok(resp.text.includes('Total: *R$ 31.200,00*'), resp.text);
+});
+
+teste('/faturamento com argumento inválido mostra o uso', async (ctx) => {
+  configComFaturamento();
+  const [resp] = await mandar(ctx.webhook, update('/faturamento agosto', { chat: GRUPO_FATURAMENTO }));
+  assert.ok(resp.text.includes('Uso: /faturamento'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_mes').length, 0);
+});
+
+teste('/relatorio mes lista dia a dia, com os dias sem movimento', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES };
+  const [resp] = await mandar(ctx.webhook, update('/relatorio mes', { chat: GRUPO_FATURAMENTO }));
+
+  assert.ok(resp.text.includes('SETEMBRO · dia a dia'), resp.text);
+  assert.ok(resp.text.includes('01/09 · R$ 1.240,00 (8)'), resp.text);
+  assert.ok(resp.text.includes('03/09 · — sem movimento'), resp.text);
+  assert.ok(resp.text.includes('Total: R$ 24.380,00 · 165 pagamentos'), resp.text);
+});
+
+// /relatorio sem argumento continua sendo o de ESTOQUE, em qualquer grupo.
+teste('/relatorio sozinho continua sendo o relatório de estoque', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_ler_estoque = { status: 200, body: [] };
+  const [resp] = await mandar(ctx.webhook, update('/relatorio'));
+  assert.ok(resp.text.includes('Relatório de estoque'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_mes').length, 0);
+});
+
+teste('/relatorio mes é recusado fora do grupo de faturamento', async (ctx) => {
+  configComFaturamento();
+  const [resp] = await mandar(ctx.webhook, update('/relatorio mes'));
+  assert.ok(resp.text.includes('grupo de faturamento'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_mes').length, 0);
+});
+
+teste('mês longo quebra em várias mensagens', async (ctx) => {
+  configComFaturamento();
+  const dias = [];
+  for (let i = 1; i <= 31; i++) {
+    dias.push({ dia: `2026-09-${String(i).padStart(2, '0')}`, total: 1234.56, qtd: 9 });
+  }
+  respostas.bot_caixa_mes = { status: 200, body: { ...CAIXA_MES, dias } };
+
+  const partes = await ctx.mod.textosFaturamentoDetalhe(null);
+  for (const p of partes) assert.ok(p.length <= 4096, `passou de 4096: ${p.length}`);
+  const juntas = partes.join('\n');
+  assert.ok(juntas.includes('01/09'), juntas.slice(0, 200));
+  assert.ok(juntas.includes('31/09'), 'faltou o último dia');
+});
+
+teste('RPC de faturamento ausente diz qual SQL falta', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 404, body: { message: 'Could not find the function' } };
+  const [resp] = await mandar(ctx.webhook, update('/faturamento', { chat: GRUPO_FATURAMENTO }));
+  assert.ok(resp.text.includes('bot_caixa_mes'), resp.text);
+  assert.ok(resp.text.includes('falta rodar o SQL'), resp.text);
+});
+
+teste('o resumo das 23:30 vai SÓ pro grupo de faturamento', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES };
+  await ctx.mod.enviarFaturamentoDiario();
+
+  assert.strictEqual(enviadas.length, 1, `devia ser uma mensagem só: ${JSON.stringify(enviadas)}`);
+  assert.strictEqual(String(enviadas[0].chat_id), String(GRUPO_FATURAMENTO));
+  assert.ok(enviadas[0].text.includes('FATURAMENTO'), enviadas[0].text);
+  // Nunca no grupo de vendas.
+  assert.ok(!enviadas.some(e => String(e.chat_id) === String(GRUPO_VENDAS)));
+});
+
+teste('sem grupo configurado, o resumo automático não manda nada', async (ctx) => {
+  respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES };
+  await ctx.mod.enviarFaturamentoDiario();
+  assert.strictEqual(enviadas.length, 0, `não tem pra onde mandar: ${JSON.stringify(enviadas)}`);
+});
+
+teste('o resumo de faturamento é agendado às 23:30 de Brasília', async (ctx) => {
+  assert.strictEqual(ctx.mod.CRON_FATURAMENTO, '30 23 * * *');
+});
+
+// --- /caixa corrigir · apagar · valor --------------------------------------
+
+const LISTA_HOJE = {
+  status: 200,
+  body: {
+    ok: true, dia: 'hoje', comprovantes_total: 3675, comprovantes_qtd: 2,
+    itens: [
+      { id: 'c-1', hora: '10:14', valor: 175 },
+      { id: 'c-2', hora: '11:32', valor: 3500 },
+    ],
+  },
+};
+
+teste('/caixa corrigir lista os comprovantes numerados', async (ctx) => {
+  respostas.bot_comprovantes_dia = LISTA_HOJE;
+  const [resp] = await mandar(ctx.webhook, update('/caixa corrigir'));
+  assert.ok(resp.text.includes('COMPROVANTES DE HOJE'), resp.text);
+  assert.ok(resp.text.includes('1 · 10:14 · R$ 175,00'), resp.text);
+  assert.ok(resp.text.includes('2 · 11:32 · R$ 3.500,00'), resp.text);
+  assert.ok(resp.text.includes('/caixa apagar'), resp.text);
+  assert.ok(resp.text.includes('/caixa valor'), resp.text);
+});
+
+// O ponto da tarefa: agir pelo ID da lista, nunca por valor nem "o último".
+teste('/caixa apagar 2 apaga PELO ID do item 2', async (ctx) => {
+  respostas.bot_comprovantes_dia = LISTA_HOJE;
+  respostas.bot_comprovante_apagar = { status: 200, body: { ok: true } };
+
+  await mandar(ctx.webhook, update('/caixa corrigir'));
+  const [resp] = await mandar(ctx.webhook, update('/caixa apagar 2'));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_comprovante_apagar');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_id, 'c-2', 'tem que mandar o id, não a posição');
+  assert.ok(resp.text.includes('Apagado'), resp.text);
+  assert.ok(resp.text.includes('Novo total do dia'), resp.text);
+});
+
+teste('/caixa valor 2 235 corrige pelo id e mostra o novo total', async (ctx) => {
+  respostas.bot_comprovantes_dia = LISTA_HOJE;
+  respostas.bot_comprovante_valor = { status: 200, body: { ok: true, valor_anterior: 3500 } };
+
+  await mandar(ctx.webhook, update('/caixa corrigir'));
+  const [resp] = await mandar(ctx.webhook, update('/caixa valor 2 235'));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_comprovante_valor');
+  assert.strictEqual(rpc[0].body.p_id, 'c-2');
+  assert.strictEqual(rpc[0].body.p_valor, 235);
+  assert.ok(resp.text.includes('Corrigido'), resp.text);
+  assert.ok(resp.text.includes('R$ 235,00'), resp.text);
+});
+
+teste('/caixa valor aceita vírgula e centavos', async (ctx) => {
+  respostas.bot_comprovantes_dia = LISTA_HOJE;
+  respostas.bot_comprovante_valor = { status: 200, body: { ok: true } };
+  await mandar(ctx.webhook, update('/caixa corrigir'));
+  await mandar(ctx.webhook, update('/caixa valor 1 235,50'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_valor')[0].body.p_valor, 235.5);
+});
+
+teste('/caixa apagar sem a lista aberta manda abrir primeiro', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/caixa apagar 2'));
+  assert.ok(resp.text.includes('/caixa corrigir'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_apagar').length, 0);
+});
+
+teste('/caixa apagar com número fora da lista avisa', async (ctx) => {
+  respostas.bot_comprovantes_dia = LISTA_HOJE;
+  await mandar(ctx.webhook, update('/caixa corrigir'));
+  const [resp] = await mandar(ctx.webhook, update('/caixa apagar 9'));
+  assert.ok(resp.text.includes('Não existe o número 9'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_apagar').length, 0);
+});
+
+// Depois de apagar, as posições mudaram: a lista velha não pode continuar
+// valendo, senão o próximo "apagar 2" acerta outro comprovante.
+teste('depois de apagar, a lista velha é descartada', async (ctx) => {
+  respostas.bot_comprovantes_dia = LISTA_HOJE;
+  respostas.bot_comprovante_apagar = { status: 200, body: { ok: true } };
+  await mandar(ctx.webhook, update('/caixa corrigir'));
+  await mandar(ctx.webhook, update('/caixa apagar 1'));
+
+  chamadas.length = 0;
+  const [resp] = await mandar(ctx.webhook, update('/caixa apagar 1'));
+  assert.ok(resp.text.includes('/caixa corrigir'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_apagar').length, 0);
+});
+
+teste('/caixa corrigir 15/09 mexe em outro dia', async (ctx) => {
+  respostas.bot_comprovantes_dia = LISTA_HOJE;
+  respostas.bot_comprovante_apagar = { status: 200, body: { ok: true } };
+  await mandar(ctx.webhook, update('/caixa corrigir 15/09'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovantes_dia')[0].body.p_data, '2026-09-15');
+
+  await mandar(ctx.webhook, update('/caixa apagar 1'));
+  // O total conferido depois tem que ser o do MESMO dia, não o de hoje.
+  const consultas = chamadas.filter(c => c.fn === 'bot_comprovantes_dia');
+  assert.strictEqual(consultas[consultas.length - 1].body.p_data, '2026-09-15');
+});
+
+teste('/caixa apagar do funcionário é recusado', async (ctx) => {
+  respostas.bot_comprovantes_dia = LISTA_HOJE;
+  await mandar(ctx.webhook, update('/caixa corrigir'));
+  const [resp] = await mandar(ctx.webhook, update('/caixa apagar 1', { from: FUNCIONARIO }));
+  assert.ok(resp.text.includes('Só o dono e o Rodrigo'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_apagar').length, 0);
+});
+
+teste('/caixa corrigir em dia sem comprovante não abre lista', async (ctx) => {
+  respostas.bot_comprovantes_dia = { status: 200, body: { ok: true, dia: 'hoje', itens: [] } };
+  const [resp] = await mandar(ctx.webhook, update('/caixa corrigir'));
+  assert.ok(resp.text.includes('Nenhum comprovante registrado'), resp.text);
+
+  const [depois] = await mandar(ctx.webhook, update('/caixa apagar 1'));
+  assert.ok(depois.text.includes('/caixa corrigir'), depois.text);
+});
+
+teste('/caixa sem argumento continua sendo o resumo do dia', async (ctx) => {
+  respostas.bot_caixa_dia = { status: 200, body: CAIXA_DIA };
+  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  assert.ok(resp.text.includes('Total recebido'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovantes_dia').length, 0);
 });
 
 // --- Runner ----------------------------------------------------------------
