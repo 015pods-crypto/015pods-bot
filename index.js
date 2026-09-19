@@ -2180,14 +2180,38 @@ async function dadosFaturamento(ref) {
 
 // Mês fechado = o período já acabou. "Hoje" e "projeção" não fazem sentido num
 // mês passado: hoje seria sempre 0 e a projeção, o próprio total.
+// Mês fechado = o mês CALENDÁRIO já acabou. Usa mes_ate, não `ate`: desde que
+// a RPC passou a medir período parcial, `ate` é o fim do que foi MEDIDO, e um
+// mês corrente parcial seria lido como mês passado.
 function mesFechado(d) {
-  const ate = String(d.ate ?? '');
+  const ate = String(d.mes_ate ?? d.ate ?? '');
   return /^\d{4}-\d{2}-\d{2}/.test(ate) && ate.slice(0, 10) < hojeISO();
+}
+
+// Período parcial: o registro de comprovantes começou depois do dia 1, então a
+// conta não cobre o mês inteiro. Sem isso, uma média de 11 dias apareceria como
+// "média do mês" e a projeção sairia de uma base que não existe.
+function ehParcial(d) {
+  return d.parcial === true;
+}
+
+// Cabeçalho do recorte, usado no resumo e no dia a dia: "10/09 a 20/09 (11 dias)".
+function rotuloPeriodo(d) {
+  const dias = Number(d.dias_contados) || 0;
+  const faixa = `${diaCurto(d.de)} a ${diaCurto(d.ate)}`;
+  return dias ? `${faixa}* (${dias} dias)` : `${faixa}*`;
+}
+
+// A explicação do recorte. Fica de rodapé: é o que responde "por que o total
+// está menor do que eu esperava".
+function notaParcial(d) {
+  return `_Começamos a registrar os comprovantes em ${diaCurto(d.primeiro_registro)}, então este mês ainda não está completo._`;
 }
 
 function formatFaturamento(d) {
   const hoje = d.hoje || {};
   const fechado = mesFechado(d);
+  const parcial = ehParcial(d);
   const linhas = [];
 
   if (fechado) {
@@ -2196,10 +2220,15 @@ function formatFaturamento(d) {
     linhas.push(`💰 *FATURAMENTO · ${escapeMd(diaCurto(hojeISO()))}*`);
     linhas.push(`Hoje: *R$ ${fmtBR(hoje.total)}* (${hoje.qtd ?? 0} pagamentos)`);
     linhas.push('');
-    linhas.push(`📅 *${escapeMd(String(d.mes ?? ''))} até agora*`);
   }
 
-  linhas.push(`Total: *R$ ${fmtBR(d.mes_total)}*`);
+  if (parcial) {
+    linhas.push(`📅 *Período medido: ${rotuloPeriodo(d)}`);
+    linhas.push(`Total: *R$ ${fmtBR(d.mes_total)}* (${d.mes_qtd ?? 0} pagamentos)`);
+  } else {
+    if (!fechado) linhas.push(`📅 *${escapeMd(String(d.mes ?? ''))} até agora*`);
+    linhas.push(`Total: *R$ ${fmtBR(d.mes_total)}*`);
+  }
   linhas.push(`Média por dia: R$ ${fmtBR(d.media_dia)}`);
 
   const melhor = d.melhor_dia || {};
@@ -2207,8 +2236,10 @@ function formatFaturamento(d) {
     linhas.push(`Melhor dia: ${escapeMd(diaCurto(melhor.dia))} com R$ ${fmtBR(melhor.total)}`);
   }
 
+  // Projeção só com o mês inteiro medido: sem isso ela sairia de uma base
+  // parcial e inflaria o número.
   const projecao = Number(d.projecao) || 0;
-  if (!fechado) linhas.push(`Projeção do mês: R$ ${fmtBR(projecao)}`);
+  if (!fechado && !parcial) linhas.push(`Projeção do mês: R$ ${fmtBR(projecao)}`);
 
   // Mês anterior zerado (primeiro mês de operação) não vira linha: comparar com
   // nada só ocupa espaço e ainda daria "📈 acima" sempre.
@@ -2216,8 +2247,17 @@ function formatFaturamento(d) {
   if (anterior > 0) {
     linhas.push('');
     linhas.push(`_Mês passado fechou em R$ ${fmtBR(anterior)}_`);
-    const comparar = fechado ? Number(d.mes_total) || 0 : projecao;
-    linhas.push(comparar >= anterior ? '📈 acima do mês passado' : '📉 abaixo do mês passado');
+    // A seta sai num período parcial: 11 dias contra um mês fechado daria
+    // "📉 abaixo" sempre, sem a loja ter vendido menos.
+    if (!parcial) {
+      const comparar = fechado ? Number(d.mes_total) || 0 : projecao;
+      linhas.push(comparar >= anterior ? '📈 acima do mês passado' : '📉 abaixo do mês passado');
+    }
+  }
+
+  if (parcial) {
+    linhas.push('');
+    linhas.push(notaParcial(d));
   }
 
   return linhas.join('\n');
@@ -2236,7 +2276,13 @@ async function textosFaturamentoDetalhe(ref) {
   if (erro) return [erro];
 
   const dias = Array.isArray(dados.dias) ? dados.dias : [];
-  const linhas = [`📅 *${escapeMd(String(dados.mes ?? '').toUpperCase())} · dia a dia*`, ''];
+  const parcial = ehParcial(dados);
+  // Num recorte parcial o cabeçalho diz o período REAL: "SETEMBRO" em cima de
+  // uma lista que começa no dia 10 faria o leitor procurar os dias que faltam.
+  const cabecalho = parcial
+    ? `📅 *Período medido: ${rotuloPeriodo(dados)} · dia a dia*`
+    : `📅 *${escapeMd(String(dados.mes ?? '').toUpperCase())} · dia a dia*`;
+  const linhas = [cabecalho, ''];
   for (const it of dias) {
     const total = Number(it.total) || 0;
     const qtd = Number(it.qtd) || 0;
@@ -2246,6 +2292,7 @@ async function textosFaturamentoDetalhe(ref) {
   }
   linhas.push('');
   linhas.push(`*Total: R$ ${fmtBR(dados.mes_total)} · ${dados.mes_qtd ?? 0} pagamentos*`);
+  if (parcial) linhas.push('', notaParcial(dados));
   return splitMessage(linhas.join('\n'));
 }
 
@@ -2812,6 +2859,7 @@ module.exports = {
   podeFaturamento,
   parseMesComando,
   formatFaturamento,
+  ehParcial,
   textoFaturamento,
   textosFaturamentoDetalhe,
   enviarFaturamentoDiario,

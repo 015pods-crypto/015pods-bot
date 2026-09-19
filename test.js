@@ -2372,6 +2372,114 @@ teste('o resumo de faturamento é agendado às 23:30 de Brasília', async (ctx) 
   assert.strictEqual(ctx.mod.CRON_FATURAMENTO, '30 23 * * *');
 });
 
+// --- Período parcial (registro começou depois do dia 1) --------------------
+
+const CAIXA_MES_PARCIAL = {
+  ok: true, mes: 'Setembro', parcial: true,
+  de: '2026-09-10', ate: '2026-09-20',
+  mes_de: '2026-09-01', mes_ate: '2026-09-30',
+  dias_contados: 11, primeiro_registro: '2026-09-10',
+  hoje: { total: 1470, qtd: 10 },
+  mes_total: 19887.91, mes_qtd: 109, media_dia: 1807.99,
+  projecao: null,
+  melhor_dia: { dia: '2026-09-18', total: 8969.49 },
+  mes_anterior: 31200,
+  dias: [
+    { dia: '2026-09-10', total: 1240, qtd: 8 },
+    { dia: '2026-09-11', total: 980, qtd: 6 },
+  ],
+};
+
+teste('/faturamento parcial diz o período medido e omite a projeção', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES_PARCIAL };
+  const [resp] = await mandar(ctx.webhook, update('/faturamento', { chat: GRUPO_FATURAMENTO }));
+
+  assert.ok(resp.text.includes('Período medido: 10/09 a 20/09* (11 dias)'), resp.text);
+  assert.ok(resp.text.includes('Total: *R$ 19.887,91* (109 pagamentos)'), resp.text);
+  assert.ok(resp.text.includes('Média por dia: R$ 1.807,99'), resp.text);
+  assert.ok(resp.text.includes('Melhor dia: 18/09 com R$ 8.969,49'), resp.text);
+  assert.ok(resp.text.includes('Começamos a registrar os comprovantes em 10/09'), resp.text);
+
+  // O que NÃO pode aparecer: projeção sem mês inteiro, e "Setembro até agora"
+  // em cima de um recorte de 11 dias.
+  assert.ok(!resp.text.includes('Projeção'), resp.text);
+  assert.ok(!resp.text.includes('até agora'), resp.text);
+});
+
+// 11 dias contra um mês fechado daria "abaixo" sempre, sem a loja ter vendido
+// menos — é o mesmo problema da comparação que saiu do /caixa.
+teste('período parcial não ganha seta de comparação com o mês passado', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES_PARCIAL };
+  const [resp] = await mandar(ctx.webhook, update('/faturamento', { chat: GRUPO_FATURAMENTO }));
+  assert.ok(!resp.text.includes('📉'), resp.text);
+  assert.ok(!resp.text.includes('📈'), resp.text);
+  // O número do mês passado continua ali, como informação.
+  assert.ok(resp.text.includes('Mês passado fechou em R$ 31.200,00'), resp.text);
+});
+
+teste('parcial mantém a linha de hoje', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES_PARCIAL };
+  const [resp] = await mandar(ctx.webhook, update('/faturamento', { chat: GRUPO_FATURAMENTO }));
+  assert.ok(resp.text.includes('Hoje: *R$ 1.470,00* (10 pagamentos)'), resp.text);
+});
+
+teste('mês completo (parcial=false) mantém o formato com projeção', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = {
+    status: 200,
+    body: { ...CAIXA_MES, parcial: false, mes_de: '2026-09-01', mes_ate: '2026-09-30' },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/faturamento', { chat: GRUPO_FATURAMENTO }));
+  assert.ok(resp.text.includes('Setembro até agora'), resp.text);
+  assert.ok(resp.text.includes('Projeção do mês: R$ 38.494,50'), resp.text);
+  assert.ok(resp.text.includes('📈 acima do mês passado'), resp.text);
+  assert.ok(!resp.text.includes('Período medido'), resp.text);
+  assert.ok(!resp.text.includes('Começamos a registrar'), resp.text);
+});
+
+teste('/relatorio mes parcial diz o período real no cabeçalho', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES_PARCIAL };
+  const [resp] = await mandar(ctx.webhook, update('/relatorio mes', { chat: GRUPO_FATURAMENTO }));
+
+  assert.ok(resp.text.includes('Período medido: 10/09 a 20/09* (11 dias) · dia a dia'), resp.text);
+  assert.ok(!resp.text.includes('SETEMBRO · dia a dia'), resp.text);
+  assert.ok(resp.text.includes('10/09 · R$ 1.240,00 (8)'), resp.text);
+  assert.ok(resp.text.includes('Total: R$ 19.887,91 · 109 pagamentos'), resp.text);
+  assert.ok(resp.text.includes('Começamos a registrar os comprovantes em 10/09'), resp.text);
+});
+
+// mes_ate é o mês CALENDÁRIO; `ate` virou o fim do período medido. Trocar os
+// dois faria um mês corrente parcial ser lido como mês passado (sem "hoje").
+teste('mês corrente parcial não é confundido com mês fechado', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = {
+    status: 200,
+    body: { ...CAIXA_MES_PARCIAL, ate: '2026-09-18' },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/faturamento', { chat: GRUPO_FATURAMENTO }));
+  assert.ok(resp.text.includes('Hoje:'), `mês corrente tem que mostrar o hoje: ${resp.text}`);
+});
+
+teste('mês passado fechado continua sem "hoje" nem projeção', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = {
+    status: 200,
+    body: {
+      ...CAIXA_MES, mes: 'Agosto', parcial: false,
+      de: '2026-08-01', ate: '2026-08-31', mes_de: '2026-08-01', mes_ate: '2026-08-31',
+      mes_total: 31200,
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/faturamento 08/2026', { chat: GRUPO_FATURAMENTO }));
+  assert.ok(!resp.text.includes('Hoje:'), resp.text);
+  assert.ok(!resp.text.includes('Projeção'), resp.text);
+  assert.ok(resp.text.includes('Total: *R$ 31.200,00*'), resp.text);
+});
+
 // --- /caixa corrigir · apagar · valor --------------------------------------
 
 const LISTA_HOJE = {
