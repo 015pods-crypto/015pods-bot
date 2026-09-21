@@ -2604,6 +2604,225 @@ teste('/caixa sem argumento continua sendo o resumo do dia', async (ctx) => {
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovantes_dia').length, 0);
 });
 
+const GRUPO_PEDIDOS = -400;
+
+function configComPedidos(id = GRUPO_PEDIDOS) {
+  respostas.bot_config = (body) => body.p_key === 'telegram_grupo_pedidos'
+    ? { status: 200, body: { ok: true, valor: String(id) } }
+    : { status: 200, body: { ok: true, valor: '' } };
+}
+
+// --- /estoque: pods separados dos acompanhamentos --------------------------
+
+// Estoque falso no formato da bot_ler_estoque (agrupado por modelo).
+const ESTOQUE_MISTO = {
+  status: 200,
+  body: [
+    {
+      modelo: 'Ignite 50000 (V500)',
+      sabores: [
+        { sabor: 'Strawberry Kiwi', qty: 4 },
+        { sabor: 'Grape Ice', qty: 0 },
+        { sabor: 'Watermelon Ice', qty: 1 },
+        { sabor: 'Cool Menthol', qty: 0 },
+        { sabor: 'Blueberry', qty: 14 },
+      ],
+    },
+    { modelo: 'Elfbar 30000', sabores: [{ sabor: 'Cherry', qty: 8 }] },
+    { modelo: 'Fini Beijos', sabores: [{ sabor: 'Morango', qty: 20 }] },
+    { modelo: 'Kitkat', sabores: [{ sabor: 'Ao leite', qty: 47 }] },
+    { modelo: 'Stikadinho', sabores: [{ sabor: 'Original', qty: 63 }] },
+  ],
+};
+
+function configNaoPods() {
+  respostas.bot_config = (body) => body.p_key === 'bot_nao_pods'
+    ? { status: 200, body: { ok: true, valor: 'fini,kitkat,trident,stikadinho,essencia,blvk,chocolate,bala,doce,pilha,carregador' } }
+    : { status: 200, body: { ok: true, valor: '' } };
+}
+
+teste('/estoque conta só pods e joga os acompanhamentos pro fim', async (ctx) => {
+  configNaoPods();
+  respostas.bot_ler_estoque = ESTOQUE_MISTO;
+  const [resp] = await mandar(ctx.webhook, update('/estoque'));
+
+  // 19 do Ignite + 8 do Elfbar = 27 pods. Os 130 de doce ficam de fora.
+  assert.ok(resp.text.includes('🧮 Total de pods: *27*'), resp.text);
+  assert.ok(resp.text.includes('Ignite 50000 (V500)*: 19'), resp.text);
+  assert.ok(resp.text.includes('Elfbar 30000*: 8'), resp.text);
+
+  assert.ok(resp.text.includes('🍬 Acompanhamentos:'), resp.text);
+  assert.ok(resp.text.includes('Stikadinho 63'), resp.text);
+  assert.ok(resp.text.includes('Kitkat 47'), resp.text);
+  assert.ok(resp.text.includes('Fini Beijos 20'), resp.text);
+  assert.ok(resp.text.includes('(total 130)'), resp.text);
+
+  // Acompanhamento não pode aparecer na lista de pods.
+  const listaPods = resp.text.split('🍬')[0];
+  assert.ok(!listaPods.includes('Kitkat'), listaPods);
+  assert.ok(!listaPods.includes('Total geral'), 'o total que misturava tudo saiu');
+});
+
+teste('/estoque detalhado lista os sabores, zerados primeiro', async (ctx) => {
+  configNaoPods();
+  respostas.bot_ler_estoque = ESTOQUE_MISTO;
+  const respostasBot = await mandar(ctx.webhook, update('/estoque detalhado'));
+  await new Promise(r => setTimeout(r, 150));
+  const t = respostasBot.map(r => r.text).join('\n');
+
+  assert.ok(t.includes('📦 *Ignite 50000 (V500)* · 19 un'), t);
+  assert.ok(t.includes('❌ Grape Ice · 0'), t);
+  assert.ok(t.includes('❌ Cool Menthol · 0'), t);
+  assert.ok(t.includes('⚠️ Watermelon Ice · 1'), t);
+  assert.ok(t.includes('Strawberry Kiwi · 4'), t);
+
+  // A ordem é o ponto: zerado, depois o que está acabando, depois o resto.
+  const bloco = t.slice(t.indexOf('Ignite 50000'));
+  const pos = n => bloco.indexOf(n);
+  assert.ok(pos('Cool Menthol') < pos('Watermelon Ice'), bloco);
+  assert.ok(pos('Watermelon Ice') < pos('Strawberry Kiwi'), bloco);
+  assert.ok(pos('Strawberry Kiwi') < pos('Blueberry'), bloco);
+});
+
+teste('/estoque detalhado põe os acompanhamentos no fim, separados', async (ctx) => {
+  configNaoPods();
+  respostas.bot_ler_estoque = ESTOQUE_MISTO;
+  const respostasBot = await mandar(ctx.webhook, update('/estoque detalhado'));
+  await new Promise(r => setTimeout(r, 150));
+  const t = respostasBot.map(r => r.text).join('\n');
+
+  assert.ok(t.includes('🍬 *Acompanhamentos* · 130 un'), t);
+  assert.ok(t.indexOf('Elfbar 30000') < t.indexOf('Acompanhamentos'), 'pod tem que vir antes');
+  assert.ok(t.indexOf('Acompanhamentos') < t.indexOf('Ao leite'), 'Kitkat tem que vir depois do cabeçalho');
+});
+
+teste('/estoque detalhado longo quebra sem cortar modelo no meio', async (ctx) => {
+  configNaoPods();
+  const body = [];
+  for (let m = 0; m < 30; m++) {
+    const sabores = [];
+    for (let f = 0; f < 10; f++) sabores.push({ sabor: `Sabor bem comprido numero ${f}`, qty: f });
+    body.push({ modelo: `MODELO COMPRIDO NUMERO ${m}`, sabores });
+  }
+  respostas.bot_ler_estoque = { status: 200, body };
+
+  const antes = enviadas.length;
+  await mandar(ctx.webhook, update('/estoque detalhado'));
+  await new Promise(r => setTimeout(r, 400));
+  const partes = enviadas.slice(antes);
+
+  assert.ok(partes.length > 1, `devia ter quebrado: ${partes.length}`);
+  for (const p of partes) assert.ok(p.text.length <= 4096, `passou de 4096: ${p.text.length}`);
+  // Nenhuma parte pode começar com linha de sabor solta.
+  for (const p of partes.slice(1)) {
+    assert.ok(/^(📦|🍬)/.test(p.text.trim()), `parte começa no meio de um modelo:\n${p.text.slice(0, 80)}`);
+  }
+});
+
+teste('config de acompanhamentos fora do ar cai na lista padrão', async (ctx) => {
+  respostas.bot_config = { status: 500, body: { message: 'boom' } };
+  respostas.bot_ler_estoque = ESTOQUE_MISTO;
+  const [resp] = await mandar(ctx.webhook, update('/estoque'));
+  assert.ok(resp.text.includes('Total de pods: *27*'), `o padrão tem que segurar: ${resp.text}`);
+  assert.ok(resp.text.includes('Acompanhamentos'), resp.text);
+});
+
+teste('palavra nova em bot_nao_pods reclassifica sem deploy', async (ctx) => {
+  respostas.bot_config = (body) => body.p_key === 'bot_nao_pods'
+    ? { status: 200, body: { ok: true, valor: 'fini,kitkat,stikadinho,elfbar' } }
+    : { status: 200, body: { ok: true, valor: '' } };
+  respostas.bot_ler_estoque = ESTOQUE_MISTO;
+  const [resp] = await mandar(ctx.webhook, update('/estoque'));
+  // Elfbar virou acompanhamento: sobram 19 pods.
+  assert.ok(resp.text.includes('Total de pods: *19*'), resp.text);
+  assert.ok(resp.text.includes('Elfbar 30000 8'), resp.text);
+});
+
+teste('ehAcompanhamento ignora maiúscula e acento', async (ctx) => {
+  const palavras = ['essencia', 'fini'];
+  assert.strictEqual(ctx.mod.ehAcompanhamento('Essência de Baunilha', palavras), true);
+  assert.strictEqual(ctx.mod.ehAcompanhamento('FINI BEIJOS', palavras), true);
+  assert.strictEqual(ctx.mod.ehAcompanhamento('Ignite 50000', palavras), false);
+});
+
+// --- Grupos de PEDIDOS e FATURAMENTO não mexem em estoque nem em caixa -----
+
+teste('baixa no grupo de PEDIDOS é recusada, sem tocar no estoque', async (ctx) => {
+  configComPedidos();
+  const [resp] = await mandar(ctx.webhook, update('-2 elfbar 30000 cherry', { chat: GRUPO_PEDIDOS }));
+  assert.ok(resp.text.includes('só para montar pedido ao fornecedor'), resp.text);
+  assert.ok(resp.text.includes('grupo de VENDAS'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('entrada e despesa no grupo de PEDIDOS também são recusadas', async (ctx) => {
+  configComPedidos();
+  const [entrada] = await mandar(ctx.webhook, update('+2 elfbar 30000 cherry', { chat: GRUPO_PEDIDOS }));
+  assert.ok(entrada.text.includes('só para montar pedido'), entrada.text);
+
+  const [despesa] = await mandar(ctx.webhook, update('+25 ENTREGA', { chat: GRUPO_PEDIDOS }));
+  assert.ok(despesa.text.includes('só para montar pedido'), despesa.text);
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar').length, 0);
+});
+
+teste('comprovante no grupo de PEDIDOS é recusado, sem ler a imagem', async (ctx) => {
+  configComPedidos();
+  const [resp] = await mandar(ctx.webhook, updateArquivo({ chat: GRUPO_PEDIDOS }));
+  assert.ok(resp.text.includes('só para montar pedido'), resp.text);
+  assert.strictEqual(chamadasGemini.length, 0, 'nem podia chamar o Gemini');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
+});
+
+teste('comprovante no grupo de FATURAMENTO é recusado', async (ctx) => {
+  configComFaturamento();
+  const [resp] = await mandar(ctx.webhook, updateArquivo({ chat: GRUPO_FATURAMENTO }));
+  assert.ok(resp.text.includes('só para os números do faturamento'), resp.text);
+  assert.ok(resp.text.includes('grupo de VENDAS'), resp.text);
+  assert.strictEqual(chamadasGemini.length, 0);
+});
+
+teste('baixa no grupo de FATURAMENTO é recusada', async (ctx) => {
+  configComFaturamento();
+  const [resp] = await mandar(ctx.webhook, update('-2 elfbar 30000 cherry', { chat: GRUPO_FATURAMENTO }));
+  assert.ok(resp.text.includes('só para os números do faturamento'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('"/atacado + baixas" no grupo de PEDIDOS também é recusado', async (ctx) => {
+  configComPedidos();
+  const [resp] = await mandar(ctx.webhook, update('/atacado\n-2 elfbar 30000 cherry', { chat: GRUPO_PEDIDOS }));
+  assert.ok(resp.text.includes('só para montar pedido'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
+});
+
+// O que esses grupos ACEITAM continua funcionando.
+teste('o grupo de PEDIDOS continua aceitando /pedido', async (ctx) => {
+  configComPedidos();
+  respostas.bot_montar_pedido = { status: 200, body: { ok: true, grupos: [], usou_lista_fornecedor: true } };
+  const [resp] = await mandar(ctx.webhook, update('/pedido', { chat: GRUPO_PEDIDOS }));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_montar_pedido').length, 1);
+  assert.ok(resp.text.includes('Nada a pedir'), resp.text);
+});
+
+teste('a baixa no grupo de VENDAS segue intocada', async (ctx) => {
+  configComPedidos();
+  respostas.bot_movimentar_estoque = {
+    status: 200,
+    body: {
+      resultados: [{
+        status: 'ok', direction: 'baixa', model: 'Elfbar 30000',
+        flavor: 'Cherry', qty: 2, stock_after: 8, sale_id: '77',
+      }],
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('-2 elfbar 30000 cherry'));
+  assert.ok(resp.text.includes('Baixa registrada'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {

@@ -514,29 +514,116 @@ async function marcarVendasAtacado(chatId, baixas) {
   return out;
 }
 
-function totaisPorModelo(produtos) {
-  const map = new Map();
-  for (const p of produtos) {
-    const modelo = p.modelo || '(sem modelo)';
-    map.set(modelo, (map.get(modelo) || 0) + p.qtd);
-  }
-  return map;
+// ---------------------------------------------------------------------------
+// Pods x acompanhamentos
+//
+// O estoque tem chiclete, Fini, Kitkat, essência, pilha — coisas que não são
+// pod. Somadas junto, o "total geral" vira um número que não serve pra decidir
+// compra nem pra conferir contagem.
+//
+// A lista vem de integration_config ('bot_nao_pods'), CSV: acompanhamento novo
+// é update no config, sem deploy. Um modelo é acompanhamento quando o NOME
+// contém qualquer uma das palavras.
+// ---------------------------------------------------------------------------
+
+// Rede de segurança pro config fora do ar: sem isso o /estoque voltaria a
+// somar tudo junto, calado, que é exatamente o problema que estamos tirando.
+const NAO_PODS_PADRAO = [
+  'fini', 'kitkat', 'trident', 'stikadinho', 'essencia', 'blvk',
+  'chocolate', 'bala', 'doce', 'pilha', 'carregador',
+];
+
+async function palavrasNaoPods() {
+  const csv = await lerConfig('bot_nao_pods');
+  const lista = csv.split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+  return lista.length ? lista : NAO_PODS_PADRAO;
 }
 
-async function handleEstoque(chatId) {
+function ehAcompanhamento(modelo, palavras) {
+  const nome = semAcento(String(modelo || '')).toLowerCase();
+  return palavras.some(p => nome.includes(semAcento(p).toLowerCase()));
+}
+
+// Sabores de um modelo na ordem de quem precisa de atenção: zerado primeiro,
+// depois o que está acabando, depois o resto. Ordenar por quantidade já dá
+// exatamente isso — e o nome desempata pra lista não dançar entre chamadas.
+function ordenarSabores(sabores) {
+  return [...sabores].sort((a, b) => a.qtd - b.qtd || a.sabor.localeCompare(b.sabor, 'pt-BR'));
+}
+
+function iconeSabor(qtd) {
+  if (qtd <= 0) return '❌ ';
+  if (qtd === 1) return '⚠️ ';
+  return '';
+}
+
+// Um bloco de texto por modelo. Blocos são a unidade da quebra em mensagens:
+// modelo cortado no meio é ilegível.
+function blocoModeloDetalhado(modelo, sabores) {
+  const total = sabores.reduce((s, p) => s + p.qtd, 0);
+  const linhas = [`📦 *${escapeMd(modelo)}* · ${total} un`];
+  for (const p of ordenarSabores(sabores)) {
+    linhas.push(`${iconeSabor(p.qtd)}${escapeMd(p.sabor)} · ${p.qtd}`);
+  }
+  return linhas.join('\n');
+}
+
+// Agrupa { modelo, sabor, qtd } por modelo, na ordem de maior total.
+function porModeloOrdenado(produtos) {
+  const mapa = new Map();
+  for (const p of produtos) {
+    const modelo = p.modelo || '(sem modelo)';
+    if (!mapa.has(modelo)) mapa.set(modelo, []);
+    mapa.get(modelo).push(p);
+  }
+  return [...mapa.entries()]
+    .map(([modelo, sabores]) => ({ modelo, sabores, total: sabores.reduce((s, x) => s + x.qtd, 0) }))
+    .sort((a, b) => b.total - a.total || a.modelo.localeCompare(b.modelo, 'pt-BR'));
+}
+
+// Linha única dos acompanhamentos: eles não entram na conta de pods, mas some
+// da tela também não pode — é estoque que alguém comprou.
+function linhaAcompanhamentos(grupos) {
+  if (!grupos.length) return null;
+  const total = grupos.reduce((s, g) => s + g.total, 0);
+  const itens = grupos.map(g => `${escapeMd(g.modelo)} ${g.total}`).join(' · ');
+  return `🍬 Acompanhamentos: ${itens} (total ${total})`;
+}
+
+async function handleEstoque(chatId, text) {
+  const arg = (text || '').trim().split(/\s+/)[1];
+  const detalhado = arg && /^detalhad|^detalhe/i.test(arg);
+
   const produtos = await readEstoque();
   if (!produtos.length) { await sendTelegram(chatId, '📦 Estoque vazio.'); return; }
-  const totais = totaisPorModelo(produtos);
-  const ordenado = [...totais.entries()].sort((a, b) => b[1] - a[1]);
-  const linhas = ['📦 *Estoque atual* (por modelo)', ''];
-  let totalGeral = 0;
-  for (const [modelo, total] of ordenado) {
-    const ico = total <= 0 ? '🔴' : total <= 5 ? '🟡' : '🟢';
-    linhas.push(`${ico} *${escapeMd(modelo)}*: ${total}`);
-    totalGeral += total;
+
+  const palavras = await palavrasNaoPods();
+  const grupos = porModeloOrdenado(produtos);
+  const pods = grupos.filter(g => !ehAcompanhamento(g.modelo, palavras));
+  const acomp = grupos.filter(g => ehAcompanhamento(g.modelo, palavras));
+  const totalPods = pods.reduce((s, g) => s + g.total, 0);
+
+  if (!detalhado) {
+    const linhas = ['📦 *Estoque atual* (por modelo)', ''];
+    for (const g of pods) {
+      const ico = g.total <= 0 ? '🔴' : g.total <= 5 ? '🟡' : '🟢';
+      linhas.push(`${ico} *${escapeMd(g.modelo)}*: ${g.total}`);
+    }
+    if (!pods.length) linhas.push('_Nenhum pod em estoque._');
+    linhas.push('', `🧮 Total de pods: *${totalPods}*`);
+    const acompLinha = linhaAcompanhamentos(acomp);
+    if (acompLinha) linhas.push('', acompLinha);
+    for (const parte of splitMessage(linhas.join('\n'))) await sendTelegram(chatId, parte);
+    return;
   }
-  linhas.push('', `🧮 Total geral: *${totalGeral}*`);
-  await sendTelegram(chatId, linhas.join('\n'));
+
+  const blocos = [`📦 *Estoque detalhado* · ${totalPods} pods`, ...pods.map(g => blocoModeloDetalhado(g.modelo, g.sabores))];
+  if (acomp.length) {
+    const totalAcomp = acomp.reduce((s, g) => s + g.total, 0);
+    blocos.push(`🍬 *Acompanhamentos* · ${totalAcomp} un`);
+    blocos.push(...acomp.map(g => blocoModeloDetalhado(g.modelo, g.sabores)));
+  }
+  for (const parte of dividirBlocos(blocos)) await sendTelegram(chatId, parte);
 }
 
 async function handleZerados(chatId) {
@@ -2487,7 +2574,7 @@ function parseValorArg(txt) {
   return Number.isFinite(v) && v > 0 ? Math.round(v * 100) / 100 : null;
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Ver estoque\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 23:30)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 23:30)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -2616,6 +2703,20 @@ app.post('/webhook', async (req, res) => {
     //                           (é o caso mais comum: o atendente manda a foto
     //                           já com a baixa escrita na legenda)
     //   legenda de comando   -> o comando manda; a foto é só anexo
+    // Grupos de PEDIDOS e FATURAMENTO são só de comando: não mexem em estoque
+    // nem em caixa. Sem esta barreira a baixa caía no galho do privado lá
+    // embaixo (`permitidas`) e era processada como se fosse o grupo de vendas.
+    const soComandos = isPedidos || isFaturamento;
+    const recusaSoComandos = isPedidos
+      ? '⛔ Esse grupo é só para montar pedido ao fornecedor. Baixa de estoque e comprovante vão no grupo de VENDAS.'
+      : '⛔ Esse grupo é só para os números do faturamento. Baixa de estoque e comprovante vão no grupo de VENDAS.';
+
+    // Foto sem legenda de comando nesses grupos: recusa em vez de sumir calado.
+    if (soComandos && arquivoComprovante(msg) && !cmd.startsWith('/')) {
+      await sendTelegram(chatId, recusaSoComandos);
+      return;
+    }
+
     const temComprovante = !!(isVendas && arquivoComprovante(msg));
     if (temComprovante && !text) {
       await handleComprovante(chatId, msg);
@@ -2650,6 +2751,10 @@ app.post('/webhook', async (req, res) => {
     // Movimentos com prefixo: cada grupo aceita só o seu sinal.
     //   VENDAS: só baixa (-). REPOSIÇÃO: só entrada (+). Privado: os dois.
     if (text.charAt(0) === '-' || text.charAt(0) === '+' || (controleAtacado && temItem)) {
+      // Antes de qualquer parsing: nesses grupos nada de movimento é aceito —
+      // nem baixa, nem entrada, nem despesa/dinheiro (que também usam "+").
+      if (soComandos) { await sendTelegram(chatId, recusaSoComandos); return; }
+
       const todas = linhasSemControle;
 
       // Despesa ("+25 ENTREGA"), dinheiro ("+100 DINHEIRO") e os estornos dos
@@ -2723,7 +2828,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     if (cmd === '/start' || cmd === '/ajuda') { await sendTelegram(chatId, AJUDA); return; }
-    if (cmd === '/estoque') { await handleEstoque(chatId); return; }
+    if (cmd === '/estoque') { await handleEstoque(chatId, text); return; }
     if (cmd === '/zerados') { await handleZerados(chatId); return; }
     if (cmd === '/baixo') { await handleBaixo(chatId); return; }
     // "/relatorio mes" é faturamento, não estoque — e por isso respeita o
@@ -2814,6 +2919,10 @@ module.exports = {
   app,
   readEstoque,
   handleEstoque,
+  palavrasNaoPods,
+  ehAcompanhamento,
+  ordenarSabores,
+  porModeloOrdenado,
   handleZerados,
   handleBaixo,
   handleRelatorio,
