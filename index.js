@@ -39,6 +39,7 @@ const COMANDOS = [
   '/chatid', '/setgrupopedidos', '/fornecedor', '/apelido', '/pedido',
   '/atacado', '/desatacado', '/caixa',
   '/setgrupofaturamento', '/faturamento', '/lembrete-teste',
+  '/setgrupotraducao', '/traduzir',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -2663,7 +2664,181 @@ async function handleLembreteTeste(chatId, from) {
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 23:30)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
+// ---------------------------------------------------------------------------
+// /traduzir — lista do fornecedor -> formato do grupo de REPOSIÇÃO
+//
+// O pedido volta do fornecedor com o modelo abreviado ("V500", "ICE KING 40k")
+// e o sabor escrito de qualquer jeito ("apppe peach ice"). O bot de estoque só
+// entende o nome exato, então hoje alguém digita tudo de novo à mão — que é
+// onde nascem os erros.
+//
+// SÓ TRADUZ TEXTO: não dá entrada, não mexe em estoque, não registra nada. A
+// entrada continua acontecendo quando alguém cola o resultado no grupo de
+// REPOSIÇÃO. Isso é de propósito: o passo de conferir antes de colar é o que
+// segura um nome traduzido errado.
+//
+// LEITURA sem depender de asterisco, dois-pontos ou emoji — nem sempre estão
+// lá. Linha que COMEÇA COM NÚMERO é sabor (o número é a quantidade); qualquer
+// outra linha é o MODELO, e vale até aparecer o próximo.
+// ---------------------------------------------------------------------------
+
+const CONFIG_GRUPO_TRADUCAO = 'telegram_grupo_traducao';
+
+async function chatTraducao() {
+  return (await lerConfig(CONFIG_GRUPO_TRADUCAO)).trim();
+}
+
+// Onde /traduzir vale: grupo de tradução, grupo de pedidos e privado do dono.
+function podeTraduzir(chatKey, isPrivadoLucas, traducaoId, pedidosId) {
+  if (isPrivadoLucas) return true;
+  if (traducaoId && String(chatKey) === String(traducaoId)) return true;
+  return !!pedidosId && String(chatKey) === String(pedidosId);
+}
+
+async function handleSetGrupoTraducao(chatId, text, from) {
+  if (!ehDono(from && from.id)) {
+    await sendTelegram(chatId, '⛔ Só o dono pode definir o grupo de tradução.');
+    return;
+  }
+  const arg = (text || '').trim().split(/\s+/)[1];
+  const alvo = arg ? arg.trim() : String(chatId);
+  if (!/^-?\d+$/.test(alvo)) {
+    await sendTelegram(chatId, 'Uso: /setgrupotraducao (no grupo desejado) ou /setgrupotraducao -1001234567890');
+    return;
+  }
+  const ok = await gravarConfig(CONFIG_GRUPO_TRADUCAO, alvo);
+  if (!ok) {
+    await sendTelegram(chatId, '⚠️ Não consegui gravar a configuração. Tente de novo em instantes.');
+    return;
+  }
+  await sendTelegram(chatId,
+    `✅ Grupo de tradução definido: \`${alvo}\`\nCole a lista do fornecedor aqui que eu devolvo no formato da reposição — nem precisa do /traduzir.`);
+}
+
+// "2 grape ice", "• 2 grape ice", "- 2 grape ice", "2x grape ice".
+const RE_LINHA_SABOR = /^[•*\-–—]?\s*(\d+)\s*x?\s*[-–—.:)]?\s+(\S.*)$/;
+// Sabor sem quantidade é raro, mas acontece ("grape ice" solto embaixo do
+// modelo). Vale 1 — deixar de fora seria perder item calado.
+const RE_SO_BULLET = /^[•*\-–—]\s*(\S.*)$/;
+
+// Tira marcador, dois-pontos do fim, asteriscos e emoji do nome do modelo.
+function limparModelo(linha) {
+  return limparNome(String(linha).replace(/^[•*\-–—]\s*/, '')).replace(/\s*:\s*$/, '').trim();
+}
+
+// Devolve [{ modelo, sabor, qtd }]. Sabor antes do primeiro modelo é
+// descartado: sem modelo não dá pra dizer de que produto ele é.
+function parseListaTraducao(texto) {
+  const itens = [];
+  let modelo = null;
+
+  for (const bruta of String(texto || '').split('\n')) {
+    const linha = bruta.trim();
+    if (!linha || RE_SEPARADOR.test(linha)) continue;
+
+    const mSabor = linha.match(RE_LINHA_SABOR);
+    if (mSabor) {
+      const qtd = parseInt(mSabor[1], 10);
+      const sabor = limparNome(mSabor[2]);
+      if (!modelo || !qtd || qtd <= 0 || !sabor) continue;
+      itens.push({ modelo, sabor, qtd });
+      continue;
+    }
+
+    // Bullet sem número embaixo de um modelo: sabor de quantidade 1.
+    const mBullet = modelo && linha.match(RE_SO_BULLET);
+    if (mBullet) {
+      const sabor = limparNome(mBullet[1]);
+      if (sabor && !ehRuidoFornecedor(linha, true)) itens.push({ modelo, sabor, qtd: 1 });
+      continue;
+    }
+
+    // Sobrou: é nome de modelo — a não ser que seja recado.
+    if (ehRuidoFornecedor(linha, false)) continue;
+    const nome = limparModelo(linha);
+    if (nome) modelo = nome;
+  }
+  return itens;
+}
+
+// Quebra as linhas em blocos de código de até `max`, sem cortar um item.
+// Bloco de código porque no celular um toque copia o conteúdo inteiro — e o
+// ponto do comando é justamente colar no outro grupo.
+function blocosCodigo(linhas, max = 3800) {
+  const blocos = [];
+  let buf = [];
+  let tam = 0;
+  for (const linha of linhas) {
+    // +1 da quebra de linha, +8 da cerca ```\n ... \n```
+    if (buf.length && tam + linha.length + 1 + 8 > max) {
+      blocos.push('```\n' + buf.join('\n') + '\n```');
+      buf = []; tam = 0;
+    }
+    buf.push(linha);
+    tam += linha.length + 1;
+  }
+  if (buf.length) blocos.push('```\n' + buf.join('\n') + '\n```');
+  return blocos;
+}
+
+const USO_TRADUZIR =
+  'Cole a lista do fornecedor junto com o comando:\n\n`/traduzir`\n`V500:`\n`2 green apple`\n`1 grape ice`';
+
+async function handleTraduzir(chatId, texto) {
+  const itens = parseListaTraducao(texto);
+  if (!itens.length) {
+    await sendTelegram(chatId, `🤔 Não achei nenhum item nessa lista.\n${USO_TRADUZIR}`);
+    return;
+  }
+
+  let r = null;
+  try {
+    r = await callRpc('bot_traduzir_lista', { p_token: BOT_SYNC_TOKEN, p_itens: itens });
+  } catch (err) {
+    console.error('bot_traduzir_lista:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC `bot_traduzir_lista` não existe no banco — falta rodar o SQL da tradução.'
+      : '⚠️ Erro ao traduzir a lista. Tente de novo em instantes.');
+    return;
+  }
+  if (!r || r.ok === false) {
+    await sendTelegram(chatId, `⚠️ ${(r && (r.erro || r.msg)) || 'Não consegui traduzir a lista.'}`);
+    return;
+  }
+
+  const reconhecidos = Array.isArray(r.itens) ? r.itens : [];
+  const faltantes = Array.isArray(r.faltantes) ? r.faltantes : [];
+
+  // Cabeçalho, blocos e rodapé saem em mensagens SEPARADAS: no Telegram um
+  // toque no bloco de código copia a mensagem toda, então tudo que não for
+  // lista de colar tem que ficar fora dele.
+  if (reconhecidos.length) {
+    const casaram = Number(r.casaram ?? reconhecidos.length) || 0;
+    const unidades = Number(r.unidades) || 0;
+    await sendTelegram(chatId,
+      `✅ *Lista pronta para o grupo de reposição*\n_${casaram} itens · ${unidades} unidades_`);
+
+    for (const bloco of blocosCodigo(reconhecidos.map(it => String(it.linha ?? '')).filter(Boolean))) {
+      await sendTelegram(chatId, bloco);
+    }
+  }
+
+  const rodape = [];
+  if (reconhecidos.length) rodape.push('_Copie o bloco acima e cole no grupo de REPOSIÇÃO._');
+  if (faltantes.length) {
+    if (rodape.length) rodape.push('');
+    rodape.push('⚠️ *Não reconheci estes (confira o nome ou cadastre o produto):*');
+    for (const f of faltantes) {
+      rodape.push(`${f.qtd ?? 1} ${escapeMd(String(f.modelo ?? ''))} · ${escapeMd(String(f.sabor ?? ''))}`);
+    }
+  }
+  if (!reconhecidos.length && !faltantes.length) {
+    rodape.push('🤔 A lista foi lida, mas nenhum item voltou traduzido. Confira os nomes.');
+  }
+  if (rodape.length) await sendTelegram(chatId, rodape.join('\n'));
+}
+
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 23:30)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -2778,18 +2953,24 @@ app.post('/webhook', async (req, res) => {
       if (ehDono(fromId)) { await handleSetGrupoFaturamento(chatId, text, msg.from); return; }
       return;
     }
+    if (cmd === '/setgrupotraducao') {
+      if (ehDono(fromId)) { await handleSetGrupoTraducao(chatId, text, msg.from); return; }
+      return;
+    }
 
     // Os dois grupos, o privado do Lucas e o grupo de pedidos são atendidos;
     // o resto é ignorado.
     const pedidosId = await chatPedidos();
     const faturamentoId = await chatFaturamento();
+    const traducaoId = await chatTraducao();
     const isVendas = chatKey === VENDAS_CHAT_ID;
     const isReposicao = chatKey === REPOSICAO_CHAT_ID;
     const isPrivadoLucas =
       msg.chat.type === 'private' && String(msg.from && msg.from.id) === LUCAS_USER_ID;
     const isPedidos = !!pedidosId && chatKey === String(pedidosId);
     const isFaturamento = !!faturamentoId && chatKey === String(faturamentoId);
-    if (!isVendas && !isReposicao && !isPrivadoLucas && !isPedidos && !isFaturamento) return;
+    const isTraducao = !!traducaoId && chatKey === String(traducaoId);
+    if (!isVendas && !isReposicao && !isPrivadoLucas && !isPedidos && !isFaturamento && !isTraducao) return;
 
     // Comprovante: foto/PDF no grupo de VENDAS.
     //   sem legenda          -> só o comprovante
@@ -2800,10 +2981,12 @@ app.post('/webhook', async (req, res) => {
     // Grupos de PEDIDOS e FATURAMENTO são só de comando: não mexem em estoque
     // nem em caixa. Sem esta barreira a baixa caía no galho do privado lá
     // embaixo (`permitidas`) e era processada como se fosse o grupo de vendas.
-    const soComandos = isPedidos || isFaturamento;
+    const soComandos = isPedidos || isFaturamento || isTraducao;
     const recusaSoComandos = isPedidos
       ? '⛔ Esse grupo é só para montar pedido ao fornecedor. Baixa de estoque e comprovante vão no grupo de VENDAS.'
-      : '⛔ Esse grupo é só para os números do faturamento. Baixa de estoque e comprovante vão no grupo de VENDAS.';
+      : isTraducao
+        ? '⛔ Esse grupo é só para traduzir a lista do fornecedor. Baixa de estoque e comprovante vão no grupo de VENDAS.'
+        : '⛔ Esse grupo é só para os números do faturamento. Baixa de estoque e comprovante vão no grupo de VENDAS.';
 
     // Foto sem legenda de comando nesses grupos: recusa em vez de sumir calado.
     if (soComandos && arquivoComprovante(msg) && !cmd.startsWith('/')) {
@@ -2832,6 +3015,15 @@ app.post('/webhook', async (req, res) => {
     // primeira delas cairia direto na rota de baixa de estoque.
     if (!cmd.startsWith('/') && consumirFornecedorPendente(chatKey, fromId, text)) {
       await handleFornecedor(chatId, text, msg.from);
+      return;
+    }
+
+    // No grupo de tradução, lista colada JÁ BASTA — é um grupo dedicado a isso.
+    // Vem antes da rota de movimento porque item em bullet ("- 2 grape ice")
+    // começa com "-" e cairia na baixa de estoque. Mensagem sem item nenhum
+    // segue o fluxo normal (conversa fica quieta, comando funciona).
+    if (isTraducao && !cmd.startsWith('/') && parseListaTraducao(text).length) {
+      await handleTraduzir(chatId, text);
       return;
     }
 
@@ -2947,6 +3139,14 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/refazerfechamento') { await handleRefazerFechamento(chatId, text, fromId); return; }
     if (cmd === '/atacado') { await handleAtacado(chatId, msg.from); return; }
     if (cmd === '/desatacado') { await handleDesatacado(chatId, msg.from); return; }
+    if (cmd === '/traduzir') {
+      if (!podeTraduzir(chatKey, isPrivadoLucas, traducaoId, pedidosId)) {
+        await sendTelegram(chatId, '📋 Esse comando é no grupo de tradução, no de pedidos ou no privado do dono.');
+        return;
+      }
+      await handleTraduzir(chatId, text.replace(/^\/traduzir(@\S+)?[ \t]*/i, ''));
+      return;
+    }
     if (cmd === '/caixa') { await handleCaixa(chatId, text, msg.from); return; }
     if (cmd === '/faturamento') {
       if (!faturamentoAqui) { await sendTelegram(chatId, '💰 Esse comando é no grupo de faturamento (ou no privado do dono).'); return; }
@@ -3073,6 +3273,11 @@ module.exports = {
   textosFaturamentoDetalhe,
   enviarFaturamentoDiario,
   CRON_FATURAMENTO,
+  chatTraducao,
+  podeTraduzir,
+  parseListaTraducao,
+  blocosCodigo,
+  handleTraduzir,
   destinosLembrete,
   enviarLembreteChips,
   handleLembreteTeste,

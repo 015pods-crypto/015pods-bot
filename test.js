@@ -2962,6 +2962,244 @@ teste('/lembrete-teste do funcionário é ignorado', async (ctx) => {
   assert.strictEqual(enviadas.length, 0, `não devia mandar nada: ${JSON.stringify(enviadas)}`);
 });
 
+// --- /traduzir -------------------------------------------------------------
+
+const GRUPO_TRADUCAO = -500;
+
+function configTraducao({ traducao = GRUPO_TRADUCAO, pedidos = GRUPO_PEDIDOS } = {}) {
+  respostas.bot_config = (body) => {
+    if (body.p_key === 'telegram_grupo_traducao') return { status: 200, body: { ok: true, valor: String(traducao || '') } };
+    if (body.p_key === 'telegram_grupo_pedidos') return { status: 200, body: { ok: true, valor: String(pedidos || '') } };
+    return { status: 200, body: { ok: true, valor: '' } };
+  };
+}
+
+// Lista real: modelo abreviado, com e sem asterisco, sabor escrito errado.
+const LISTA_FORNECEDOR = [
+  '*V500:*',
+  '2 green apple',
+  '2 kiwi acai',
+  '1 pineapple mango',
+  '',
+  'Dinner landy 20k:',
+  '2 apppe peach ice',
+  '1 grape ice',
+].join('\n');
+
+const TRADUCAO_OK = {
+  status: 200,
+  body: {
+    ok: true, casaram: 5, nao_casaram: 0, unidades: 8,
+    itens: [
+      { qtd: 2, modelo: 'Ignite 50000 (V500)', sabor: 'Green Apple', linha: '+2 Ignite 50000 (V500) Green Apple', mudou: true },
+      { qtd: 2, modelo: 'Ignite 50000 (V500)', sabor: 'Kiwi Acai', linha: '+2 Ignite 50000 (V500) Kiwi Acai', mudou: true },
+      { qtd: 1, modelo: 'Ignite 50000 (V500)', sabor: 'Pineapple Mango', linha: '+1 Ignite 50000 (V500) Pineapple Mango', mudou: true },
+      { qtd: 2, modelo: 'Dinner Lady Luma 20000', sabor: 'Apple Peach Ice', linha: '+2 Dinner Lady Luma 20000 Apple Peach Ice', mudou: true },
+      { qtd: 1, modelo: 'Dinner Lady Luma 20000', sabor: 'Grape Ice', linha: '+1 Dinner Lady Luma 20000 Grape Ice', mudou: true },
+    ],
+    faltantes: [],
+  },
+};
+
+teste('parser lê modelo abreviado e sabores com quantidade', async (ctx) => {
+  assert.deepStrictEqual(ctx.mod.parseListaTraducao(LISTA_FORNECEDOR), [
+    { modelo: 'V500', sabor: 'green apple', qtd: 2 },
+    { modelo: 'V500', sabor: 'kiwi acai', qtd: 2 },
+    { modelo: 'V500', sabor: 'pineapple mango', qtd: 1 },
+    { modelo: 'Dinner landy 20k', sabor: 'apppe peach ice', qtd: 2 },
+    { modelo: 'Dinner landy 20k', sabor: 'grape ice', qtd: 1 },
+  ]);
+});
+
+// O ponto do parser: não depender de asterisco, dois-pontos nem emoji.
+teste('parser funciona sem asterisco, sem dois-pontos e com marcador', async (ctx) => {
+  const itens = ctx.mod.parseListaTraducao(
+    'ICE KING 40k\n• 2 grape ice\n- 3 mint\n1 blueberry',
+  );
+  assert.deepStrictEqual(itens, [
+    { modelo: 'ICE KING 40k', sabor: 'grape ice', qtd: 2 },
+    { modelo: 'ICE KING 40k', sabor: 'mint', qtd: 3 },
+    { modelo: 'ICE KING 40k', sabor: 'blueberry', qtd: 1 },
+  ]);
+});
+
+teste('parser descarta ruído, separador e sabor órfão', async (ctx) => {
+  const itens = ctx.mod.parseListaTraducao(
+    '━━━━━━━━\n📣 RECADOS AOS CLIENTES\n2 orfao sem modelo antes\nV500\n2 grape ice\n🔥 PROMOÇÃO: leve 10',
+  );
+  assert.deepStrictEqual(itens, [{ modelo: 'V500', sabor: 'grape ice', qtd: 2 }]);
+});
+
+teste('sabor em bullet sem quantidade vale 1', async (ctx) => {
+  assert.deepStrictEqual(ctx.mod.parseListaTraducao('V500\n• grape ice'), [
+    { modelo: 'V500', sabor: 'grape ice', qtd: 1 },
+  ]);
+});
+
+teste('/traduzir devolve a lista pronta, em bloco de código separado', async (ctx) => {
+  configTraducao();
+  respostas.bot_traduzir_lista = TRADUCAO_OK;
+
+  await mandar(ctx.webhook, update(`/traduzir\n${LISTA_FORNECEDOR}`, { chat: GRUPO_TRADUCAO }));
+  await new Promise(r => setTimeout(r, 250));
+
+  // Os itens vão pra RPC com o texto do fornecedor, sem tradução local.
+  const rpc = chamadas.filter(c => c.fn === 'bot_traduzir_lista');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_itens.length, 5);
+  assert.deepStrictEqual(rpc[0].body.p_itens[0], { modelo: 'V500', sabor: 'green apple', qtd: 2 });
+
+  const cabecalho = enviadas.find(e => e.text.includes('Lista pronta'));
+  assert.ok(cabecalho, JSON.stringify(enviadas));
+  assert.ok(cabecalho.text.includes('_5 itens · 8 unidades_'), cabecalho.text);
+
+  // O bloco de código tem que estar SOZINHO na mensagem: no celular um toque
+  // copia a mensagem inteira.
+  const bloco = enviadas.find(e => e.text.startsWith('```'));
+  assert.ok(bloco, JSON.stringify(enviadas.map(e => e.text)));
+  assert.ok(bloco.text.includes('+2 Ignite 50000 (V500) Green Apple'), bloco.text);
+  assert.ok(bloco.text.includes('+1 Dinner Lady Luma 20000 Grape Ice'), bloco.text);
+  assert.ok(!bloco.text.includes('Lista pronta'), 'o cabeçalho não pode entrar no bloco');
+  assert.ok(!bloco.text.includes('Copie o bloco'), 'o rodapé não pode entrar no bloco');
+
+  const rodape = enviadas.find(e => e.text.includes('Copie o bloco acima'));
+  assert.ok(rodape, 'faltou o rodapé');
+});
+
+// SÓ TRADUZ: não pode encostar em estoque.
+teste('/traduzir não dá entrada nem mexe no estoque', async (ctx) => {
+  configTraducao();
+  respostas.bot_traduzir_lista = TRADUCAO_OK;
+  await mandar(ctx.webhook, update(`/traduzir\n${LISTA_FORNECEDOR}`, { chat: GRUPO_TRADUCAO }));
+  await new Promise(r => setTimeout(r, 250));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('itens não reconhecidos saem listados no fim', async (ctx) => {
+  configTraducao();
+  respostas.bot_traduzir_lista = {
+    status: 200,
+    body: {
+      ok: true, casaram: 1, nao_casaram: 2, unidades: 2,
+      itens: [{ qtd: 2, linha: '+2 Ignite 50000 (V500) Green Apple' }],
+      faltantes: [
+        { qtd: 2, modelo: 'S200 SLIM', sabor: 'grape ice', achou_modelo: false },
+        { qtd: 1, modelo: 'BC PRO 40k', sabor: 'clear', achou_modelo: false },
+      ],
+    },
+  };
+  await mandar(ctx.webhook, update(`/traduzir\nV500\n2 green apple`, { chat: GRUPO_TRADUCAO }));
+  await new Promise(r => setTimeout(r, 250));
+
+  const aviso = enviadas.find(e => e.text.includes('Não reconheci'));
+  assert.ok(aviso, JSON.stringify(enviadas.map(e => e.text)));
+  assert.ok(aviso.text.includes('2 S200 SLIM · grape ice'), aviso.text);
+  assert.ok(aviso.text.includes('1 BC PRO 40k · clear'), aviso.text);
+});
+
+teste('lista sem item nenhum explica o uso', async (ctx) => {
+  configTraducao();
+  const [resp] = await mandar(ctx.webhook, update('/traduzir bom dia', { chat: GRUPO_TRADUCAO }));
+  assert.ok(resp.text.includes('Não achei nenhum item'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_traduzir_lista').length, 0);
+});
+
+// --- Grupo dedicado: lista colada já basta --------------------------------
+
+teste('lista solta no grupo de tradução é traduzida sem o comando', async (ctx) => {
+  configTraducao();
+  respostas.bot_traduzir_lista = TRADUCAO_OK;
+  await mandar(ctx.webhook, update(LISTA_FORNECEDOR, { chat: GRUPO_TRADUCAO }));
+  await new Promise(r => setTimeout(r, 250));
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_traduzir_lista').length, 1);
+  assert.ok(enviadas.some(e => e.text.startsWith('```')), JSON.stringify(enviadas.map(e => e.text)));
+});
+
+// Item em bullet começa com "-": sem a rota da tradução vir antes, cairia
+// direto na baixa de estoque.
+teste('lista com marcador "-" não vira baixa de estoque', async (ctx) => {
+  configTraducao();
+  respostas.bot_traduzir_lista = TRADUCAO_OK;
+  await mandar(ctx.webhook, update('ICE KING 40k\n- 2 grape ice\n- 3 mint', { chat: GRUPO_TRADUCAO }));
+  await new Promise(r => setTimeout(r, 250));
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0,
+    'marcador "-" não podia virar baixa');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_traduzir_lista').length, 1);
+});
+
+teste('conversa solta no grupo de tradução é ignorada', async (ctx) => {
+  configTraducao();
+  await mandar(ctx.webhook, update('bom dia pessoal', { chat: GRUPO_TRADUCAO }), { esperaResposta: false });
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_traduzir_lista').length, 0);
+  assert.strictEqual(enviadas.length, 0, JSON.stringify(enviadas));
+});
+
+teste('grupo de tradução não aceita baixa, entrada nem comprovante', async (ctx) => {
+  configTraducao();
+  const [baixa] = await mandar(ctx.webhook, update('+2 elfbar 30000 cherry', { chat: GRUPO_TRADUCAO }));
+  assert.ok(baixa.text.includes('só para traduzir a lista'), baixa.text);
+
+  const [foto] = await mandar(ctx.webhook, updateArquivo({ chat: GRUPO_TRADUCAO }));
+  assert.ok(foto.text.includes('só para traduzir a lista'), foto.text);
+
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+  assert.strictEqual(chamadasGemini.length, 0);
+});
+
+teste('/traduzir vale no grupo de pedidos e no privado do dono', async (ctx) => {
+  configTraducao();
+  respostas.bot_traduzir_lista = TRADUCAO_OK;
+
+  await mandar(ctx.webhook, update('/traduzir\nV500\n2 green apple', { chat: GRUPO_PEDIDOS }));
+  await new Promise(r => setTimeout(r, 200));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_traduzir_lista').length, 1);
+
+  await mandar(ctx.webhook, update('/traduzir\nV500\n2 green apple', { chat: DONO, tipo: 'private' }));
+  await new Promise(r => setTimeout(r, 200));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_traduzir_lista').length, 2);
+});
+
+teste('/traduzir é recusado no grupo de VENDAS', async (ctx) => {
+  configTraducao();
+  const [resp] = await mandar(ctx.webhook, update('/traduzir\nV500\n2 green apple'));
+  assert.ok(resp.text.includes('grupo de tradução'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_traduzir_lista').length, 0);
+});
+
+teste('/setgrupotraducao grava a chave', async (ctx) => {
+  respostas.bot_config_set = { status: 200, body: { ok: true } };
+  const [resp] = await mandar(ctx.webhook, update('/setgrupotraducao', { chat: GRUPO_TRADUCAO }));
+  const rpc = chamadas.filter(c => c.fn === 'bot_config_set');
+  assert.strictEqual(rpc[0].body.p_key, 'telegram_grupo_traducao');
+  assert.strictEqual(rpc[0].body.p_valor, String(GRUPO_TRADUCAO));
+  assert.ok(resp.text.includes('Grupo de tradução definido'), resp.text);
+});
+
+teste('lista longa quebra em vários blocos, sem cortar item', async (ctx) => {
+  const linhas = [];
+  for (let i = 0; i < 200; i++) linhas.push(`+2 MODELO BEM COMPRIDO NUMERO ${i} Sabor Bem Comprido ${i}`);
+  const blocos = ctx.mod.blocosCodigo(linhas);
+
+  assert.ok(blocos.length > 1, `devia quebrar: ${blocos.length}`);
+  for (const b of blocos) {
+    assert.ok(b.length <= 4096, `passou de 4096: ${b.length}`);
+    assert.ok(b.startsWith('```') && b.endsWith('```'), b.slice(0, 20));
+  }
+  // Nenhum item pode sumir nem ser cortado no meio.
+  const juntos = blocos.join('\n').split('\n').filter(l => l.startsWith('+2 MODELO'));
+  assert.strictEqual(juntos.length, 200);
+});
+
+teste('RPC de tradução ausente diz qual SQL falta', async (ctx) => {
+  configTraducao();
+  respostas.bot_traduzir_lista = { status: 404, body: { message: 'Could not find the function' } };
+  const [resp] = await mandar(ctx.webhook, update('/traduzir\nV500\n2 green apple', { chat: GRUPO_TRADUCAO }));
+  assert.ok(resp.text.includes('bot_traduzir_lista'), resp.text);
+  assert.ok(resp.text.includes('falta rodar o SQL'), resp.text);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {

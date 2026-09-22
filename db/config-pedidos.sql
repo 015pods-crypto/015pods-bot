@@ -36,6 +36,7 @@ as $$
   select array[
     'telegram_grupo_pedidos',     -- id do grupo de pedidos (/setgrupopedidos)
     'telegram_grupo_faturamento', -- id do grupo de faturamento (/setgrupofaturamento)
+    'telegram_grupo_traducao',    -- id do grupo de tradução (/setgrupotraducao)
     'bot_despesa_palavras',       -- CSV das palavras de despesa (+25 ENTREGA)
     'bot_nao_pods',               -- modelos que não são pod (/estoque)
     'bot_lembrete_chips'          -- data do último lembrete dos chips (dia 20)
@@ -107,6 +108,7 @@ grant execute on function public.bot_config_set(text, text, text) to anon, authe
 -- Tem que vir ok:true em todas estas:
 --   select public.bot_config('<TOKEN>', 'telegram_grupo_pedidos');
 --   select public.bot_config('<TOKEN>', 'telegram_grupo_faturamento');
+--   select public.bot_config('<TOKEN>', 'telegram_grupo_traducao');
 --   select public.bot_config('<TOKEN>', 'bot_despesa_palavras');
 --   select public.bot_config('<TOKEN>', 'bot_nao_pods');
 --   select public.bot_config('<TOKEN>', 'bot_lembrete_chips');
