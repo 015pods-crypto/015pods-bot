@@ -38,7 +38,7 @@ const COMANDOS = [
   '/anular', '/desanular', '/adicionar', '/refazerfechamento', '/versao',
   '/chatid', '/setgrupopedidos', '/fornecedor', '/apelido', '/pedido',
   '/atacado', '/desatacado', '/caixa',
-  '/setgrupofaturamento', '/faturamento',
+  '/setgrupofaturamento', '/faturamento', '/lembrete-teste',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -229,6 +229,7 @@ function _resetEstadoTeste() {
   fornecedorPendente.clear();
   ultimaMarcacao.clear();
   caixaListado.clear();
+  lembreteChipsEnviado = '';
 }
 
 // `palavras` é a lista já resolvida (o parser é síncrono de propósito: o
@@ -2574,6 +2575,94 @@ function parseValorArg(txt) {
   return Number.isFinite(v) && v > 0 ? Math.round(v * 100) / 100 : null;
 }
 
+// ---------------------------------------------------------------------------
+// Lembrete mensal dos chips (dia 20, 10:00)
+//
+// O Telegram não deixa o bot listar os grupos em que está, então os destinos
+// são esta lista de ids conhecidos. Os dois grupos novos vêm da config, e não
+// hardcoded, pra que um grupo reconfigurado entre sozinho no lembrete.
+//
+// DISPARA UMA VEZ SÓ: a data do último envio fica gravada na config, então
+// reinício do Render no dia 20 não repete a mensagem. O cron roda de hora em
+// hora (não só às 10:00) porque o contrário também é problema: se o serviço
+// estiver dormindo ou em deploy exatamente às 10:00, o node-cron não dispara
+// atrasado e o lembrete se perde por um MÊS. Da segunda hora em diante a trava
+// faz o disparo virar no-op.
+// ---------------------------------------------------------------------------
+
+const LEMBRETE_CHIPS = '📱 *Recarregar os CHIPS de telefone!!!*';
+const CONFIG_LEMBRETE_CHIPS = 'bot_lembrete_chips';
+const CRON_LEMBRETE_CHIPS = '0 10-23 20 * *';
+
+// Espelho em memória da data gravada. Segura a repetição de hora em hora
+// mesmo quando a config não pode ser gravada (chave fora da lista branca, banco
+// fora do ar): aí o pior caso é repetir depois de um restart, não 14 vezes.
+let lembreteChipsEnviado = '';
+
+// Todos os destinos conhecidos, sem repetir. O privado do dono entra junto: é
+// o único que não é grupo, e o dono também precisa do lembrete.
+async function destinosLembrete() {
+  const ids = [
+    ADMIN_USER_ID,
+    VENDAS_CHAT_ID,
+    REPOSICAO_CHAT_ID,
+    await chatPedidos(),
+    await chatFaturamento(),
+  ];
+  return [...new Set(ids.map(x => String(x || '').trim()).filter(Boolean))];
+}
+
+// Manda pra todos. Uma falha não derruba as outras — perder um destino é ruim,
+// perder os cinco por causa de um é pior.
+async function enviarParaTodos(texto) {
+  const destinos = await destinosLembrete();
+  const ok = [];
+  for (const destino of destinos) {
+    try {
+      await sendTelegram(destino, texto);
+      ok.push(destino);
+    } catch (err) {
+      console.error(`lembrete: falhou para ${destino}:`, err.message);
+    }
+  }
+  return { destinos, ok };
+}
+
+// Roda de hora em hora no dia 20; só o primeiro do dia manda de verdade.
+async function enviarLembreteChips() {
+  const hoje = hojeISO();
+  if (lembreteChipsEnviado === hoje) return false;
+
+  // A config é a trava que sobrevive a restart; a memória sozinha não sabe o
+  // que uma instância anterior já fez.
+  const gravado = (await lerConfig(CONFIG_LEMBRETE_CHIPS)).trim();
+  if (gravado === hoje) { lembreteChipsEnviado = hoje; return false; }
+
+  const { destinos, ok } = await enviarParaTodos(LEMBRETE_CHIPS);
+  // Marca ANTES de conferir se gravou: o que não pode acontecer é mandar de
+  // novo daqui a uma hora porque a escrita falhou.
+  lembreteChipsEnviado = hoje;
+  const gravou = await gravarConfig(CONFIG_LEMBRETE_CHIPS, hoje);
+  if (!gravou) {
+    console.error(`lembrete chips: não consegui gravar ${CONFIG_LEMBRETE_CHIPS} — a trava vale só até o próximo restart`);
+  }
+  console.log(`lembrete chips enviado para ${ok.length}/${destinos.length} destinos`);
+  return true;
+}
+
+// /lembrete-teste — dispara na hora, pra conferir os destinos sem esperar o
+// dia 20. NÃO mexe na trava: testar no dia 20 não pode cancelar o lembrete
+// de verdade.
+async function handleLembreteTeste(chatId, from) {
+  if (!ehDono(from && from.id)) return;
+  const { destinos, ok } = await enviarParaTodos(LEMBRETE_CHIPS);
+  const falhas = destinos.filter(d => !ok.includes(d));
+  const linhas = [`🧪 Lembrete de teste enviado para *${ok.length}* de ${destinos.length} destino(s).`];
+  if (falhas.length) linhas.push(`⚠️ Não entregou em: ${falhas.map(d => `\`${d}\``).join(', ')}`);
+  linhas.push('_A trava do dia 20 não foi tocada._');
+  await sendTelegram(chatId, linhas.join('\n'));
+}
+
 const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 23:30)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
@@ -2618,6 +2707,11 @@ cron.schedule('59 23 * * *', async () => {
 cron.schedule(CRON_FATURAMENTO, async () => {
   try { await enviarFaturamentoDiario(); }
   catch (err) { console.error('Erro no faturamento diário:', err); }
+}, { timezone: 'America/Sao_Paulo' });
+
+cron.schedule(CRON_LEMBRETE_CHIPS, async () => {
+  try { await enviarLembreteChips(); }
+  catch (err) { console.error('Erro no lembrete dos chips:', err); }
 }, { timezone: 'America/Sao_Paulo' });
 
 cron.schedule('0 0 * * *', () => {
@@ -2859,6 +2953,12 @@ app.post('/webhook', async (req, res) => {
       await handleFaturamento(chatId, text);
       return;
     }
+    // Aceita as duas grafias: o autocomplete do Telegram não oferece comando
+    // com hífen, e quem lembra do nome digita do jeito que quiser.
+    if (cmd === '/lembrete-teste' || cmd === '/lembreteteste') {
+      await handleLembreteTeste(chatId, msg.from);
+      return;
+    }
     if (cmd === '/versao') { await handleVersao(chatId, fromId); return; }
 
     // Pedidos: só no grupo de pedidos e no privado do dono (enquanto a chave
@@ -2973,6 +3073,11 @@ module.exports = {
   textosFaturamentoDetalhe,
   enviarFaturamentoDiario,
   CRON_FATURAMENTO,
+  destinosLembrete,
+  enviarLembreteChips,
+  handleLembreteTeste,
+  LEMBRETE_CHIPS,
+  CRON_LEMBRETE_CHIPS,
   parseValorArg,
   handleCaixaCorrigir,
   nomeAutor,

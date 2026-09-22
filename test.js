@@ -2823,6 +2823,145 @@ teste('a baixa no grupo de VENDAS segue intocada', async (ctx) => {
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1);
 });
 
+// --- Lembrete mensal dos chips ---------------------------------------------
+
+// Config com os dois grupos configuráveis e a trava do lembrete vazia.
+function configLembrete({ pedidos = -400, faturamento = -300, ultimo = '' } = {}) {
+  respostas.bot_config = (body) => {
+    if (body.p_key === 'telegram_grupo_pedidos') return { status: 200, body: { ok: true, valor: String(pedidos || '') } };
+    if (body.p_key === 'telegram_grupo_faturamento') return { status: 200, body: { ok: true, valor: String(faturamento || '') } };
+    if (body.p_key === 'bot_lembrete_chips') return { status: 200, body: { ok: true, valor: ultimo } };
+    return { status: 200, body: { ok: true, valor: '' } };
+  };
+}
+
+teste('o lembrete vai pros cinco destinos conhecidos', async (ctx) => {
+  configLembrete();
+  respostas.bot_config_set = { status: 200, body: { ok: true } };
+
+  const enviou = await ctx.mod.enviarLembreteChips();
+  assert.strictEqual(enviou, true);
+
+  const destinos = enviadas.map(e => String(e.chat_id)).sort();
+  assert.deepStrictEqual(destinos, ['-100', '-200', '-300', '-400', '111'].sort(),
+    `destinos errados: ${JSON.stringify(destinos)}`);
+  for (const e of enviadas) {
+    assert.strictEqual(e.text, '📱 *Recarregar os CHIPS de telefone!!!*', e.text);
+  }
+});
+
+teste('grupo não configurado é pulado, sem quebrar o resto', async (ctx) => {
+  configLembrete({ pedidos: '', faturamento: '' });
+  respostas.bot_config_set = { status: 200, body: { ok: true } };
+
+  await ctx.mod.enviarLembreteChips();
+  const destinos = enviadas.map(e => String(e.chat_id)).sort();
+  assert.deepStrictEqual(destinos, ['-100', '-200', '111'].sort(), JSON.stringify(destinos));
+});
+
+teste('destino repetido não recebe duas vezes', async (ctx) => {
+  // Alguém aponta o grupo de faturamento pro de vendas por engano.
+  configLembrete({ faturamento: -100 });
+  respostas.bot_config_set = { status: 200, body: { ok: true } };
+
+  await ctx.mod.enviarLembreteChips();
+  const vendas = enviadas.filter(e => String(e.chat_id) === '-100');
+  assert.strictEqual(vendas.length, 1, 'mandou repetido pro mesmo chat');
+});
+
+// O ponto da trava: o cron roda de hora em hora no dia 20.
+teste('roda de novo no mesmo dia e NÃO manda de novo', async (ctx) => {
+  configLembrete();
+  respostas.bot_config_set = { status: 200, body: { ok: true } };
+
+  await ctx.mod.enviarLembreteChips();
+  const quantas = enviadas.length;
+  assert.strictEqual(await ctx.mod.enviarLembreteChips(), false);
+  assert.strictEqual(enviadas.length, quantas, 'não podia mandar de novo');
+});
+
+teste('grava a data do envio na config', async (ctx) => {
+  configLembrete();
+  respostas.bot_config_set = { status: 200, body: { ok: true } };
+  await ctx.mod.enviarLembreteChips();
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_config_set' && c.body.p_key === 'bot_lembrete_chips');
+  assert.strictEqual(rpc.length, 1);
+  assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(rpc[0].body.p_valor), rpc[0].body.p_valor);
+});
+
+// Reinício do Render no dia 20 não pode repetir a mensagem: a memória zera,
+// mas a config lembra.
+teste('data já gravada segura o envio mesmo com a memória zerada', async (ctx) => {
+  const hoje = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+  configLembrete({ ultimo: hoje });
+
+  assert.strictEqual(await ctx.mod.enviarLembreteChips(), false);
+  assert.strictEqual(enviadas.length, 0, `não podia mandar nada: ${JSON.stringify(enviadas)}`);
+});
+
+// Sem a chave na lista branca, a gravação falha. O lembrete ainda sai UMA vez
+// (e não uma por hora), porque a memória segura dentro do mesmo processo.
+teste('config que não grava não faz o lembrete repetir de hora em hora', async (ctx) => {
+  configLembrete();
+  respostas.bot_config_set = { status: 200, body: { ok: false, erro: 'chave não permitida para escrita' } };
+
+  assert.strictEqual(await ctx.mod.enviarLembreteChips(), true);
+  const quantas = enviadas.length;
+  assert.ok(quantas > 0, 'o lembrete tem que sair mesmo sem conseguir gravar');
+  assert.strictEqual(await ctx.mod.enviarLembreteChips(), false);
+  assert.strictEqual(enviadas.length, quantas);
+});
+
+teste('o lembrete é agendado de hora em hora no dia 20', async (ctx) => {
+  // 10h às 23h do dia 20: se o serviço estiver dormindo às 10:00, o node-cron
+  // não dispara atrasado e o lembrete se perderia por um mês.
+  assert.strictEqual(ctx.mod.CRON_LEMBRETE_CHIPS, '0 10-23 20 * *');
+});
+
+// --- /lembrete-teste -------------------------------------------------------
+
+teste('/lembrete-teste dispara na hora pra todos e confirma pro dono', async (ctx) => {
+  configLembrete();
+  const [primeira] = await mandar(ctx.webhook, update('/lembrete-teste'));
+  await new Promise(r => setTimeout(r, 200));
+
+  const lembretes = enviadas.filter(e => e.text === '📱 *Recarregar os CHIPS de telefone!!!*');
+  assert.strictEqual(lembretes.length, 5, `devia ir pros 5 destinos: ${lembretes.length}`);
+
+  const confirmacao = enviadas.find(e => e.text.includes('Lembrete de teste'));
+  assert.ok(confirmacao, 'faltou confirmar pro dono');
+  assert.ok(confirmacao.text.includes('5* de 5'), confirmacao.text);
+  assert.ok(primeira, 'alguma resposta tinha que sair');
+});
+
+// Testar no dia 20 não pode cancelar o lembrete de verdade.
+teste('/lembrete-teste não mexe na trava do dia 20', async (ctx) => {
+  configLembrete();
+  respostas.bot_config_set = { status: 200, body: { ok: true } };
+
+  await mandar(ctx.webhook, update('/lembrete-teste'));
+  await new Promise(r => setTimeout(r, 200));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_config_set').length, 0,
+    'o teste não pode gravar a data do envio');
+
+  // E o lembrete de verdade ainda sai depois.
+  assert.strictEqual(await ctx.mod.enviarLembreteChips(), true);
+});
+
+teste('/lembreteteste (sem hífen) também funciona', async (ctx) => {
+  configLembrete();
+  await mandar(ctx.webhook, update('/lembreteteste'));
+  await new Promise(r => setTimeout(r, 200));
+  assert.ok(enviadas.some(e => e.text.includes('CHIPS')), JSON.stringify(enviadas));
+});
+
+teste('/lembrete-teste do funcionário é ignorado', async (ctx) => {
+  configLembrete();
+  await mandar(ctx.webhook, update('/lembrete-teste', { from: FUNCIONARIO }), { esperaResposta: false });
+  assert.strictEqual(enviadas.length, 0, `não devia mandar nada: ${JSON.stringify(enviadas)}`);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {
