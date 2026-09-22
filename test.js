@@ -3200,6 +3200,135 @@ teste('RPC de tradução ausente diz qual SQL falta', async (ctx) => {
   assert.ok(resp.text.includes('falta rodar o SQL'), resp.text);
 });
 
+// --- Lista espremida: vários sabores por linha ----------------------------
+//
+// Colando do WhatsApp pro Telegram as quebras de linha se perdem. É o formato
+// que chega de verdade.
+
+const LISTA_ESPREMIDA = [
+  'S200 SLIM:',
+  '2 grape ice 2 strawberry banana 2 pineapple mango 2 strawberry watermelon',
+  'BC10k TOUCH: 2 blueberry watermelon 2 ruby raspberry 2 OMG 1 citrus grape',
+  'V300:',
+  '2 cactus lime soda 2 banana coconut watermelon',
+].join('\n');
+
+teste('lista espremida: vários sabores na mesma linha viram itens separados', async (ctx) => {
+  assert.deepStrictEqual(ctx.mod.parseListaTraducao(LISTA_ESPREMIDA), [
+    { modelo: 'S200 SLIM', sabor: 'grape ice', qtd: 2 },
+    { modelo: 'S200 SLIM', sabor: 'strawberry banana', qtd: 2 },
+    { modelo: 'S200 SLIM', sabor: 'pineapple mango', qtd: 2 },
+    { modelo: 'S200 SLIM', sabor: 'strawberry watermelon', qtd: 2 },
+    { modelo: 'BC10k TOUCH', sabor: 'blueberry watermelon', qtd: 2 },
+    { modelo: 'BC10k TOUCH', sabor: 'ruby raspberry', qtd: 2 },
+    { modelo: 'BC10k TOUCH', sabor: 'OMG', qtd: 2 },
+    { modelo: 'BC10k TOUCH', sabor: 'citrus grape', qtd: 1 },
+    { modelo: 'V300', sabor: 'cactus lime soda', qtd: 2 },
+    { modelo: 'V300', sabor: 'banana coconut watermelon', qtd: 2 },
+  ]);
+});
+
+// O teste que o enunciado pede: espremido e um-por-linha têm que dar igual.
+teste('espremida e um-item-por-linha dão exatamente o mesmo resultado', async (ctx) => {
+  const porLinha = [
+    'S200 SLIM:',
+    '2 grape ice',
+    '2 strawberry banana',
+    '2 pineapple mango',
+    '2 strawberry watermelon',
+    'BC10k TOUCH:',
+    '2 blueberry watermelon',
+    '2 ruby raspberry',
+    '2 OMG',
+    '1 citrus grape',
+    'V300:',
+    '2 cactus lime soda',
+    '2 banana coconut watermelon',
+  ].join('\n');
+
+  assert.deepStrictEqual(
+    ctx.mod.parseListaTraducao(LISTA_ESPREMIDA),
+    ctx.mod.parseListaTraducao(porLinha),
+  );
+});
+
+teste('modelo junto dos itens na mesma linha, com dois-pontos', async (ctx) => {
+  assert.deepStrictEqual(ctx.mod.parseListaTraducao('BC10k TOUCH: 2 blueberry watermelon 2 OMG'), [
+    { modelo: 'BC10k TOUCH', sabor: 'blueberry watermelon', qtd: 2 },
+    { modelo: 'BC10k TOUCH', sabor: 'OMG', qtd: 2 },
+  ]);
+});
+
+// O "+" faz parte do nome do primeiro sabor, não separa os itens.
+teste('"2 peach + 2 cherry strazz" mantém o + no nome do sabor', async (ctx) => {
+  assert.deepStrictEqual(ctx.mod.parseListaTraducao('V500\n2 peach + 2 cherry strazz'), [
+    { modelo: 'V500', sabor: 'peach +', qtd: 2 },
+    { modelo: 'V500', sabor: 'cherry strazz', qtd: 2 },
+  ]);
+});
+
+teste('sabor curto grudado no próximo número não junta os dois', async (ctx) => {
+  assert.deepStrictEqual(ctx.mod.parseListaTraducao('BC10k\n2 OMG 1 citrus grape'), [
+    { modelo: 'BC10k', sabor: 'OMG', qtd: 2 },
+    { modelo: 'BC10k', sabor: 'citrus grape', qtd: 1 },
+  ]);
+});
+
+// Nome de modelo com número no meio não pode ser confundido com item: a regra
+// é começar com número, não conter número.
+teste('modelo com número no meio continua sendo modelo', async (ctx) => {
+  for (const nome of ['BC10k TOUCH', 'V300 slim', 'ICE KING 40k']) {
+    assert.deepStrictEqual(ctx.mod.parseListaTraducao(`${nome}\n2 grape ice`), [
+      { modelo: nome, sabor: 'grape ice', qtd: 2 },
+    ], nome);
+  }
+});
+
+teste('formatação do Telegram não muda a leitura', async (ctx) => {
+  const comAsterisco = ctx.mod.parseListaTraducao('*S200 SLIM:*\n2 grape ice 2 OMG');
+  const sem = ctx.mod.parseListaTraducao('S200 SLIM:\n2 grape ice 2 OMG');
+  assert.deepStrictEqual(comAsterisco, sem);
+  assert.strictEqual(comAsterisco[0].modelo, 'S200 SLIM');
+});
+
+// "PROMOÇÃO: leve 10 por R$ 250" tem dois-pontos e viraria um modelo com um
+// item de 10 unidades.
+teste('recado com dois-pontos não vira modelo nem item', async (ctx) => {
+  const itens = ctx.mod.parseListaTraducao(
+    'V500:\n2 grape ice\n🔥 PROMOÇÃO: leve 10 por R$ 250\n📣 RECADOS: confira\n2 kiwi acai',
+  );
+  assert.deepStrictEqual(itens, [
+    { modelo: 'V500', sabor: 'grape ice', qtd: 2 },
+    { modelo: 'V500', sabor: 'kiwi acai', qtd: 2 },
+  ]);
+});
+
+// A regex nova é global: sem instância nova por trecho, o lastIndex vazaria e
+// a segunda linha começaria do meio.
+teste('duas linhas de itens seguidas são lidas inteiras', async (ctx) => {
+  assert.deepStrictEqual(
+    ctx.mod.parseListaTraducao('V500\n2 grape ice 2 kiwi acai\n3 mint 1 blueberry'),
+    [
+      { modelo: 'V500', sabor: 'grape ice', qtd: 2 },
+      { modelo: 'V500', sabor: 'kiwi acai', qtd: 2 },
+      { modelo: 'V500', sabor: 'mint', qtd: 3 },
+      { modelo: 'V500', sabor: 'blueberry', qtd: 1 },
+    ],
+  );
+});
+
+teste('lista espremida no grupo de tradução vai inteira pra RPC', async (ctx) => {
+  configTraducao();
+  respostas.bot_traduzir_lista = TRADUCAO_OK;
+  await mandar(ctx.webhook, update(LISTA_ESPREMIDA, { chat: GRUPO_TRADUCAO }));
+  await new Promise(r => setTimeout(r, 250));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_traduzir_lista');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_itens.length, 10, 'os 10 itens têm que chegar na RPC');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {

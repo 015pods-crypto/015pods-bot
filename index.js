@@ -2715,15 +2715,54 @@ async function handleSetGrupoTraducao(chatId, text, from) {
     `✅ Grupo de tradução definido: \`${alvo}\`\nCole a lista do fornecedor aqui que eu devolvo no formato da reposição — nem precisa do /traduzir.`);
 }
 
-// "2 grape ice", "• 2 grape ice", "- 2 grape ice", "2x grape ice".
-const RE_LINHA_SABOR = /^[•*\-–—]?\s*(\d+)\s*x?\s*[-–—.:)]?\s+(\S.*)$/;
-// Sabor sem quantidade é raro, mas acontece ("grape ice" solto embaixo do
-// modelo). Vale 1 — deixar de fora seria perder item calado.
+// A lista raramente chega com um item por linha: colada do WhatsApp pro
+// Telegram, as quebras se perdem e vira "2 grape ice 2 strawberry banana 2
+// pineapple mango" tudo junto — às vezes com o modelo na frente, separado por
+// dois-pontos. Por isso a leitura é por TRECHO, não por linha.
+
+// Todos os pares "número + texto" de um trecho. O lookahead é quem fecha o
+// sabor: ele termina onde começa o próximo número, ou no fim do trecho.
+// `[^\d]+?` de propósito — sabor com número no meio quebraria a conta, e é
+// preferível não reconhecer a picotar errado.
+const RE_PARES_ITEM = /(\d+)\s+([^\d]+?)(?=\s+\d+\s|\s*$)/g;
+
+// Começa com número, com ou sem marcador na frente: é linha de itens.
+const RE_COMECA_NUMERO = /^[•*\-–—]?\s*\d/;
+// Marcador sem número: "• grape ice".
 const RE_SO_BULLET = /^[•*\-–—]\s*(\S.*)$/;
 
-// Tira marcador, dois-pontos do fim, asteriscos e emoji do nome do modelo.
+// Formatação do Telegram sai antes de qualquer decisão: "*V500:*" tem que ser
+// lido igual a "V500:".
+function limparFormatacao(linha) {
+  return String(linha || '').replace(/[*_`]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Tira só lixo das PONTAS. O "+" fica: em "2 peach + 2 cherry strazz" ele faz
+// parte do nome do primeiro sabor.
+function limparSabor(s) {
+  return String(s || '').replace(/^[\s.\-–—•]+/, '').replace(/[\s.\-–—•]+$/, '').trim();
+}
+
+// Tira marcador e dois-pontos do fim do nome do modelo.
 function limparModelo(linha) {
   return limparNome(String(linha).replace(/^[•*\-–—]\s*/, '')).replace(/\s*:\s*$/, '').trim();
+}
+
+// Extrai os pares de um trecho e pendura no modelo corrente. Sem modelo, o
+// trecho é descartado: não dá pra dizer de que produto ele é.
+function itensDoTrecho(trecho, modelo) {
+  if (!modelo) return [];
+  const achados = [];
+  // Regex nova a cada chamada: `g` compartilhado guarda lastIndex entre
+  // chamadas e faria a segunda linha começar do meio.
+  const re = new RegExp(RE_PARES_ITEM.source, 'g');
+  let m;
+  while ((m = re.exec(trecho)) !== null) {
+    const qtd = parseInt(m[1], 10);
+    const sabor = limparSabor(m[2]);
+    if (qtd > 0 && sabor) achados.push({ modelo, sabor, qtd });
+  }
+  return achados;
 }
 
 // Devolve [{ modelo, sabor, qtd }]. Sabor antes do primeiro modelo é
@@ -2733,28 +2772,43 @@ function parseListaTraducao(texto) {
   let modelo = null;
 
   for (const bruta of String(texto || '').split('\n')) {
-    const linha = bruta.trim();
+    const linha = limparFormatacao(bruta);
     if (!linha || RE_SEPARADOR.test(linha)) continue;
+    // Ruído ANTES de tudo: "PROMOÇÃO: leve 10 por R$ 250" tem dois-pontos e
+    // viraria um modelo com um item de 10 unidades.
+    if (ehRuidoFornecedor(linha, RE_BULLET.test(linha))) continue;
 
-    const mSabor = linha.match(RE_LINHA_SABOR);
-    if (mSabor) {
-      const qtd = parseInt(mSabor[1], 10);
-      const sabor = limparNome(mSabor[2]);
-      if (!modelo || !qtd || qtd <= 0 || !sabor) continue;
-      itens.push({ modelo, sabor, qtd });
+    // "BC10k TOUCH: 2 blueberry 2 OMG" — modelo e itens na mesma linha. Só
+    // vale quando o que vem antes dos dois-pontos não começa com número.
+    const corte = linha.indexOf(':');
+    if (corte > 0) {
+      const antes = linha.slice(0, corte).trim();
+      const depois = linha.slice(corte + 1).trim();
+      if (antes && !RE_COMECA_NUMERO.test(antes)) {
+        const nome = limparModelo(antes);
+        if (nome) modelo = nome;
+        if (depois) itens.push(...itensDoTrecho(depois, modelo));
+        continue;
+      }
+    }
+
+    if (RE_COMECA_NUMERO.test(linha)) {
+      itens.push(...itensDoTrecho(linha, modelo));
       continue;
     }
 
-    // Bullet sem número embaixo de um modelo: sabor de quantidade 1.
+    // Bullet sem número embaixo de um modelo: sabor de quantidade 1. É a
+    // exceção da regra acima — "• grape ice" logo abaixo de um modelo é sabor,
+    // não um modelo novo.
     const mBullet = modelo && linha.match(RE_SO_BULLET);
     if (mBullet) {
-      const sabor = limparNome(mBullet[1]);
-      if (sabor && !ehRuidoFornecedor(linha, true)) itens.push({ modelo, sabor, qtd: 1 });
+      const sabor = limparSabor(limparNome(mBullet[1]));
+      if (sabor) itens.push({ modelo, sabor, qtd: 1 });
       continue;
     }
 
-    // Sobrou: é nome de modelo — a não ser que seja recado.
-    if (ehRuidoFornecedor(linha, false)) continue;
+    // Sobrou: linha inteira é nome de modelo — mesmo com número no meio
+    // ("BC10k TOUCH", "V300 slim").
     const nome = limparModelo(linha);
     if (nome) modelo = nome;
   }
