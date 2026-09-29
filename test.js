@@ -3553,6 +3553,79 @@ teste('lembrete sem grupo cadastrado não gasta o envio do dia', async (ctx) => 
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_tarefas_lembrete').length, 0);
 });
 
+// Id crescente por chamada, como o banco faria.
+function novaComIds(primeiro = 20) {
+  let id = primeiro;
+  respostas.bot_tarefa_nova = () => ({ status: 200, body: { ok: true, id: id++, pendentes: 1 } });
+}
+
+teste('/nova com várias linhas vira uma tarefa por linha, fixada uma vez', async (ctx) => {
+  configTarefas({ msgFixada: 777 });
+  novaComIds(20);
+  const texto = '/nova tarefa um\n/nova@Bot015 tarefa dois\n\n- tarefa três\n• quatro\n* cinco\n1. seis\n2) sete\n# oito\n   ';
+  const [resp] = await mandar(ctx.webhook, update(texto, { chat: GRUPO_ATUALIZACOES }));
+
+  const textos = chamadas.filter(c => c.fn === 'bot_tarefa_nova').map(c => c.body.p_texto);
+  assert.deepStrictEqual(textos, ['tarefa um', 'tarefa dois', 'tarefa três', 'quatro', 'cinco', 'seis', 'sete', 'oito']);
+  assert.strictEqual(resp.text, [
+    '📌 8 tarefas anotadas:',
+    '#20 · tarefa um', '#21 · tarefa dois', '#22 · tarefa três', '#23 · quatro',
+    '#24 · cinco', '#25 · seis', '#26 · sete', '#27 · oito',
+  ].join('\n'));
+  await esperar(() => chamadasTelegram.some(c => c.metodo === 'editMessageText'));
+  await new Promise(r => setTimeout(r, 150));
+  assert.strictEqual(chamadasTelegram.filter(c => c.metodo === 'editMessageText').length, 1, 'fixada só uma vez');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_tarefa_lista').length, 1);
+});
+
+teste('/nova de uma linha continua com a resposta de sempre', async (ctx) => {
+  configTarefas();
+  novaComIds(12);
+  const [resp] = await mandar(ctx.webhook, update('/nova 2.5k de estoque no site', { chat: GRUPO_ATUALIZACOES }));
+  assert.strictEqual(resp.text, '📌 #12 anotada: 2.5k de estoque no site');
+});
+
+teste('/nova respondendo mensagem de várias linhas cria uma por linha', async (ctx) => {
+  configTarefas();
+  novaComIds(30);
+  const upd = update('/nova', { chat: GRUPO_ATUALIZACOES });
+  upd.message.reply_to_message = { message_id: 1, text: '1) foto V500\n2) banner\n\n3) preço Elfbar' };
+  const [resp] = await mandar(ctx.webhook, upd);
+  assert.deepStrictEqual(chamadas.filter(c => c.fn === 'bot_tarefa_nova').map(c => c.body.p_texto), ['foto V500', 'banner', 'preço Elfbar']);
+  assert.ok(resp.text.startsWith('📌 3 tarefas anotadas:\n#30 · foto V500'), resp.text);
+});
+
+teste('/nova com mais de 20 linhas cria as 20 primeiras e avisa', async (ctx) => {
+  configTarefas();
+  novaComIds(1);
+  const linhas = [];
+  for (let i = 1; i <= 23; i++) linhas.push(`item ${i}`);
+  const [resp] = await mandar(ctx.webhook, update('/nova ' + linhas.join('\n'), { chat: GRUPO_ATUALIZACOES }));
+  const rpc = chamadas.filter(c => c.fn === 'bot_tarefa_nova');
+  assert.strictEqual(rpc.length, 20);
+  assert.strictEqual(rpc[19].body.p_texto, 'item 20');
+  assert.ok(resp.text.startsWith('📌 20 tarefas anotadas:'), resp.text);
+  assert.ok(resp.text.includes('3 linhas ficaram de fora'), resp.text);
+});
+
+teste('/nova com falha no meio diz quais entraram', async (ctx) => {
+  configTarefas();
+  let n = 0;
+  respostas.bot_tarefa_nova = () => (++n === 2
+    ? { status: 200, body: { ok: false, erro: 'texto vazio' } }
+    : { status: 200, body: { ok: true, id: 40 + n, pendentes: 1 } });
+  const [resp] = await mandar(ctx.webhook, update('/nova a\nb\nc', { chat: GRUPO_ATUALIZACOES }));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_tarefa_nova').length, 2, 'para na primeira falha');
+  assert.strictEqual(resp.text, '📌 #41 anotada: a\n⚠️ 2 não foram anotadas: texto vazio');
+});
+
+teste('/instrucoes explica o /nova de várias linhas', async (ctx) => {
+  configTarefas();
+  const [resp] = await mandar(ctx.webhook, update('/instrucoes', { chat: GRUPO_ATUALIZACOES }));
+  assert.ok(resp.text.includes(
+    '/nova <texto> → anota uma tarefa. Ex: /nova trocar foto do V500 no site\nVárias de uma vez: uma por linha, no mesmo /nova\nResponder uma mensagem'), resp.text);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {

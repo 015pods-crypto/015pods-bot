@@ -2918,6 +2918,7 @@ const INSTRUCOES_TAREFAS = [
   '📋 COMO USAR O GRUPO DE ATUALIZAÇÕES',
   '',
   '/nova <texto> → anota uma tarefa. Ex: /nova trocar foto do V500 no site',
+  'Várias de uma vez: uma por linha, no mesmo /nova',
   'Responder uma mensagem com /nova → transforma aquela mensagem em tarefa',
   '/lista → mostra o que está pendente',
   '/feito <número> → marca como concluída. Dá para várias: /feito 12 15 18',
@@ -3163,21 +3164,61 @@ async function rpcTarefa(fn, body) {
   }
 }
 
+const MAX_TAREFAS_POR_MSG = 20;
+
+// Cada linha vira uma tarefa: "/nova a\n/nova b" eram DUAS, e viravam uma só
+// com "/nova b" no meio do texto. Tira de cada linha o "/nova" repetido e o
+// marcador de lista ("-", "•", "*", "#", "1.", "1)"). O "1." só sai com
+// espaço depois, pra "2.5k" não perder o número.
+function linhasTarefa(texto) {
+  return String(texto || '').split('\n')
+    .map(l => l.trim()
+      .replace(/^\/nova(@\S+)?(?=\s|$)/i, '').trim()
+      .replace(/^(?:[-•*#]|\d+[.)](?=\s|$))\s*/, '').trim())
+    .filter(Boolean);
+}
+
 async function handleNovaTarefa(chatId, msg, text) {
-  let texto = textoDoComando(text);
+  let linhas = linhasTarefa(textoDoComando(text));
   const resp = msg.reply_to_message;
-  if (!texto && resp) texto = String(resp.text || resp.caption || '').trim();
-  if (!texto) {
+  if (!linhas.length && resp) linhas = linhasTarefa(resp.text || resp.caption || '');
+  if (!linhas.length) {
     await enviarTextoPuro(chatId, 'Escreva a tarefa depois do comando. Ex: /nova trocar foto do V500 no site\n(ou responda uma mensagem com /nova)');
     return;
   }
+  const excedentes = Math.max(0, linhas.length - MAX_TAREFAS_POR_MSG);
+  linhas = linhas.slice(0, MAX_TAREFAS_POR_MSG);
+
   const from = msg.from || {};
-  const { d, erro } = await rpcTarefa('bot_tarefa_nova', {
-    p_texto: texto, p_autor: primeiroNome(from), p_autor_id: from.id ?? null,
-  });
-  if (erro) { await enviarTextoPuro(chatId, `⚠️ Não anotei: ${erro}`); return; }
-  await enviarTextoPuro(chatId, `📌 #${d.id} anotada: ${texto}`);
-  await atualizarFixadaAvisando(chatId);
+  const criadas = [];
+  let falha = '';
+  // Uma chamada por linha, na ordem. Se uma falhar, para ali: as de baixo
+  // ficam de fora e a resposta diz quais entraram.
+  for (const texto of linhas) {
+    const { d, erro } = await rpcTarefa('bot_tarefa_nova', {
+      p_texto: texto, p_autor: primeiroNome(from), p_autor_id: from.id ?? null,
+    });
+    if (erro) { falha = erro; break; }
+    criadas.push({ id: d.id, texto });
+  }
+
+  const saida = [];
+  if (criadas.length === 1) saida.push(`📌 #${criadas[0].id} anotada: ${criadas[0].texto}`);
+  else if (criadas.length > 1) {
+    saida.push(`📌 ${criadas.length} tarefas anotadas:`, ...criadas.map(t => `#${t.id} · ${t.texto}`));
+  }
+  if (falha) {
+    const faltou = linhas.length - criadas.length;
+    saida.push(criadas.length
+      ? `⚠️ ${faltou} não ${faltou === 1 ? 'foi anotada' : 'foram anotadas'}: ${falha}`
+      : `⚠️ Não anotei: ${falha}`);
+  }
+  if (excedentes) {
+    saida.push(`⚠️ Máximo de ${MAX_TAREFAS_POR_MSG} por mensagem: ${excedentes} ${excedentes === 1 ? 'linha ficou' : 'linhas ficaram'} de fora. Mande de novo só ${excedentes === 1 ? 'ela' : 'elas'}.`);
+  }
+  await enviarTextoPuro(chatId, saida.join('\n'));
+  // Fixada UMA vez, depois de todas.
+  if (criadas.length) await atualizarFixadaAvisando(chatId);
 }
 
 async function handleListaTarefas(chatId) {
