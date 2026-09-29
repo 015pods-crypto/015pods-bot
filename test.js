@@ -10,6 +10,9 @@ const assert = require('assert');
 const enviadas = [];      // mensagens que o bot mandou pro Telegram
 const chamadas = [];      // { fn, body } de cada RPC recebida
 let respostas = {};       // { [fn]: { status, body } } — o que o Supabase falso devolve
+const chamadasTelegram = []; // { metodo, body } de cada chamada à API do Telegram
+let respostasTelegram = {};  // { [metodo]: { status, body } } — o que o Telegram falso devolve
+let ultimoMsgIdTelegram = 5000;
 const chamadasGemini = []; // { url, body } de cada leitura de comprovante
 let respostaGemini = null; // o que o Gemini falso devolve (null = valor padrão)
 
@@ -44,9 +47,18 @@ async function subirFalsos() {
       res.end(Buffer.from('bytes-falsos-da-foto'));
       return;
     }
-    try { enviadas.push(JSON.parse(raw)); } catch (_) { enviadas.push({ text: raw }); }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end('{"ok":true}');
+    let corpo;
+    try { corpo = JSON.parse(raw); } catch (_) { corpo = { text: raw }; }
+    enviadas.push(corpo);
+    const metodo = url.split('/').pop();
+    chamadasTelegram.push({ metodo, body: corpo });
+    // Resposta por método (ex.: editMessageText falhando); padrão = ok com um
+    // message_id novo, que é o que a lista fixada precisa pra se lembrar.
+    const bruta = respostasTelegram[metodo];
+    const r = (typeof bruta === 'function' ? bruta(corpo) : bruta) ||
+      { status: 200, body: { ok: true, result: { message_id: ++ultimoMsgIdTelegram } } };
+    res.writeHead(r.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(r.body));
   });
 
   const supabase = await servidorFalso((req, raw, res) => {
@@ -3329,6 +3341,218 @@ teste('lista espremida no grupo de tradução vai inteira pra RPC', async (ctx) 
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
 });
 
+// --- Grupo de ATUALIZAÇÕES (tarefas) --------------------------------------
+
+const GRUPO_ATUALIZACOES = -600;
+
+function configTarefas({ grupo = GRUPO_ATUALIZACOES, msgFixada = null, pendentes = [] } = {}) {
+  respostas.bot_tarefas_estado = (body) => ({
+    status: 200,
+    body: { ok: true, grupo: body.p_grupo ?? grupo, msg_fixada: body.p_msg_fixada ?? msgFixada },
+  });
+  respostas.bot_tarefa_lista = { status: 200, body: { ok: true, pendentes } };
+}
+
+const PENDENTES = [
+  { id: 12, texto: 'Atualizar foto do V500 no site', criado_por: 'Dedé', criado_em: new Date().toISOString() },
+  { id: 15, texto: 'Trocar banner', criado_por: 'Rod', criado_em: new Date().toISOString() },
+];
+
+// O webhook responde antes de terminar a fixada: espera a condição aparecer.
+async function esperar(cond, ms = 2000) {
+  const limite = Date.now() + ms;
+  while (!cond() && Date.now() < limite) await new Promise(r => setTimeout(r, 10));
+  assert.ok(cond(), 'condição não aconteceu a tempo');
+}
+
+teste('/nova anota, responde com o número e publica a lista fixada', async (ctx) => {
+  configTarefas({ pendentes: PENDENTES });
+  respostas.bot_tarefa_nova = { status: 200, body: { ok: true, id: 12, pendentes: 2 } };
+  const [resp] = await mandar(ctx.webhook, update('/nova Atualizar foto do V500 no site', { chat: GRUPO_ATUALIZACOES, from: FUNCIONARIO, nome: 'Dedé Silva' }));
+
+  const rpc = chamadas.filter(c => c.fn === 'bot_tarefa_nova');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_texto, 'Atualizar foto do V500 no site');
+  assert.strictEqual(rpc[0].body.p_autor, 'Dedé');
+  assert.strictEqual(rpc[0].body.p_autor_id, FUNCIONARIO);
+  assert.strictEqual(resp.text, '📌 #12 anotada: Atualizar foto do V500 no site');
+
+  await esperar(() => chamadasTelegram.some(c => c.metodo === 'pinChatMessage'));
+  const fixada = chamadasTelegram.find(c => c.metodo === 'sendMessage' && c.body.text.startsWith('📋 ATUALIZAÇÕES'));
+  assert.ok(fixada, 'faltou mandar a lista');
+  assert.strictEqual(fixada.body.chat_id, String(GRUPO_ATUALIZACOES));
+  assert.strictEqual(fixada.body.disable_notification, true);
+  assert.ok(fixada.body.text.includes('#12 · Atualizar foto do V500 no site · Dedé, hoje'), fixada.body.text);
+  assert.ok(fixada.body.text.endsWith('Concluiu? Manda /feito e o número. Dúvidas: /instrucoes'));
+  const pin = chamadasTelegram.find(c => c.metodo === 'pinChatMessage');
+  assert.strictEqual(pin.body.disable_notification, true);
+  await esperar(() => chamadas.some(c => c.fn === 'bot_tarefas_estado' && c.body.p_msg_fixada));
+  const grava = chamadas.find(c => c.fn === 'bot_tarefas_estado' && c.body.p_msg_fixada);
+  assert.strictEqual(grava.body.p_msg_fixada, pin.body.message_id);
+});
+
+teste('/nova respondendo uma mensagem usa o texto dela', async (ctx) => {
+  configTarefas();
+  respostas.bot_tarefa_nova = { status: 200, body: { ok: true, id: 13, pendentes: 1 } };
+  const upd = update('/nova', { chat: GRUPO_ATUALIZACOES, nome: 'Lucas' });
+  upd.message.reply_to_message = { message_id: 1, caption: 'foto nova do Elfbar' };
+  const [resp] = await mandar(ctx.webhook, upd);
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_tarefa_nova').body.p_texto, 'foto nova do Elfbar');
+  assert.strictEqual(resp.text, '📌 #13 anotada: foto nova do Elfbar');
+});
+
+teste('/nova sem texto e sem resposta explica o uso', async (ctx) => {
+  configTarefas();
+  const [resp] = await mandar(ctx.webhook, update('/nova', { chat: GRUPO_ATUALIZACOES }));
+  assert.ok(resp.text.includes('/nova trocar foto'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_tarefa_nova').length, 0);
+});
+
+teste('/feito com vários números, vírgula e #; edita a fixada existente', async (ctx) => {
+  configTarefas({ msgFixada: 777 });
+  respostas.bot_tarefa_feito = { status: 200, body: {
+    ok: true, concluidas: [{ id: 12, texto: 'Foto V500' }, { id: 15, texto: 'Banner' }], nao_encontradas: [18], pendentes: 0,
+  } };
+  const [resp] = await mandar(ctx.webhook, update('/feito 12, 15 #18', { chat: GRUPO_ATUALIZACOES, nome: 'Rod' }));
+  assert.deepStrictEqual(chamadas.find(c => c.fn === 'bot_tarefa_feito').body.p_ids, [12, 15, 18]);
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_tarefa_feito').body.p_quem, 'Rod');
+  assert.strictEqual(resp.text, [
+    '✅ #12 concluída por Rod: Foto V500',
+    '✅ #15 concluída por Rod: Banner',
+    '⚠️ Não encontrei pendente: #18 (não existe ou já foi concluída)',
+  ].join('\n'));
+
+  await esperar(() => chamadasTelegram.some(c => c.metodo === 'editMessageText'));
+  const edit = chamadasTelegram.find(c => c.metodo === 'editMessageText');
+  assert.strictEqual(edit.body.message_id, 777);
+  assert.strictEqual(edit.body.text, '📋 Nenhuma atualização pendente ✅\n\nConcluiu? Manda /feito e o número. Dúvidas: /instrucoes');
+  await new Promise(r => setTimeout(r, 100));
+  assert.strictEqual(chamadasTelegram.filter(c => c.metodo === 'pinChatMessage').length, 0, 'editou: não devia fixar outra');
+});
+
+teste('fixada apagada: manda outra, fixa e grava o id novo', async (ctx) => {
+  configTarefas({ msgFixada: 777, pendentes: PENDENTES });
+  respostas.bot_tarefa_apagar = { status: 200, body: { ok: true, id: 15, texto: 'Banner', pendentes: 1 } };
+  respostasTelegram.editMessageText = { status: 400, body: { ok: false, description: 'Bad Request: message to edit not found' } };
+  const [resp] = await mandar(ctx.webhook, update('/apagar 15', { chat: GRUPO_ATUALIZACOES }));
+  assert.strictEqual(resp.text, '🗑️ #15 apagada: Banner');
+  await esperar(() => chamadas.some(c => c.fn === 'bot_tarefas_estado' && c.body.p_msg_fixada));
+  const pin = await (async () => { await esperar(() => chamadasTelegram.some(c => c.metodo === 'pinChatMessage')); return chamadasTelegram.find(c => c.metodo === 'pinChatMessage'); })();
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_tarefas_estado' && c.body.p_msg_fixada).body.p_msg_fixada, pin.body.message_id);
+});
+
+teste('"message is not modified" conta como sucesso', async (ctx) => {
+  configTarefas({ msgFixada: 777 });
+  respostas.bot_tarefa_reabrir = { status: 200, body: { ok: true, id: 12, texto: 'Foto', pendentes: 1 } };
+  respostasTelegram.editMessageText = { status: 400, body: { ok: false, description: 'Bad Request: message is not modified' } };
+  const [resp] = await mandar(ctx.webhook, update('/reabrir 12', { chat: GRUPO_ATUALIZACOES }));
+  assert.strictEqual(resp.text, '↩️ #12 reaberta: Foto');
+  await esperar(() => chamadasTelegram.some(c => c.metodo === 'editMessageText'));
+  await new Promise(r => setTimeout(r, 100));
+  assert.strictEqual(chamadasTelegram.filter(c => c.metodo === 'sendMessage').length, 1, 'só a resposta, sem lista nova');
+});
+
+teste('/reabrir com erro do banco mostra o erro', async (ctx) => {
+  configTarefas();
+  respostas.bot_tarefa_reabrir = { status: 200, body: { ok: false, erro: 'tarefa não está concluída' } };
+  const [resp] = await mandar(ctx.webhook, update('/reabrir 12', { chat: GRUPO_ATUALIZACOES }));
+  assert.strictEqual(resp.text, '⚠️ #12: tarefa não está concluída');
+});
+
+teste('comandos de tarefa são ignorados em outros grupos', async (ctx) => {
+  configTarefas();
+  await mandar(ctx.webhook, update('/nova teste', { chat: GRUPO_VENDAS }), { esperaResposta: false });
+  await mandar(ctx.webhook, update('/lista', { chat: GRUPO_VENDAS }), { esperaResposta: false });
+  assert.strictEqual(enviadas.length, 0, JSON.stringify(enviadas));
+  assert.strictEqual(chamadas.filter(c => c.fn.startsWith('bot_tarefa_')).length, 0);
+});
+
+teste('no grupo de atualizações, conversa e outros comandos são ignorados', async (ctx) => {
+  configTarefas();
+  await mandar(ctx.webhook, update('-1 Ignite 5500 Grape Ice', { chat: GRUPO_ATUALIZACOES }), { esperaResposta: false });
+  await mandar(ctx.webhook, update('/estoque', { chat: GRUPO_ATUALIZACOES }), { esperaResposta: false });
+  assert.strictEqual(enviadas.length, 0, JSON.stringify(enviadas));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque' || c.fn === 'bot_ler_estoque').length, 0);
+});
+
+teste('/lista funciona no privado do dono', async (ctx) => {
+  configTarefas({ pendentes: PENDENTES });
+  const [resp] = await mandar(ctx.webhook, update('/lista', { chat: DONO, tipo: 'private' }));
+  assert.ok(resp.text.startsWith('📋 ATUALIZAÇÕES PENDENTES (2)\n#12 · Atualizar foto do V500 no site · Dedé, hoje'), resp.text);
+});
+
+teste('/nova editada não cria tarefa de novo', async (ctx) => {
+  configTarefas();
+  const upd = update('/nova teste', { chat: GRUPO_ATUALIZACOES });
+  upd.edited_message = upd.message; delete upd.message;
+  await fetch(ctx.webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(upd) });
+  await new Promise(r => setTimeout(r, 150));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_tarefa_nova').length, 0);
+});
+
+teste('/instrucoes responde o texto combinado', async (ctx) => {
+  configTarefas();
+  const [resp] = await mandar(ctx.webhook, update('/instrucoes', { chat: GRUPO_ATUALIZACOES }));
+  assert.strictEqual(resp.text, ctx.mod.INSTRUCOES_TAREFAS);
+  assert.ok(resp.text.startsWith('📋 COMO USAR O GRUPO DE ATUALIZAÇÕES\n\n/nova <texto>'));
+  assert.strictEqual(resp.parse_mode, undefined, 'texto puro: tarefa com _ ou * não pode quebrar');
+});
+
+teste('/feitas lista as concluídas com quem e quando', async (ctx) => {
+  configTarefas();
+  respostas.bot_tarefas_feitas = { status: 200, body: { ok: true, feitas: [
+    { id: 9, texto: 'Foto', feito_por: 'Rod', feito_em: '2026-09-28T17:30:00Z' },
+  ] } };
+  const [resp] = await mandar(ctx.webhook, update('/feitas', { chat: GRUPO_ATUALIZACOES }));
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_tarefas_feitas').body.p_limite, 10);
+  assert.strictEqual(resp.text, '📗 ÚLTIMAS CONCLUÍDAS\n✅ #9 · Foto · Rod, 28/09 14:30');
+});
+
+teste('/setgrupoatualizacoes: só o dono, e grava o grupo', async (ctx) => {
+  configTarefas({ grupo: null });
+  await mandar(ctx.webhook, update('/setgrupoatualizacoes', { chat: GRUPO_ATUALIZACOES, from: FUNCIONARIO }), { esperaResposta: false });
+  assert.strictEqual(enviadas.length, 0);
+  const [resp] = await mandar(ctx.webhook, update('/setgrupoatualizacoes', { chat: GRUPO_ATUALIZACOES }));
+  const grava = chamadas.find(c => c.fn === 'bot_tarefas_estado' && c.body.p_grupo);
+  assert.strictEqual(grava.body.p_grupo, GRUPO_ATUALIZACOES);
+  assert.ok(resp.text.includes('Grupo de atualizações definido'), resp.text);
+});
+
+teste('lista fixada longa é cortada em 4096 com "... e mais X"', async (ctx) => {
+  const muitas = [];
+  for (let i = 1; i <= 300; i++) muitas.push({ id: i, texto: `Tarefa comprida número ${i} `.repeat(3), criado_por: 'Dedé', criado_em: '2026-09-27T12:00:00Z' });
+  const txt = ctx.mod.textoFixada(muitas, '2026-09-29');
+  assert.ok(txt.length <= 4096, `passou: ${txt.length}`);
+  assert.ok(txt.startsWith('📋 ATUALIZAÇÕES PENDENTES (300)'));
+  assert.ok(/\.\.\. e mais \d+ \(use \/lista\)\n\nConcluiu\?/.test(txt), txt.slice(-200));
+  assert.ok(txt.includes('#1 · ') && txt.includes('Dedé, há 2 dias'));
+});
+
+teste('haQuanto conta por dia em São Paulo', async (ctx) => {
+  assert.strictEqual(ctx.mod.haQuanto('2026-09-29T02:00:00Z', '2026-09-29'), 'ontem'); // 23h do dia 28 em SP
+  assert.strictEqual(ctx.mod.haQuanto('2026-09-29T15:00:00Z', '2026-09-29'), 'hoje');
+  assert.strictEqual(ctx.mod.haQuanto('2026-09-26T15:00:00Z', '2026-09-29'), 'há 3 dias');
+});
+
+teste('lembrete diário: manda só quando o banco libera e tem pendente', async (ctx) => {
+  configTarefas({ msgFixada: 777, pendentes: PENDENTES });
+  respostas.bot_tarefas_lembrete = { status: 200, body: { ok: true, enviar: false, pendentes: 2 } };
+  assert.strictEqual(await ctx.mod.enviarLembreteTarefas(), false);
+  assert.strictEqual(enviadas.length, 0);
+
+  respostas.bot_tarefas_lembrete = { status: 200, body: { ok: true, enviar: true, pendentes: 2 } };
+  assert.strictEqual(await ctx.mod.enviarLembreteTarefas(), true);
+  const msg = chamadasTelegram.find(c => c.metodo === 'sendMessage');
+  assert.strictEqual(msg.body.chat_id, String(GRUPO_ATUALIZACOES));
+  assert.ok(msg.body.text.startsWith('Bom dia! Tem 2 atualizações esperando:\n#12 · '), msg.body.text);
+});
+
+teste('lembrete sem grupo cadastrado não gasta o envio do dia', async (ctx) => {
+  configTarefas({ grupo: null });
+  assert.strictEqual(await ctx.mod.enviarLembreteTarefas(), false);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_tarefas_lembrete').length, 0);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {
@@ -3361,7 +3585,9 @@ async function main() {
     enviadas.length = 0;
     chamadas.length = 0;
     chamadasGemini.length = 0;
+    chamadasTelegram.length = 0;
     respostas = {};
+    respostasTelegram = {};
     respostaGemini = null;
     mod._resetEstadoTeste(); // config, fornecedor pendente e marcação de atacado
     try {

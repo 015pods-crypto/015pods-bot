@@ -40,6 +40,8 @@ const COMANDOS = [
   '/atacado', '/desatacado', '/caixa',
   '/setgrupofaturamento', '/faturamento', '/lembrete-teste',
   '/setgrupotraducao', '/traduzir',
+  '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
+  '/apagar', '/instrucoes',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -231,6 +233,8 @@ function _resetEstadoTeste() {
   ultimaMarcacao.clear();
   caixaListado.clear();
   lembreteChipsEnviado = '';
+  cacheGrupoTarefas = null;
+  ultimaFixada = null;
 }
 
 // `palavras` é a lista já resolvida (o parser é síncrono de propósito: o
@@ -2892,6 +2896,391 @@ async function handleTraduzir(chatId, texto) {
   if (rodape.length) await sendTelegram(chatId, rodape.join('\n'));
 }
 
+// ---------------------------------------------------------------------------
+// Grupo de ATUALIZAÇÕES — lista de tarefas da equipe
+//
+// Pedidos como "atualizar foto no site" se perdiam no meio das conversas. Aqui
+// cada um vira uma tarefa numerada, e a lista de pendentes fica SEMPRE fixada
+// no topo do grupo: é ela que a equipe olha, não o histórico.
+//
+// Tudo passa pelas RPCs bot_tarefa_* / bot_tarefas_*: o bot não guarda tarefa
+// nenhuma, só o texto da última mensagem fixada (pra não editar à toa).
+//
+// Mensagens daqui saem em TEXTO PURO (sem Markdown): o texto das tarefas é
+// digitado pela equipe, e um "_" ou "*" solto derrubaria o envio.
+// ---------------------------------------------------------------------------
+
+const TAREFA_CMDS = new Set(['/nova', '/lista', '/feito', '/reabrir', '/apagar', '/feitas', '/instrucoes']);
+const CRON_LEMBRETE_TAREFAS = '0 10-23 * * *';
+const LIMITE_TELEGRAM = 4096;
+
+const INSTRUCOES_TAREFAS = [
+  '📋 COMO USAR O GRUPO DE ATUALIZAÇÕES',
+  '',
+  '/nova <texto> → anota uma tarefa. Ex: /nova trocar foto do V500 no site',
+  'Responder uma mensagem com /nova → transforma aquela mensagem em tarefa',
+  '/lista → mostra o que está pendente',
+  '/feito <número> → marca como concluída. Dá para várias: /feito 12 15 18',
+  '/feitas → mostra as últimas concluídas',
+  '/reabrir <número> → volta uma tarefa para a lista',
+  '/apagar <número> → remove uma tarefa criada por engano',
+  '',
+  'A lista atualizada fica sempre fixada no topo do grupo.',
+].join('\n');
+
+const RODAPE_TAREFAS = 'Concluiu? Manda /feito e o número. Dúvidas: /instrucoes';
+
+// Chamada crua à API do Telegram: devolve o JSON ({ ok, result, description })
+// em vez de lançar, porque aqui o motivo da falha decide o que fazer (editar
+// deu "not modified" = sucesso; mensagem sumiu = manda outra).
+async function telegramApi(metodo, corpo) {
+  const fetch = (await import('node-fetch')).default;
+  try {
+    const resp = await fetch(`${TELEGRAM_API}/${metodo}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(corpo),
+    });
+    const texto = await resp.text();
+    let data = null;
+    try { data = texto ? JSON.parse(texto) : null; } catch (_) { /* não-JSON */ }
+    if (!data) data = { ok: resp.ok, description: texto.slice(0, 200) };
+    if (!resp.ok) data.ok = false;
+    return data;
+  } catch (err) {
+    return { ok: false, description: err.message };
+  }
+}
+
+async function enviarTextoPuro(chatId, texto) {
+  for (const parte of splitMessage(texto)) {
+    const r = await telegramApi('sendMessage', { chat_id: chatId, text: parte });
+    if (!r.ok) console.error(`tarefas: sendMessage falhou: ${r.description || ''}`);
+  }
+}
+
+// --- Qual é o grupo --------------------------------------------------------
+
+// O webhook pergunta isso em TODA mensagem: cache curto, como o lerConfig.
+let cacheGrupoTarefas = null; // { at, grupo }
+
+async function estadoTarefas(grava) {
+  const body = { p_token: BOT_SYNC_TOKEN };
+  if (grava) Object.assign(body, grava);
+  const d = await callRpc('bot_tarefas_estado', body);
+  if (!d || d.ok === false) throw new Error((d && d.erro) || 'bot_tarefas_estado falhou');
+  const grupo = d.grupo == null ? '' : String(d.grupo).trim();
+  cacheGrupoTarefas = { at: Date.now(), grupo };
+  return { grupo, msgFixada: d.msg_fixada == null ? null : Number(d.msg_fixada) };
+}
+
+// Nunca lança: banco fora do ar = grupo desconhecido (e o bot fica quieto lá).
+async function chatAtualizacoes() {
+  if (cacheGrupoTarefas && Date.now() - cacheGrupoTarefas.at < CONFIG_TTL_MS) return cacheGrupoTarefas.grupo;
+  try {
+    return (await estadoTarefas()).grupo;
+  } catch (err) {
+    console.error('bot_tarefas_estado:', err.message);
+    cacheGrupoTarefas = { at: Date.now(), grupo: '' };
+    return '';
+  }
+}
+
+async function handleSetGrupoAtualizacoes(chatId, text, from) {
+  if (!ehDono(from && from.id)) return;
+  const arg = (text || '').trim().split(/\s+/)[1];
+  const alvo = arg ? arg.trim() : String(chatId);
+  if (!/^-?\d+$/.test(alvo)) {
+    await enviarTextoPuro(chatId, 'Uso: /setgrupoatualizacoes (no grupo desejado) ou /setgrupoatualizacoes -1001234567890');
+    return;
+  }
+  try {
+    await estadoTarefas({ p_grupo: Number(alvo) });
+  } catch (err) {
+    console.error('bot_tarefas_estado (gravar):', err.message);
+    await enviarTextoPuro(chatId, '⚠️ Não consegui gravar o grupo de atualizações. Tente de novo em instantes.');
+    return;
+  }
+  // Grupo novo: a fixada antiga (se houver) é de outro chat.
+  ultimaFixada = null;
+  await enviarTextoPuro(chatId, `✅ Grupo de atualizações definido: ${alvo}\nMande /instrucoes para ver como usar.`);
+  await atualizarFixadaAvisando(chatId);
+}
+
+// --- Formatação ------------------------------------------------------------
+
+// Tarefa com várias linhas vira uma só na lista: a lista é pra bater o olho.
+function textoUmaLinha(s) {
+  return String(s ?? '').replace(/\s+/g, ' ').trim();
+}
+
+// Data (YYYY-MM-DD) de um timestamp, em São Paulo.
+function diaSP(iso) {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+}
+
+// "hoje", "ontem", "há 3 dias". Por DIA e não por hora de propósito: a lista
+// fixada só é reescrita quando algo muda, e "há 2 h" envelheceria errado.
+function haQuanto(iso, hoje = hojeISO()) {
+  const dia = diaSP(iso);
+  if (!dia) return '';
+  const dias = Math.round((Date.parse(hoje) - Date.parse(dia)) / 864e5);
+  if (dias <= 0) return 'hoje';
+  if (dias === 1) return 'ontem';
+  return `há ${dias} dias`;
+}
+
+function linhaTarefa(t, hoje) {
+  const quando = haQuanto(t.criado_em, hoje);
+  const quem = [t.criado_por, quando].filter(Boolean).join(', ');
+  return `#${t.id} · ${textoUmaLinha(t.texto)}${quem ? ` · ${quem}` : ''}`;
+}
+
+// Cabeçalho + linhas + rodapé, cortando linhas do fim até caber no limite.
+function montarComCorte(cabecalho, linhas, rodape, max = LIMITE_TELEGRAM) {
+  const juntar = (ls, resto) => [cabecalho, ...ls, ...(resto ? [resto] : []), '', rodape].join('\n');
+  let texto = juntar(linhas);
+  if (texto.length <= max) return texto;
+  for (let n = linhas.length - 1; n >= 0; n--) {
+    texto = juntar(linhas.slice(0, n), `... e mais ${linhas.length - n} (use /lista)`);
+    if (texto.length <= max) return texto;
+  }
+  return texto.slice(0, max);
+}
+
+function textoFixada(pendentes, hoje = hojeISO(), max = LIMITE_TELEGRAM) {
+  if (!pendentes.length) return `📋 Nenhuma atualização pendente ✅\n\n${RODAPE_TAREFAS}`;
+  return montarComCorte(
+    `📋 ATUALIZAÇÕES PENDENTES (${pendentes.length})`,
+    pendentes.map(t => linhaTarefa(t, hoje)),
+    RODAPE_TAREFAS,
+    max,
+  );
+}
+
+// "Fulano" — só o primeiro nome, que é como a equipe se chama no grupo.
+function primeiroNome(from) {
+  if (!from) return 'alguém';
+  return (from.first_name || '').trim().split(/\s+/)[0] || (from.username ? `@${from.username}` : 'alguém');
+}
+
+// "/feito 12 15, #18" -> [12, 15, 18], sem repetir.
+function parseNumerosTarefa(texto) {
+  const resto = String(texto || '').replace(/^\/\S+/, '');
+  const ids = (resto.match(/\d+/g) || []).map(Number).filter(n => Number.isSafeInteger(n) && n > 0);
+  return [...new Set(ids)];
+}
+
+function textoDoComando(texto) {
+  return String(texto || '').replace(/^\/\S+[ \t]*/, '').trim();
+}
+
+// --- Lista fixada ----------------------------------------------------------
+
+// Último texto que ESTA instância pôs na fixada. Só serve pra não editar à
+// toa; depois de um restart é null, e aí o "message is not modified" do
+// Telegram cobre o caso.
+let ultimaFixada = null; // { grupo, msgId, texto }
+
+// Uma atualização por vez: dois comandos juntos, sem isto, veriam os dois
+// "não tem fixada" e mandariam duas listas.
+let filaFixada = Promise.resolve();
+
+function atualizarFixada() {
+  const rodada = filaFixada.then(atualizarFixadaAgora, atualizarFixadaAgora);
+  filaFixada = rodada.catch(() => {});
+  return rodada;
+}
+
+// Devolve { ok, aviso? }. Nunca lança.
+async function atualizarFixadaAgora() {
+  try {
+    const { grupo, msgFixada } = await estadoTarefas();
+    if (!grupo) return { ok: false, aviso: '' };
+
+    const d = await callRpc('bot_tarefa_lista', { p_token: BOT_SYNC_TOKEN });
+    const pendentes = (d && Array.isArray(d.pendentes)) ? d.pendentes : [];
+    const texto = textoFixada(pendentes);
+
+    if (msgFixada) {
+      if (ultimaFixada && ultimaFixada.grupo === grupo && ultimaFixada.msgId === msgFixada && ultimaFixada.texto === texto) {
+        return { ok: true };
+      }
+      const r = await telegramApi('editMessageText', { chat_id: grupo, message_id: msgFixada, text: texto });
+      if (r.ok || /message is not modified/i.test(r.description || '')) {
+        ultimaFixada = { grupo, msgId: msgFixada, texto };
+        return { ok: true };
+      }
+      console.log(`tarefas: não deu pra editar a fixada ${msgFixada} (${r.description || '?'}) — mandando outra`);
+    }
+
+    const env = await telegramApi('sendMessage', { chat_id: grupo, text: texto, disable_notification: true });
+    const novoId = env.ok && env.result && env.result.message_id;
+    if (!novoId) {
+      console.error(`tarefas: não consegui mandar a lista no grupo: ${env.description || '?'}`);
+      return { ok: false, aviso: '⚠️ Não consegui publicar a lista no grupo de atualizações.' };
+    }
+    // Grava ANTES de fixar: se fixar falhar, a próxima rodada ainda edita esta
+    // mensagem em vez de mandar mais uma.
+    await estadoTarefas({ p_grupo: Number(grupo), p_msg_fixada: novoId });
+    ultimaFixada = { grupo, msgId: novoId, texto };
+
+    const pin = await telegramApi('pinChatMessage', { chat_id: grupo, message_id: novoId, disable_notification: true });
+    if (!pin.ok) {
+      console.error(`tarefas: não consegui fixar: ${pin.description || '?'}`);
+      return { ok: true, aviso: '⚠️ Não consegui fixar a lista no topo — o bot precisa ser administrador do grupo (com permissão de fixar mensagens).' };
+    }
+    return { ok: true };
+  } catch (err) {
+    console.error('tarefas: atualizar fixada:', err.message);
+    return { ok: false, aviso: '' };
+  }
+}
+
+// Depois de um comando: atualiza a fixada e, se algo deu errado de um jeito
+// que alguém precisa resolver (bot sem permissão), avisa quem mandou.
+async function atualizarFixadaAvisando(chatId) {
+  const r = await atualizarFixada();
+  if (r && r.aviso) await enviarTextoPuro(chatId, r.aviso);
+}
+
+// --- Comandos --------------------------------------------------------------
+
+// RPC que responde { ok:false, erro } ou lança: devolve { d } ou { erro }.
+async function rpcTarefa(fn, body) {
+  try {
+    const d = await callRpc(fn, { p_token: BOT_SYNC_TOKEN, ...body });
+    if (!d || d.ok === false) return { erro: (d && (d.erro || d.msg)) || 'não deu certo' };
+    return { d };
+  } catch (err) {
+    console.error(`${fn}:`, err.message);
+    return {
+      erro: rpcAusente(err.message)
+        ? `a função ${fn} não existe no banco — falta rodar o SQL das tarefas`
+        : 'erro ao falar com o banco, tente de novo em instantes',
+    };
+  }
+}
+
+async function handleNovaTarefa(chatId, msg, text) {
+  let texto = textoDoComando(text);
+  const resp = msg.reply_to_message;
+  if (!texto && resp) texto = String(resp.text || resp.caption || '').trim();
+  if (!texto) {
+    await enviarTextoPuro(chatId, 'Escreva a tarefa depois do comando. Ex: /nova trocar foto do V500 no site\n(ou responda uma mensagem com /nova)');
+    return;
+  }
+  const from = msg.from || {};
+  const { d, erro } = await rpcTarefa('bot_tarefa_nova', {
+    p_texto: texto, p_autor: primeiroNome(from), p_autor_id: from.id ?? null,
+  });
+  if (erro) { await enviarTextoPuro(chatId, `⚠️ Não anotei: ${erro}`); return; }
+  await enviarTextoPuro(chatId, `📌 #${d.id} anotada: ${texto}`);
+  await atualizarFixadaAvisando(chatId);
+}
+
+async function handleListaTarefas(chatId) {
+  const { d, erro } = await rpcTarefa('bot_tarefa_lista', {});
+  if (erro) { await enviarTextoPuro(chatId, `⚠️ Não consegui ler a lista: ${erro}`); return; }
+  const pendentes = Array.isArray(d.pendentes) ? d.pendentes : [];
+  // /lista não corta: é o lugar pra ver tudo (a fixada manda pra cá).
+  if (!pendentes.length) { await enviarTextoPuro(chatId, '📋 Nenhuma atualização pendente ✅'); return; }
+  const hoje = hojeISO();
+  await enviarTextoPuro(chatId,
+    [`📋 ATUALIZAÇÕES PENDENTES (${pendentes.length})`, ...pendentes.map(t => linhaTarefa(t, hoje))].join('\n'));
+}
+
+async function handleFeito(chatId, msg, text) {
+  const ids = parseNumerosTarefa(text);
+  if (!ids.length) { await enviarTextoPuro(chatId, 'Diga o número. Ex: /feito 12 (ou várias: /feito 12 15 18)'); return; }
+  const quem = primeiroNome(msg.from);
+  const { d, erro } = await rpcTarefa('bot_tarefa_feito', { p_ids: ids, p_quem: quem });
+  if (erro) { await enviarTextoPuro(chatId, `⚠️ Não marquei: ${erro}`); return; }
+
+  const concluidas = Array.isArray(d.concluidas) ? d.concluidas : [];
+  const faltam = Array.isArray(d.nao_encontradas) ? d.nao_encontradas : [];
+  const linhas = concluidas.map(t => `✅ #${t.id} concluída por ${quem}: ${textoUmaLinha(t.texto)}`);
+  if (faltam.length) {
+    linhas.push(`⚠️ Não encontrei pendente: ${faltam.map(n => `#${n}`).join(', ')} (não existe ou já foi concluída)`);
+  }
+  await enviarTextoPuro(chatId, linhas.join('\n') || '⚠️ Nada foi marcado.');
+  if (concluidas.length) await atualizarFixadaAvisando(chatId);
+}
+
+// /reabrir e /apagar: um número, mesma forma de resposta.
+async function handleTarefaUnica(chatId, text, fn, verbo, emoji) {
+  const [id] = parseNumerosTarefa(text);
+  if (!id) { await enviarTextoPuro(chatId, `Diga o número. Ex: ${text.split(/\s+/)[0].split('@')[0]} 12`); return; }
+  const { d, erro } = await rpcTarefa(fn, { p_id: id });
+  if (erro) { await enviarTextoPuro(chatId, `⚠️ #${id}: ${erro}`); return; }
+  await enviarTextoPuro(chatId, `${emoji} #${d.id ?? id} ${verbo}: ${textoUmaLinha(d.texto)}`);
+  await atualizarFixadaAvisando(chatId);
+}
+
+// "28/09 14:30" em São Paulo.
+function dataHoraCurta(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const p = Object.fromEntries(new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(d).map(x => [x.type, x.value]));
+  return `${p.day}/${p.month} ${p.hour}:${p.minute}`;
+}
+
+async function handleFeitas(chatId) {
+  const { d, erro } = await rpcTarefa('bot_tarefas_feitas', { p_limite: 10 });
+  if (erro) { await enviarTextoPuro(chatId, `⚠️ Não consegui ler as concluídas: ${erro}`); return; }
+  const feitas = Array.isArray(d.feitas) ? d.feitas : [];
+  if (!feitas.length) { await enviarTextoPuro(chatId, 'Nenhuma tarefa concluída ainda.'); return; }
+  const linhas = feitas.map(t => {
+    const quem = [t.feito_por, dataHoraCurta(t.feito_em)].filter(Boolean).join(', ');
+    return `✅ #${t.id} · ${textoUmaLinha(t.texto)}${quem ? ` · ${quem}` : ''}`;
+  });
+  await enviarTextoPuro(chatId, ['📗 ÚLTIMAS CONCLUÍDAS', ...linhas].join('\n'));
+}
+
+async function handleComandoTarefa(chatId, cmd, text, msg) {
+  if (cmd === '/nova') return handleNovaTarefa(chatId, msg, text);
+  if (cmd === '/lista') return handleListaTarefas(chatId);
+  if (cmd === '/feito') return handleFeito(chatId, msg, text);
+  if (cmd === '/reabrir') return handleTarefaUnica(chatId, text, 'bot_tarefa_reabrir', 'reaberta', '↩️');
+  if (cmd === '/apagar') return handleTarefaUnica(chatId, text, 'bot_tarefa_apagar', 'apagada', '🗑️');
+  if (cmd === '/feitas') return handleFeitas(chatId);
+  if (cmd === '/instrucoes') return enviarTextoPuro(chatId, INSTRUCOES_TAREFAS);
+}
+
+// --- Lembrete diário (10h) -------------------------------------------------
+//
+// Roda de hora em hora das 10h às 23h pelo mesmo motivo do lembrete dos chips
+// (serviço dormindo às 10h não pode perder o dia). Quem garante que sai UMA
+// vez por dia é o banco: bot_tarefas_lembrete só devolve enviar=true na
+// primeira chamada do dia.
+
+async function enviarLembreteTarefas() {
+  const grupo = await chatAtualizacoes();
+  if (!grupo) return false; // sem grupo não gasta o "enviar" do dia
+
+  const l = await callRpc('bot_tarefas_lembrete', { p_token: BOT_SYNC_TOKEN });
+  if (!l || l.ok === false || !l.enviar) return false;
+
+  const d = await callRpc('bot_tarefa_lista', { p_token: BOT_SYNC_TOKEN });
+  const pendentes = (d && Array.isArray(d.pendentes)) ? d.pendentes : [];
+  if (pendentes.length) {
+    const n = pendentes.length;
+    const hoje = hojeISO();
+    await enviarTextoPuro(grupo, montarComCorte(
+      `Bom dia! Tem ${n} ${n === 1 ? 'atualização esperando' : 'atualizações esperando'}:`,
+      pendentes.map(t => linhaTarefa(t, hoje)),
+      RODAPE_TAREFAS,
+    ));
+  }
+  // Uma vez por dia a fixada é reescrita mesmo sem mudança: é o que mantém o
+  // "há N dias" em dia.
+  await atualizarFixada();
+  return true;
+}
+
 const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 23:30)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
@@ -2941,6 +3330,11 @@ cron.schedule(CRON_FATURAMENTO, async () => {
 cron.schedule(CRON_LEMBRETE_CHIPS, async () => {
   try { await enviarLembreteChips(); }
   catch (err) { console.error('Erro no lembrete dos chips:', err); }
+}, { timezone: 'America/Sao_Paulo' });
+
+cron.schedule(CRON_LEMBRETE_TAREFAS, async () => {
+  try { await enviarLembreteTarefas(); }
+  catch (err) { console.error('Erro no lembrete das atualizações:', err); }
 }, { timezone: 'America/Sao_Paulo' });
 
 cron.schedule('0 0 * * *', () => {
@@ -3009,6 +3403,21 @@ app.post('/webhook', async (req, res) => {
     }
     if (cmd === '/setgrupotraducao') {
       if (ehDono(fromId)) { await handleSetGrupoTraducao(chatId, text, msg.from); return; }
+      return;
+    }
+    if (cmd === '/setgrupoatualizacoes') {
+      if (ehDono(fromId)) { await handleSetGrupoAtualizacoes(chatId, text, msg.from); return; }
+      return;
+    }
+
+    // Tarefas: valem no grupo de atualizações e no privado do dono; em
+    // qualquer outro chat, nem são lidas. Mensagem EDITADA não conta: editar
+    // um "/nova" criaria a mesma tarefa duas vezes.
+    if (TAREFA_CMDS.has(cmd)) {
+      const atualizacoesId = await chatAtualizacoes();
+      const aqui = (!!atualizacoesId && chatKey === String(atualizacoesId)) ||
+        (msg.chat.type === 'private' && ehDono(fromId));
+      if (aqui && body.message) await handleComandoTarefa(chatId, cmd, text, msg);
       return;
     }
 
@@ -3338,6 +3747,14 @@ module.exports = {
   LEMBRETE_CHIPS,
   CRON_LEMBRETE_CHIPS,
   parseValorArg,
+  chatAtualizacoes,
+  textoFixada,
+  haQuanto,
+  parseNumerosTarefa,
+  atualizarFixada,
+  enviarLembreteTarefas,
+  INSTRUCOES_TAREFAS,
+  CRON_LEMBRETE_TAREFAS,
   handleCaixaCorrigir,
   nomeAutor,
   fmtValor,
