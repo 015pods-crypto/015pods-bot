@@ -2757,6 +2757,57 @@ teste('ehAcompanhamento ignora maiúscula e acento', async (ctx) => {
   assert.strictEqual(ctx.mod.ehAcompanhamento('Ignite 50000', palavras), false);
 });
 
+// Estoque com marca: seda, isqueiro e chiclete não têm palavra da lista no
+// nome — quem os separa é a marca. Kitkat vem sem marca: cai na lista.
+const ESTOQUE_COM_MARCA = {
+  status: 200,
+  body: [
+    { modelo: 'Ignite 50000 (V500)', marca: 'Ignite', sabores: [{ sabor: 'Grape Ice', qty: 10 }] },
+    { modelo: 'Elfbar 30000', marca: '', sabores: [{ sabor: 'Cherry', qty: 8 }] },
+    { modelo: 'Seda Smoking', marca: 'Tabacaria', sabores: [{ sabor: 'King Size', qty: 30 }] },
+    { modelo: 'Isqueiro BIC', marca: 'TABACARIA', sabores: [{ sabor: 'Grande', qty: 12 }] },
+    { modelo: 'Chiclete Trento', marca: 'Complementos', sabores: [{ sabor: 'Menta', qty: 5 }] },
+    { modelo: 'Kitkat', sabores: [{ sabor: 'Ao leite', qty: 4 }] },
+  ],
+};
+
+teste('/estoque tira Tabacaria e Complementos dos pods pela marca', async (ctx) => {
+  configNaoPods();
+  respostas.bot_ler_estoque = ESTOQUE_COM_MARCA;
+  const [resp] = await mandar(ctx.webhook, update('/estoque'));
+  // 10 do Ignite + 8 do Elfbar (marca vazia, fora da lista = pod).
+  assert.ok(resp.text.includes('🧮 Total de pods: *18*'), resp.text);
+  const listaPods = resp.text.split('🍬')[0];
+  for (const n of ['Seda', 'Isqueiro', 'Chiclete', 'Kitkat']) assert.ok(!listaPods.includes(n), `${n} na lista de pods`);
+  assert.ok(resp.text.includes('Seda Smoking 30'), resp.text);
+  assert.ok(resp.text.includes('Isqueiro BIC 12'), resp.text);
+  assert.ok(resp.text.includes('Chiclete Trento 5'), resp.text);
+  assert.ok(resp.text.includes('Kitkat 4'), resp.text);
+  assert.ok(resp.text.includes('(total 51)'), resp.text);
+});
+
+teste('/estoque detalhado também separa pela marca', async (ctx) => {
+  configNaoPods();
+  respostas.bot_ler_estoque = ESTOQUE_COM_MARCA;
+  const respostasBot = await mandar(ctx.webhook, update('/estoque detalhado'));
+  await new Promise(r => setTimeout(r, 150));
+  const t = respostasBot.map(r => r.text).join('\n');
+  assert.ok(t.startsWith('📦 *Estoque detalhado* · 18 pods'), t);
+  assert.ok(t.includes('🍬 *Acompanhamentos* · 51 un'), t);
+  assert.ok(t.indexOf('Acompanhamentos') < t.indexOf('Seda Smoking'), t);
+  assert.ok(t.indexOf('Acompanhamentos') < t.indexOf('Chiclete Trento'), t);
+});
+
+teste('ehAcompanhamento: marca decide; marca vazia cai na lista', async (ctx) => {
+  const palavras = ['fini'];
+  assert.strictEqual(ctx.mod.ehAcompanhamento('Seda', palavras, 'Tabacaria'), true);
+  assert.strictEqual(ctx.mod.ehAcompanhamento('Chiclete', palavras, ' complementos '), true);
+  assert.strictEqual(ctx.mod.ehAcompanhamento('Ignite 50000', palavras, 'Ignite'), false);
+  assert.strictEqual(ctx.mod.ehAcompanhamento('Fini Beijos', palavras, 'Ignite'), true, 'lista continua valendo');
+  assert.strictEqual(ctx.mod.ehAcompanhamento('Seda', palavras, ''), false);
+  assert.strictEqual(ctx.mod.ehAcompanhamento('Seda', palavras, null), false);
+});
+
 // --- Grupos de PEDIDOS e FATURAMENTO não mexem em estoque nem em caixa -----
 
 teste('baixa no grupo de PEDIDOS é recusada, sem tocar no estoque', async (ctx) => {

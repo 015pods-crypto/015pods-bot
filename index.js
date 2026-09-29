@@ -128,9 +128,13 @@ async function readEstoque() {
   const produtos = [];
   for (const grupo of data || []) {
     const modelo = (grupo.modelo || '').toString().trim();
+    // Marca do modelo ("Tabacaria", "Complementos", "Ignite"). Só o /estoque
+    // usa, pra separar pod do resto; vazia quando o banco não mandar.
+    const marca = (grupo.marca ?? '').toString().trim();
     for (const s of grupo.sabores || []) {
       produtos.push({
         modelo,
+        marca,
         sabor: (s.sabor || '').toString().trim(),
         qtd: parseInt(s.qty, 10) || 0,
       });
@@ -529,8 +533,12 @@ async function marcarVendasAtacado(chatId, baixas) {
 //
 // A lista vem de integration_config ('bot_nao_pods'), CSV: acompanhamento novo
 // é update no config, sem deploy. Um modelo é acompanhamento quando o NOME
-// contém qualquer uma das palavras.
+// contém qualquer uma das palavras, OU quando a MARCA dele é uma das marcas
+// que não são pod (seda, filtro, isqueiro não têm palavra comum no nome, mas
+// estão todos em Tabacaria/Complementos). Marca vazia: vale só a lista.
 // ---------------------------------------------------------------------------
+
+const MARCAS_NAO_PODS = ['tabacaria', 'complementos', 'complemento'];
 
 // Rede de segurança pro config fora do ar: sem isso o /estoque voltaria a
 // somar tudo junto, calado, que é exatamente o problema que estamos tirando.
@@ -545,7 +553,9 @@ async function palavrasNaoPods() {
   return lista.length ? lista : NAO_PODS_PADRAO;
 }
 
-function ehAcompanhamento(modelo, palavras) {
+function ehAcompanhamento(modelo, palavras, marca) {
+  const m = semAcento(String(marca || '')).toLowerCase().trim();
+  if (m && MARCAS_NAO_PODS.includes(m)) return true;
   const nome = semAcento(String(modelo || '')).toLowerCase();
   return palavras.some(p => nome.includes(semAcento(p).toLowerCase()));
 }
@@ -583,7 +593,12 @@ function porModeloOrdenado(produtos) {
     mapa.get(modelo).push(p);
   }
   return [...mapa.entries()]
-    .map(([modelo, sabores]) => ({ modelo, sabores, total: sabores.reduce((s, x) => s + x.qtd, 0) }))
+    .map(([modelo, sabores]) => ({
+      modelo,
+      sabores,
+      marca: (sabores.find(x => x.marca) || {}).marca || '',
+      total: sabores.reduce((s, x) => s + x.qtd, 0),
+    }))
     .sort((a, b) => b.total - a.total || a.modelo.localeCompare(b.modelo, 'pt-BR'));
 }
 
@@ -605,8 +620,8 @@ async function handleEstoque(chatId, text) {
 
   const palavras = await palavrasNaoPods();
   const grupos = porModeloOrdenado(produtos);
-  const pods = grupos.filter(g => !ehAcompanhamento(g.modelo, palavras));
-  const acomp = grupos.filter(g => ehAcompanhamento(g.modelo, palavras));
+  const pods = grupos.filter(g => !ehAcompanhamento(g.modelo, palavras, g.marca));
+  const acomp = grupos.filter(g => ehAcompanhamento(g.modelo, palavras, g.marca));
   const totalPods = pods.reduce((s, g) => s + g.total, 0);
 
   if (!detalhado) {
