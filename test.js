@@ -739,6 +739,28 @@ teste('o fechamento do relatório diário puxa despesas E dinheiro do ciclo', as
   assert.ok(texto.includes('Rod repassa R$ 57,00'), texto);
 });
 
+// Ciclo de transição (21/09 → 30/09) e mês cheio: o fechamento segue o
+// fecha_hoje da RPC, sem dia fixo no bot.
+teste('fechamento do ciclo de transição sai quando fecha_hoje = true (30/09)', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: {
+    ok: true, mes: '21/09 → 30/09', fecha_hoje: true, unidades_mes: 80, unidades_hoje: 3, taxa_atual: 2, comissao: 160,
+  } };
+  respostas.bot_despesas_rod = { status: 200, body: { ok: true, total: 0, itens: [] } };
+  const texto = await ctx.mod.textoComissaoRelatorio();
+  assert.ok(texto.startsWith('🔒 *FECHAMENTO DO PERÍODO 21/09 → 30/09*'), texto);
+  assert.ok(texto.includes('Comissão: *R$ 160,00*'), texto);
+});
+
+teste('dia 20 de outubro sem fecha_hoje não fecha nada', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: {
+    ok: true, mes: '01/10 → 31/10', fecha_hoje: false, unidades_mes: 50, unidades_hoje: 2, taxa_atual: 2, comissao: 100,
+    faltam_para_proxima: 10, proxima_taxa: 2.5,
+  } };
+  const texto = await ctx.mod.textoComissaoRelatorio();
+  assert.ok(!texto.includes('FECHAMENTO'), texto);
+  assert.ok(texto.startsWith('📊 *Comissão — 01/10 → 31/10*'), texto);
+});
+
 // --- /refazerfechamento (correção do corte 19 → 20) ------------------------
 
 teste('/refazerfechamento publica a correção no grupo de vendas', async (ctx) => {

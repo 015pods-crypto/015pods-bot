@@ -720,7 +720,9 @@ function fmtValor(n) {
 }
 
 // Busca os dados da RPC bot_comissao. Nunca lança: erro vira null.
-// `mes` é o período ("20/07 → 19/08"); `fecha_hoje` = último dia do período.
+// `mes` é o período ("01/10 → 31/10"); `fecha_hoje` = último dia do período.
+// O bot NÃO sabe onde o ciclo começa ou termina: quem decide é a RPC (era
+// 21 → 20, virou mês cheio a partir de outubro/2026). Nada aqui tem dia fixo.
 async function dadosComissao() {
   try {
     const d = await callRpc('bot_comissao', { p_token: BOT_SYNC_TOKEN });
@@ -840,7 +842,7 @@ function montarFechamento(d, desp, dinh, opts = {}) {
 // ---------------------------------------------------------------------------
 // Registros do Rod (despesa + dinheiro em mãos)
 // "+25 ENTREGA" / "+100 DINHEIRO" no grupo → linha em despesas_rod (coluna
-// `tipo`), amarrada ao ciclo vigente (21/mm → 20/mm+1, corte 20 às 23:59).
+// `tipo`), amarrada ao ciclo vigente — que o banco define (bot_ciclo), não o bot.
 // Persistido no banco, nunca em memória: o Render reinicia o processo a
 // qualquer momento.
 // ---------------------------------------------------------------------------
@@ -1025,7 +1027,7 @@ async function handleRefazerFechamento(chatId, text, userId) {
   if (!ehDono(userId)) { await sendTelegram(chatId, '⛔ Só o dono pode refazer o fechamento.'); return; }
   const data = parseDataComando(text);
   if (!data) {
-    await sendTelegram(chatId, 'Uso: /refazerfechamento 20/08 (data de corte do ciclo)');
+    await sendTelegram(chatId, 'Uso: /refazerfechamento 30/09 (data de corte do ciclo)');
     return;
   }
 
