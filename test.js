@@ -643,7 +643,8 @@ teste('/geral mostra comissão, despesas, dinheiro e o acerto do ciclo', async (
   assert.ok(resp.text.includes('3 lançamento(s) → *R$ 143,00*'), resp.text);
   assert.ok(resp.text.includes('2 lançamento(s) → *R$ 500,00*'), resp.text);
   // 500 − (300 + 143) = 57
-  assert.ok(resp.text.includes('Rod repassa R$ 57,00'), resp.text);
+  assert.ok(resp.text.includes('A pagar: comissão + fixo + despesas = *R$ 3.643,00*'), resp.text);
+  assert.ok(resp.text.includes('Loja paga R$ 3.143,00 ao Rod'), resp.text);
 });
 
 teste('/geral com sinal invertido diz que a loja paga o Rod', async (ctx) => {
@@ -694,9 +695,9 @@ teste('fechamento inclui despesas, dinheiro em mãos e o acerto', async (ctx) =>
   assert.ok(texto.includes('FECHAMENTO DO PERÍODO 21/07 → 20/08'), texto);
   assert.ok(texto.includes('💰 Comissão: *R$ 300,00*'), texto);
   assert.ok(texto.includes('🛵 Entregas/despesas Rod: R$ 143,00'), texto);
-  assert.ok(texto.includes('Total a pagar: R$ 443,00'), texto);
+  assert.ok(texto.includes('Total a pagar: R$ 3.643,00'), texto);
   assert.ok(texto.includes('💵 Dinheiro em mãos (Rod): R$ 500,00'), texto);
-  assert.ok(texto.includes('Rod repassa R$ 57,00'), texto);
+  assert.ok(texto.includes('Loja paga R$ 3.143,00 ao Rod'), texto);
 });
 
 teste('fechamento avisa quando não conseguiu somar as despesas (não paga a menos calado)', async (ctx) => {
@@ -716,7 +717,7 @@ teste('fechamento avisa quando não conseguiu somar o dinheiro em mãos', async 
     { ok: true, total: 143 },
     null,
   );
-  assert.ok(texto.includes('Total a pagar: R$ 443,00'), texto);
+  assert.ok(texto.includes('Total a pagar: R$ 3.643,00'), texto);
   assert.ok(texto.includes('Não consegui somar o dinheiro'), texto);
   assert.ok(!texto.includes('Acerto'), texto);
 });
@@ -734,9 +735,9 @@ teste('o fechamento do relatório diário puxa despesas E dinheiro do ciclo', as
     : { status: 200, body: { ok: true, total: 143, itens: [] } };
 
   const texto = await ctx.mod.textoComissaoRelatorio();
-  assert.ok(texto.includes('Total a pagar: R$ 443,00'), texto);
+  assert.ok(texto.includes('Total a pagar: R$ 3.643,00'), texto);
   assert.ok(texto.includes('Dinheiro em mãos (Rod): R$ 500,00'), texto);
-  assert.ok(texto.includes('Rod repassa R$ 57,00'), texto);
+  assert.ok(texto.includes('Loja paga R$ 3.143,00 ao Rod'), texto);
 });
 
 // Ciclo de transição (21/09 → 30/09) e mês cheio: o fechamento segue o
@@ -759,6 +760,108 @@ teste('dia 20 de outubro sem fecha_hoje não fecha nada', async (ctx) => {
   const texto = await ctx.mod.textoComissaoRelatorio();
   assert.ok(!texto.includes('FECHAMENTO'), texto);
   assert.ok(texto.startsWith('📊 *Comissão — 01/10 → 31/10*'), texto);
+});
+
+// --- Fixo mensal (R$ 3.200; proporcional fora do mês cheio) --------------
+
+teste('fixo: transição 21/09 → 30/09 paga 10 dias; mês cheio paga inteiro', async (ctx) => {
+  assert.deepStrictEqual(ctx.mod.fixoDoCiclo('21/09 → 30/09', '2026-09-30'), { valor: 1066.67, dias: 10, cheio: false });
+  assert.deepStrictEqual(ctx.mod.fixoDoCiclo('01/10 → 31/10', '2026-10-05'), { valor: 3200, dias: 31, cheio: true });
+  assert.deepStrictEqual(ctx.mod.fixoDoCiclo('01/11 → 30/11', '2026-11-05'), { valor: 3200, dias: 30, cheio: true });
+  assert.deepStrictEqual(ctx.mod.fixoDoCiclo('01/02 → 28/02', '2027-02-10'), { valor: 3200, dias: 28, cheio: true });
+  // Ciclo antigo 21 → 20 (31 dias) não passa do fixo inteiro.
+  assert.strictEqual(ctx.mod.fixoDoCiclo('21/07 → 20/08', '2026-08-20').valor, 3200);
+  assert.strictEqual(ctx.mod.fixoDoCiclo('sem período'), null);
+  assert.strictEqual(ctx.mod.FIXO_MENSAL, 3200);
+  // Datas separadas no retorno valem mais que o rótulo.
+  assert.deepStrictEqual(ctx.mod.fixoDoCiclo({ mes: 'Setembro (transição)', ciclo_inicio: '2026-09-21', ciclo_fim: '2026-09-30' }),
+    { valor: 1066.67, dias: 10, cheio: false });
+  assert.deepStrictEqual(ctx.mod.fixoDoCiclo({ mes: '01/10/2026 a 31/10/2026' }), { valor: 3200, dias: 31, cheio: true });
+});
+
+const COMISSAO_TRANSICAO = {
+  status: 200,
+  body: { ok: true, mes: '21/09 → 30/09', fecha_hoje: true, unidades_mes: 80, unidades_hoje: 3, taxa_atual: 2, comissao: 160 },
+};
+function despesasTransicao() {
+  respostas.bot_despesas_rod = (body) => body.p_tipo === 'dinheiro'
+    ? { status: 200, body: { ok: true, total: 500, itens: [{ valor: 500, descricao: 'DINHEIRO', data: '25/09' }] } }
+    : { status: 200, body: { ok: true, total: 100, itens: [
+      { valor: 25, descricao: 'ENTREGA centro', data: '22/09' },
+      { valor: 50, descricao: 'ENTREGA', data: '23/09' },
+      { valor: 25, descricao: 'UBER', data: '24/09' },
+    ] } };
+}
+
+teste('fechamento de 30/09 soma o fixo proporcional no total e no acerto', async (ctx) => {
+  respostas.bot_comissao = COMISSAO_TRANSICAO;
+  despesasTransicao();
+  const texto = await ctx.mod.textoComissaoRelatorio();
+  assert.ok(texto.includes('📌 Fixo proporcional (10 dias): R$ 1.066,67'), texto);
+  // 160 + 1066,67 + 100 = 1326,67; dinheiro 500 -> loja paga 826,67.
+  assert.ok(texto.includes('Total a pagar: R$ 1.326,67'), texto);
+  assert.ok(texto.includes('Loja paga R$ 826,67 ao Rod'), texto);
+});
+
+teste('fechamento de outubro soma o fixo cheio', async (ctx) => {
+  const texto = ctx.mod.montarFechamento(
+    { mes: '01/10 → 31/10', unidades_mes: 100, taxa_atual: 2, comissao: 200 },
+    { ok: true, total: 0 }, { ok: true, total: 0 }, { ref: '2026-10-31' },
+  );
+  assert.ok(texto.includes('📌 Fixo: R$ 3.200,00'), texto);
+  assert.ok(texto.includes('Total a pagar: R$ 3.400,00'), texto);
+});
+
+teste('período ilegível: avisa e não soma um total sem o fixo', async (ctx) => {
+  const texto = ctx.mod.montarFechamento(
+    { mes: '???', unidades_mes: 100, taxa_atual: 2, comissao: 200 }, { ok: true, total: 10 }, { ok: true, total: 0 });
+  assert.ok(texto.includes('calcular o fixo'), texto);
+  assert.ok(!texto.includes('Total a pagar'), texto);
+  assert.ok(!texto.includes('Acerto'), texto);
+});
+
+teste('/geral inclui o fixo proporcional no acerto', async (ctx) => {
+  respostas.bot_comissao = COMISSAO_TRANSICAO;
+  despesasTransicao();
+  const [resp] = await mandar(ctx.webhook, update('/geral'));
+  assert.ok(resp.text.includes('📌 Fixo proporcional (10 dias): R$ 1.066,67'), resp.text);
+  assert.ok(resp.text.includes('= *R$ 1.326,67*'), resp.text);
+  assert.ok(resp.text.includes('Loja paga R$ 826,67 ao Rod'), resp.text);
+});
+
+teste('/refazerfechamento 30/09 usa o fixo proporcional', async (ctx) => {
+  respostas.bot_comissao = COMISSAO_TRANSICAO;
+  despesasTransicao();
+  const resp = await mandar(ctx.webhook, update('/refazerfechamento 30/09/2026', { chat: DONO, tipo: 'private' }));
+  await new Promise(r => setTimeout(r, 100));
+  const pub = enviadas.find(m => String(m.chat_id) === String(GRUPO_VENDAS));
+  assert.ok(pub && pub.text.includes('Fixo proporcional (10 dias): R$ 1.066,67'), JSON.stringify(resp));
+  assert.ok(pub.text.includes('Total a pagar: R$ 1.326,67'), pub.text);
+});
+
+teste('/fechamento mostra a PARCIAL com fixo, despesas por tipo e total', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: { ...COMISSAO_TRANSICAO.body, fecha_hoje: false } };
+  despesasTransicao();
+  const [resp] = await mandar(ctx.webhook, update('/fechamento'));
+  const t = resp.text;
+  assert.ok(t.startsWith('⏳ *FECHAMENTO PARCIAL — 21/09 → 30/09*'), t);
+  assert.ok(/📅 Dia \d+ de 10 do ciclo/.test(t), t);
+  assert.ok(t.includes('Pods até agora: *80*'), t);
+  assert.ok(t.includes('Faixa atual: R$ 2,00/produto'), t);
+  assert.ok(t.includes('📌 Fixo proporcional (10 dias): R$ 1.066,67'), t);
+  assert.ok(t.includes('🛵 Despesas extras: R$ 100,00'), t);
+  assert.ok(t.includes('• ENTREGA: R$ 75,00'), t);
+  assert.ok(t.includes('• UBER: R$ 25,00'), t);
+  assert.ok(t.includes('Total a pagar até agora: R$ 1.326,67'), t);
+  assert.ok(t.includes('💵 Dinheiro com o Rod: R$ 500,00'), t);
+  assert.ok(t.includes('Loja paga R$ 826,67 ao Rod'), t);
+  assert.ok(!t.includes('🔒'), 'parcial não pode parecer fechamento');
+});
+
+teste('/fechamento é ignorado fora dos grupos atendidos (como o /geral)', async (ctx) => {
+  respostas.bot_comissao = COMISSAO_TRANSICAO;
+  await mandar(ctx.webhook, update('/fechamento', { chat: -999999 }), { esperaResposta: false });
+  assert.strictEqual(enviadas.length, 0);
 });
 
 // --- /refazerfechamento (correção do corte 19 → 20) ------------------------
@@ -1827,7 +1930,7 @@ teste('fechamento mostra a quebra de atacado', async (ctx) => {
   assert.ok(texto.includes('Unidades: *812* (780 varejo + 32 atacado)'), texto);
   assert.ok(texto.includes('Atacado: 32 × R$ 2,00 = R$ 64,00'), texto);
   assert.ok(texto.includes('💰 Comissão: *R$ 2.131,00*'), texto);
-  assert.ok(texto.includes('Total a pagar: R$ 2.274,00'), texto);
+  assert.ok(texto.includes('Total a pagar: R$ 5.474,00'), texto);
 });
 
 // --- Comprovantes de pagamento --------------------------------------------

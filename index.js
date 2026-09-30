@@ -41,7 +41,7 @@ const COMANDOS = [
   '/setgrupofaturamento', '/faturamento', '/lembrete-teste',
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
-  '/apagar', '/instrucoes',
+  '/apagar', '/instrucoes', '/fechamento',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -801,13 +801,85 @@ function linhaAcerto(dinheiro, aPagar) {
     : `⚖️ Acerto: *Loja paga R$ ${fmtBR(-acerto)} ao Rod*`;
 }
 
-// Fechamento = comissão + despesas do Rod + dinheiro em mãos do mesmo ciclo.
+// ---------------------------------------------------------------------------
+// Fixo mensal do Rod
+//
+// Nunca esteve no banco: é pago junto com a comissão, e o fechamento só somava
+// comissão + despesas. Mês cheio (dia 1 ao último dia) paga o fixo inteiro;
+// ciclo que não é mês cheio (o de transição 21/09 → 30/09) paga proporcional:
+// FIXO ÷ 30 × dias. O proporcional nunca passa do fixo inteiro — um ciclo
+// antigo 21 → 20 de 31 dias, refeito pelo /refazerfechamento, paga 3.200 e
+// não 3.306,67.
+//
+// Os dias saem do período que a bot_comissao devolve em `mes` ("21/09 →
+// 30/09"), então o bot continua sem dia de ciclo fixo no código.
+// ---------------------------------------------------------------------------
+
+const FIXO_MENSAL = 3200;
+
+// "21/09 → 30/09" (com ou sem ano) -> { inicio: Date, fim: Date } em UTC puro
+// (só data). O ano, quando não vem, é o de `refISO`; se o início tem mês
+// maior que o fim (dez → jan), o início é do ano anterior. Null se não casar.
+function periodoDoCiclo(mes, refISO = hojeISO()) {
+  // Retorno da RPC com as datas separadas ({ ciclo_inicio, ciclo_fim } ou
+  // { inicio, fim }, ISO): vale mais que o rótulo, que é texto pra gente ler.
+  if (mes && typeof mes === 'object') {
+    const ini = mes.ciclo_inicio || mes.inicio;
+    const fim = mes.ciclo_fim || mes.fim;
+    const iso = x => /^\d{4}-\d{2}-\d{2}/.test(String(x || '')) ? new Date(`${String(x).slice(0, 10)}T00:00:00Z`) : null;
+    const pi = iso(ini), pf = iso(fim);
+    if (pi && pf && pf >= pi) return { inicio: pi, fim: pf };
+    return periodoDoCiclo(mes.mes, refISO);
+  }
+  const m = String(mes || '').match(
+    /(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?\s*(?:→|->|a|até|-)\s*(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?/);
+  if (!m) return null;
+  const anoRef = parseInt(String(refISO).slice(0, 4), 10);
+  const [di, mi, df, mf] = [m[1], m[2], m[4], m[5]].map(x => parseInt(x, 10));
+  const anoFim = m[6] ? parseInt(m[6], 10) : anoRef;
+  const anoIni = m[3] ? parseInt(m[3], 10) : (mi > mf ? anoFim - 1 : anoFim);
+  const inicio = new Date(Date.UTC(anoIni, mi - 1, di));
+  const fim = new Date(Date.UTC(anoFim, mf - 1, df));
+  if (Number.isNaN(inicio.getTime()) || Number.isNaN(fim.getTime()) || fim < inicio) return null;
+  return { inicio, fim };
+}
+
+function diasEntre(a, b) {
+  return Math.round((b - a) / 864e5) + 1; // inclusivo
+}
+
+// { valor, dias, cheio } do fixo de um ciclo; null se o período não for lido
+// (aí o fechamento avisa em vez de pagar um total errado).
+function fixoDoCiclo(mes, refISO) {
+  const p = periodoDoCiclo(mes, refISO);
+  if (!p) return null;
+  const dias = diasEntre(p.inicio, p.fim);
+  const ultimoDoMes = new Date(Date.UTC(p.inicio.getUTCFullYear(), p.inicio.getUTCMonth() + 1, 0));
+  const cheio = p.inicio.getUTCDate() === 1 &&
+    p.fim.getUTCFullYear() === ultimoDoMes.getUTCFullYear() &&
+    p.fim.getUTCMonth() === ultimoDoMes.getUTCMonth() &&
+    p.fim.getUTCDate() === ultimoDoMes.getUTCDate();
+  const valor = cheio ? FIXO_MENSAL : Math.min(FIXO_MENSAL, Math.round(FIXO_MENSAL / 30 * dias * 100) / 100);
+  return { valor, dias, cheio: cheio || valor === FIXO_MENSAL };
+}
+
+function linhaFixo(fixo) {
+  return fixo.cheio
+    ? `📌 Fixo: R$ ${fmtBR(fixo.valor)}`
+    : `📌 Fixo proporcional (${fixo.dias} dias): R$ ${fmtBR(fixo.valor)}`;
+}
+
+const AVISO_FIXO = '⚠️ _Não consegui ler o período do ciclo pra calcular o fixo — confira antes de pagar._';
+
+// Fechamento = comissão + fixo + despesas do Rod + dinheiro em mãos do mesmo ciclo.
 // `desp`/`dinh` null = a RPC falhou: o total NÃO é somado e o texto avisa,
 // porque um total silenciosamente menor viraria pagamento errado.
 // `opts` troca título/rodapé — é como o /refazerfechamento publica a correção
-// sem se passar por um fechamento novo.
+// sem se passar por um fechamento novo. `opts.ref` (ISO) é a data de
+// referência do ciclo, de onde sai o ano do período.
 function montarFechamento(d, desp, dinh, opts = {}) {
   const comissao = Number(d.comissao) || 0;
+  const fixo = fixoDoCiclo(d, opts.ref);
   const titulo = opts.titulo || `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`;
   const rodape = opts.rodape || '_(amanhã começa o novo período)_';
   const quebra = linhasQuebraAtacado(d);
@@ -819,12 +891,14 @@ function montarFechamento(d, desp, dinh, opts = {}) {
     ]),
     `💰 Comissão: *R$ ${fmtBR(comissao)}*`,
   ];
+  if (fixo) linhas.push(linhaFixo(fixo));
+  else linhas.push(AVISO_FIXO);
   let aPagar = null;
   if (!desp) {
     linhas.push('⚠️ _Não consegui somar as entregas/despesas do Rod — confira antes de pagar._');
-  } else {
+  } else if (fixo) {
     const despesas = Number(desp.total) || 0;
-    aPagar = comissao + despesas;
+    aPagar = comissao + fixo.valor + despesas;
     linhas.push(`🛵 Entregas/despesas Rod: R$ ${fmtBR(despesas)}`);
     linhas.push(`🧾 *Total a pagar: R$ ${fmtBR(aPagar)}*`);
   }
@@ -965,6 +1039,11 @@ async function handleGeral(chatId) {
     linhas.push(`Total: *R$ ${fmtBR(comissao)}*`);
   }
 
+  const fixo = com ? fixoDoCiclo(com) : null;
+  linhas.push('');
+  if (fixo) linhas.push(linhaFixo(fixo));
+  else linhas.push('📌 *Fixo*: ⚠️ não consegui calcular');
+
   const despesas = desp ? Number(desp.total) || 0 : null;
   linhas.push('');
   if (!desp) {
@@ -986,12 +1065,80 @@ async function handleGeral(chatId) {
   }
 
   linhas.push('');
-  if (comissao == null || despesas == null || dinheiro == null) {
+  if (comissao == null || despesas == null || dinheiro == null || !fixo) {
     linhas.push('⚖️ *Acerto*: ⚠️ falta dado acima — não dá pra fechar a conta.');
   } else {
-    linhas.push(linhaAcerto(dinheiro, comissao + despesas));
+    linhas.push(`🧾 A pagar: comissão + fixo + despesas = *R$ ${fmtBR(comissao + fixo.valor + despesas)}*`);
+    linhas.push(linhaAcerto(dinheiro, comissao + fixo.valor + despesas));
   }
 
+  await sendTelegram(chatId, linhas.join('\n'));
+}
+
+// /fechamento — PARCIAL do ciclo vigente, no formato do fechamento, sem
+// fechar nada (não grava, não publica em outro grupo). Mesmas permissões do
+// /geral: onde ele responde, este responde.
+function despesasPorTipo(itens) {
+  const mapa = new Map();
+  for (const it of itens || []) {
+    const tipo = (String(it.descricao ?? '').trim().split(/\s+/)[0] || 'OUTROS').toUpperCase();
+    mapa.set(tipo, (mapa.get(tipo) || 0) + (Number(it.valor) || 0));
+  }
+  return [...mapa.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+async function handleFechamentoParcial(chatId) {
+  const [com, desp, dinh] = await Promise.all([
+    dadosComissao(),
+    dadosRegistrosRod(null, 'despesa'),
+    dadosRegistrosRod(null, 'dinheiro'),
+  ]);
+  if (!com) { await sendTelegram(chatId, '⚠️ Erro ao consultar comissão — não dá pra montar a parcial.'); return; }
+
+  const linhas = [`⏳ *FECHAMENTO PARCIAL — ${escapeMd(String(com.mes ?? ''))}*`, '_Até agora. Nada foi fechado._'];
+  const periodo = periodoDoCiclo(com);
+  if (periodo) {
+    const total = diasEntre(periodo.inicio, periodo.fim);
+    const hoje = new Date(`${hojeISO()}T00:00:00Z`);
+    const passados = Math.max(0, Math.min(total, diasEntre(periodo.inicio, hoje)));
+    linhas.push(`📅 Dia ${passados} de ${total} do ciclo`);
+  }
+  linhas.push('');
+
+  const comissao = Number(com.comissao) || 0;
+  linhas.push(...(linhasQuebraAtacado(com) || [
+    `Pods até agora: *${com.unidades_mes ?? 0}*`,
+    `Faixa atual: R$ ${fmtBR(com.taxa_atual)}/produto`,
+  ]));
+  linhas.push(`💰 Comissão: *R$ ${fmtBR(comissao)}*`);
+
+  const fixo = fixoDoCiclo(com);
+  linhas.push(fixo ? linhaFixo(fixo) : AVISO_FIXO);
+
+  let despesas = null;
+  if (!desp) {
+    linhas.push('⚠️ _Não consegui somar as entregas/despesas do Rod._');
+  } else {
+    despesas = Number(desp.total) || 0;
+    const tipos = despesasPorTipo(desp.itens);
+    linhas.push(`🛵 Despesas extras: R$ ${fmtBR(despesas)}`);
+    for (const [tipo, valor] of tipos) linhas.push(`   • ${escapeMd(tipo)}: R$ ${fmtBR(valor)}`);
+  }
+
+  let aPagar = null;
+  if (despesas != null && fixo) {
+    aPagar = comissao + fixo.valor + despesas;
+    linhas.push(`🧾 *Total a pagar até agora: R$ ${fmtBR(aPagar)}*`);
+  }
+
+  if (!dinh) {
+    linhas.push('⚠️ _Não consegui somar o dinheiro em mãos do Rod._');
+  } else {
+    const dinheiro = Number(dinh.total) || 0;
+    linhas.push(`💵 Dinheiro com o Rod: R$ ${fmtBR(dinheiro)}`);
+    if (aPagar != null) linhas.push(linhaAcerto(dinheiro, aPagar));
+  }
+  linhas.push('', '_Parcial: os números ainda mudam até o fechamento das 23:59 do último dia._');
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
@@ -1046,6 +1193,7 @@ async function handleRefazerFechamento(chatId, text, userId) {
   const texto = montarFechamento(d, await dadosRegistrosRod(data), await dadosRegistrosRod(data, 'dinheiro'), {
     titulo: `🔁 *FECHAMENTO CORRIGIDO — ${escapeMd(String(d.mes ?? ''))}*`,
     rodape: `_Novo corte: ${dia}/${mes} às 23:59. Substitui o fechamento anterior._`,
+    ref: data,
   });
 
   await sendTelegram(VENDAS_CHAT_ID, texto);
@@ -3652,6 +3800,7 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/despesas') { await handleListaRod(chatId, 'despesa'); return; }
     if (cmd === '/dinheiro') { await handleListaRod(chatId, 'dinheiro'); return; }
     if (cmd === '/geral') { await handleGeral(chatId); return; }
+    if (cmd === '/fechamento') { await handleFechamentoParcial(chatId); return; }
     // /anular é liberado (registra o autor); /desanular e /refazerfechamento
     // continuam só do dono — a checagem é feita dentro dos handlers.
     if (cmd === '/anular') { await handleAnular(chatId, text, msg.from); return; }
@@ -3805,6 +3954,10 @@ module.exports = {
   LEMBRETE_CHIPS,
   CRON_LEMBRETE_CHIPS,
   parseValorArg,
+  fixoDoCiclo,
+  periodoDoCiclo,
+  handleFechamentoParcial,
+  FIXO_MENSAL,
   chatAtualizacoes,
   textoFixada,
   haQuanto,
