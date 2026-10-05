@@ -887,7 +887,7 @@ teste('/refazerfechamento publica a correção no grupo de vendas', async (ctx) 
   const noGrupo = enviadas.find(e => String(e.chat_id) === String(GRUPO_VENDAS));
   assert.ok(noGrupo, `nada foi pro grupo: ${JSON.stringify(enviadas)}`);
   assert.ok(noGrupo.text.includes('FECHAMENTO CORRIGIDO — 20/07 → 20/08'), noGrupo.text);
-  assert.ok(noGrupo.text.includes('Novo corte: 20/08 às 23:59'), noGrupo.text);
+  assert.ok(noGrupo.text.includes('Novo corte: fim do dia 20/08 (2h59 da madrugada seguinte)'), noGrupo.text);
   assert.ok(noGrupo.text.includes('Substitui o fechamento anterior'), noGrupo.text);
   assert.ok(noGrupo.text.includes('*130* produtos'), noGrupo.text);
 
@@ -2156,10 +2156,11 @@ teste('falha ao ler a imagem NÃO impede a baixa', async (ctx) => {
     'a baixa tem que acontecer de qualquer jeito');
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
   assert.ok(resp.text.includes('Baixa registrada'), resp.text);
-  assert.ok(resp.text.includes('Não consegui ler o valor'), resp.text);
+  assert.ok(resp.text.includes('Não consegui ler o comprovante — a baixa foi feita normalmente'), resp.text);
 });
 
-teste('comprovante duplicado com legenda de baixa: baixa entra, comprovante avisa', async (ctx) => {
+// TRAVA: comprovante repetido com baixa na legenda não baixa NADA.
+teste('comprovante repetido com legenda de baixa: nenhuma baixa feita', async (ctx) => {
   respostas.bot_movimentar_estoque = baixaParaComprovante();
   respostaGemini = { status: 200, body: geminiJson({ valor: 165, codigo: 'E1', confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = {
@@ -2170,9 +2171,74 @@ teste('comprovante duplicado com legenda de baixa: baixa entra, comprovante avis
   const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
   await new Promise(r => setTimeout(r, 200));
 
+  assert.strictEqual(resp.text, '⚠️ Esse comprovante já foi registrado em 14/09 16:31. Nenhuma baixa feita.');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0, 'não pode baixar nada');
+  assert.strictEqual(enviadas.length, 1);
+});
+
+teste('repetido por valor (sem código) também trava a baixa', async (ctx) => {
+  respostas.bot_movimentar_estoque = baixaParaComprovante();
+  respostaGemini = { status: 200, body: geminiJson({ valor: 165, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = {
+    status: 200, body: { ok: true, duplicado: true, motivo: 'valor', valor: 165, anterior_em: '05/10 14:02' },
+  };
+  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
+  assert.strictEqual(resp.text, '⚠️ Esse comprovante já foi registrado em 05/10 14:02. Nenhuma baixa feita.');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('comprovante novo: registra ANTES e só então dá a baixa', async (ctx) => {
+  respostas.bot_movimentar_estoque = baixaParaComprovante();
+  respostaGemini = { status: 200, body: geminiJson({ valor: 165, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 165, qtd_dia: 1 } };
+  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
+  const ordem = chamadas.map(c => c.fn).filter(f => f === 'bot_comprovante_registrar' || f === 'bot_movimentar_estoque');
+  assert.deepStrictEqual(ordem, ['bot_comprovante_registrar', 'bot_movimentar_estoque']);
+  assert.ok(resp.text.includes('Baixa registrada') && resp.text.includes('Comprovante lido'), resp.text);
+});
+
+teste('baixa sem foto continua igual (nenhum comprovante envolvido)', async (ctx) => {
+  respostas.bot_movimentar_estoque = baixaParaComprovante();
+  const [resp] = await mandar(ctx.webhook, update('-1 ignite 40000 mix grape ice'));
   assert.ok(resp.text.includes('Baixa registrada'), resp.text);
-  assert.ok(resp.text.includes('COMPROVANTE JÁ ENVIADO'), resp.text);
-  assert.ok(!resp.text.includes('total do dia'), 'duplicado não soma no caixa');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
+  assert.strictEqual(chamadasGemini.length, 0);
+  assert.ok(!resp.text.includes('comprovante'), resp.text);
+});
+
+// --- ATACADO: legenda começando com /atacado também lê o comprovante -------
+
+teste('foto com "/atacado" + itens na legenda: baixa, marca E registra o comprovante', async (ctx) => {
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [baixaOk()] } };
+  respostas.bot_marcar_atacado = { status: 200, body: { ok: true, ja_marcada: false, sale_id: '77', unidades: 6 } };
+  respostaGemini = { status: 200, body: geminiJson({ valor: 900, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 900, qtd_dia: 1 } };
+
+  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '/atacado\n-6 elfbar 30000 cherry' }));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 1, 'o comprovante sumia aqui');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar')[0].body.p_valor, 900);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 1);
+  assert.ok(resp.text.includes('Comprovante lido: *R$ 900,00*'), resp.text);
+});
+
+teste('foto com "/atacado" + itens e comprovante repetido: nada é baixado nem marcado', async (ctx) => {
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [baixaOk()] } };
+  respostaGemini = { status: 200, body: geminiJson({ valor: 900, codigo: 'E9', confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: true, motivo: 'codigo', quando: '04/10 18:10' } };
+  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '/atacado\n-6 elfbar 30000 cherry' }));
+  assert.ok(resp.text.includes('Nenhuma baixa feita'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
+});
+
+teste('foto com "/atacado" sozinho: corrige a venda anterior E registra o comprovante', async (ctx) => {
+  respostaGemini = { status: 200, body: geminiJson({ valor: 900, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 900, qtd_dia: 1 } };
+  await mandar(ctx.webhook, updateArquivo({ caption: '/atacado' }));
+  await esperar(() => chamadas.some(c => c.fn === 'bot_comprovante_registrar'));
+  await new Promise(r => setTimeout(r, 100));
+  assert.ok(enviadas.some(e => String(e.text).includes('Comprovante lido: *R$ 900,00*')), JSON.stringify(enviadas));
 });
 
 teste('valor fora da faixa com legenda de baixa registra e avisa', async (ctx) => {
@@ -2324,6 +2390,41 @@ teste('o resumo diário das 23:59 leva o caixa junto', async (ctx) => {
   assert.ok(!/Diferen[çc]a/i.test(noGrupo.text), noGrupo.text);
 });
 
+// --- Dia da loja (vira às 3h) ---------------------------------------------
+
+teste('dia da loja vira às 3h, não à meia-noite', async (ctx) => {
+  const d = iso => ctx.mod.diaLojaISO(new Date(iso));
+  assert.strictEqual(d('2026-10-01T01:00:00-03:00'), '2026-09-30', '1h do dia 1º ainda é setembro');
+  assert.strictEqual(d('2026-10-01T02:59:59-03:00'), '2026-09-30');
+  assert.strictEqual(d('2026-10-01T03:00:00-03:00'), '2026-10-01');
+  assert.strictEqual(d('2026-09-30T23:59:00-03:00'), '2026-09-30');
+  assert.strictEqual(ctx.mod.ontemISO('2026-10-01'), '2026-09-30');
+  assert.strictEqual(ctx.mod.ontemISO('2027-03-01'), '2027-02-28');
+  assert.strictEqual(ctx.mod.ontemISO('2027-01-01'), '2026-12-31');
+});
+
+teste('fechamento diário roda às 3h e pede os números do dia que acabou', async (ctx) => {
+  assert.strictEqual(ctx.mod.CRON_RESUMO_VENDAS, '0 3 * * *');
+  respostas.bot_comissao = { status: 200, body: {
+    ok: true, mes: '01/10 → 31/10', fecha_hoje: true, unidades_mes: 100, unidades_hoje: 5, taxa_atual: 2, comissao: 200,
+  } };
+  respostas.bot_despesas_rod = { status: 200, body: { ok: true, total: 0, itens: [] } };
+  respostas.bot_caixa_dia = { status: 200, body: { ok: true, dia: '31/10', comprovantes_qtd: 0 } };
+  await ctx.mod.enviarResumoVendas('2026-10-31');
+
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_comissao').body.p_mes, '2026-10-31');
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_caixa_dia').body.p_data, '2026-10-31');
+  // p_ref é timestamptz: meio-dia de SP, pra não cair no dia anterior em UTC.
+  for (const c of chamadas.filter(x => x.fn === 'bot_despesas_rod')) {
+    assert.strictEqual(c.body.p_ref, '2026-10-31T12:00:00-03:00');
+  }
+  const msg = enviadas.find(e => String(e.chat_id) === String(GRUPO_VENDAS));
+  assert.ok(msg.text.includes('31/10/2026'), msg.text);
+  assert.ok(msg.text.includes('🔒 *FECHAMENTO DO PERÍODO 01/10 → 31/10*'), msg.text);
+  assert.ok(msg.text.includes('📌 Fixo: R$ 3.200,00'), msg.text);
+  assert.ok(msg.text.includes('o novo período já começou'), msg.text);
+});
+
 // --- Grupo de faturamento --------------------------------------------------
 
 const GRUPO_FATURAMENTO = -300;
@@ -2335,8 +2436,18 @@ function configComFaturamento(id = GRUPO_FATURAMENTO) {
     : { status: 200, body: { ok: true, valor: '' } };
 }
 
+// Fim do mês CORRENTE (pelo dia da loja, que vira às 3h). Os fixtures
+// abaixo representam "o mês que está rolando": com a data fixa em setembro,
+// a partir de outubro eles passavam a ser lidos como mês fechado e os testes
+// quebravam só por causa do calendário.
+const FIM_MES_CORRENTE = (() => {
+  const hoje = new Date(Date.now() - 3 * 3600e3).toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+  const [a, m] = hoje.split('-').map(Number);
+  return new Date(Date.UTC(a, m, 0)).toISOString().slice(0, 10);
+})();
+
 const CAIXA_MES = {
-  ok: true, mes: 'Setembro', de: '2026-09-01', ate: '2026-09-30',
+  ok: true, mes: 'Setembro', de: '2026-09-01', ate: FIM_MES_CORRENTE,
   hoje: { total: 1470, qtd: 10 },
   mes_total: 24380, mes_qtd: 165, ticket: 147.76,
   media_dia: 1283.15, projecao: 38494.5,
@@ -2514,7 +2625,7 @@ teste('o resumo de faturamento é agendado às 23:30 de Brasília', async (ctx) 
 const CAIXA_MES_PARCIAL = {
   ok: true, mes: 'Setembro', parcial: true,
   de: '2026-09-10', ate: '2026-09-20',
-  mes_de: '2026-09-01', mes_ate: '2026-09-30',
+  mes_de: '2026-09-01', mes_ate: FIM_MES_CORRENTE,
   dias_contados: 11, primeiro_registro: '2026-09-10',
   hoje: { total: 1470, qtd: 10 },
   mes_total: 19887.91, mes_qtd: 109, media_dia: 1807.99,
@@ -2567,7 +2678,7 @@ teste('mês completo (parcial=false) mantém o formato com projeção', async (c
   configComFaturamento();
   respostas.bot_caixa_mes = {
     status: 200,
-    body: { ...CAIXA_MES, parcial: false, mes_de: '2026-09-01', mes_ate: '2026-09-30' },
+    body: { ...CAIXA_MES, parcial: false, mes_de: '2026-09-01', mes_ate: FIM_MES_CORRENTE },
   };
   const [resp] = await mandar(ctx.webhook, update('/faturamento', { chat: GRUPO_FATURAMENTO }));
   assert.ok(resp.text.includes('Setembro até agora'), resp.text);

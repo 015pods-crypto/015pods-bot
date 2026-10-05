@@ -428,15 +428,30 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
   const parsed = lines.map(parseMovimentoLine).filter(Boolean);
   if (!parsed.length) return;
 
-  // Dispara a leitura do comprovante JÁ, sem await: ela corre junto com as RPCs
-  // de estoque em vez de somar a latência do Gemini na frente da baixa.
-  const lendoComprovante = msgComprovante
-    ? lerERegistrarComprovante(chatId, msgComprovante).catch(err => {
-        // Rede de segurança: a baixa não pode cair por causa da foto.
-        console.error('comprovante junto da baixa:', err.message);
-        return PEDE_VALOR;
-      })
-    : null;
+  // TRAVA DE COMPROVANTE REPETIDO: com foto junto, o comprovante é registrado
+  // ANTES da baixa. Se o banco disser que ele já entrou, nada é baixado — é o
+  // golpe de reenviar o comprovante de ontem pra levar pedido novo. Isso custa
+  // a latência do Gemini na frente da baixa, e é de propósito: baixar primeiro
+  // e descobrir o repetido depois deixaria o estoque já mexido.
+  // Foto que não deu pra ler não trava nada: a baixa sai e o bot avisa.
+  let textoComprovanteFinal = null;
+  if (msgComprovante) {
+    let comp = null;
+    try {
+      comp = await registrarComprovante(chatId, msgComprovante);
+    } catch (err) {
+      // Rede de segurança: a baixa não pode cair por causa da foto.
+      console.error('comprovante junto da baixa:', err.message);
+    }
+    if (comp && comp.duplicado) {
+      const quando = comp.quando ? ` em ${escapeMd(comp.quando)}` : '';
+      await sendTelegram(chatId, `⚠️ Esse comprovante já foi registrado${quando}. Nenhuma baixa feita.`);
+      return;
+    }
+    textoComprovanteFinal = comp && comp.lido
+      ? comp.texto
+      : '🤔 Não consegui ler o comprovante — a baixa foi feita normalmente. Confere o valor.';
+  }
 
   // Linhas que o parser entendeu viram itens { produto, qty } para a RPC; qty
   // negativo = baixa, positivo = entrada. Linhas com formato inválido (sem dar
@@ -492,10 +507,7 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
   const aMarcar = results.filter(r => r.ok && r.op === 'baixa' && r.atacado);
   if (aMarcar.length) linhasMsg.push(...(await marcarVendasAtacado(chatId, aMarcar)));
 
-  if (lendoComprovante) {
-    const texto = await lendoComprovante;
-    if (texto) linhasMsg.push('', texto);
-  }
+  if (textoComprovanteFinal) linhasMsg.push('', textoComprovanteFinal);
 
   await sendTelegram(chatId, linhasMsg.join('\n'));
 }
@@ -729,9 +741,11 @@ function fmtValor(n) {
 // `mes` é o período ("01/10 → 31/10"); `fecha_hoje` = último dia do período.
 // O bot NÃO sabe onde o ciclo começa ou termina: quem decide é a RPC (era
 // 21 → 20, virou mês cheio a partir de outubro/2026). Nada aqui tem dia fixo.
-async function dadosComissao() {
+async function dadosComissao(pMes) {
   try {
-    const d = await callRpc('bot_comissao', { p_token: BOT_SYNC_TOKEN });
+    const body = { p_token: BOT_SYNC_TOKEN };
+    if (pMes) body.p_mes = pMes;
+    const d = await callRpc('bot_comissao', body);
     return d && d.ok !== false ? d : null;
   } catch (err) {
     console.error('comissao:', err.message);
@@ -786,11 +800,13 @@ async function textoComissao() {
 
 // Bloco do resumo diário: no último dia do período (fecha_hoje=true) vira
 // cabeçalho de FECHAMENTO; nos demais dias é o formato padrão.
-async function textoComissaoRelatorio() {
-  const d = await dadosComissao();
+// `dia` (ISO) é o dia que o resumo fecha. O resumo roda às 3h, quando o dia
+// novo já começou: sem ele a RPC contaria o dia que mal começou.
+async function textoComissaoRelatorio(dia) {
+  const d = await dadosComissao(dia);
   if (!d) return '⚠️ Erro ao consultar comissão.';
   if (d.fecha_hoje) {
-    return montarFechamento(d, await dadosRegistrosRod(), await dadosRegistrosRod(null, 'dinheiro'));
+    return montarFechamento(d, await dadosRegistrosRod(dia), await dadosRegistrosRod(dia, 'dinheiro'), { ref: dia });
   }
   return formatComissao(d);
 }
@@ -887,7 +903,7 @@ function montarFechamento(d, desp, dinh, opts = {}) {
   const comissao = Number(d.comissao) || 0;
   const fixo = fixoDoCiclo(d, opts.ref);
   const titulo = opts.titulo || `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`;
-  const rodape = opts.rodape || '_(amanhã começa o novo período)_';
+  const rodape = opts.rodape || '_(o novo período já começou)_';
   const quebra = linhasQuebraAtacado(d);
   const linhas = [
     titulo,
@@ -933,7 +949,9 @@ function montarFechamento(d, desp, dinh, opts = {}) {
 async function dadosRegistrosRod(ref, tipo) {
   try {
     const body = { p_token: BOT_SYNC_TOKEN };
-    if (ref) body.p_ref = ref;
+    // p_ref é timestamptz: "2026-09-30" puro vira meia-noite UTC = 21h do dia
+    // 29 em São Paulo, o dia ERRADO. Meio-dia de SP cai no dia da loja certo.
+    if (ref) body.p_ref = /^\d{4}-\d{2}-\d{2}$/.test(ref) ? `${ref}T12:00:00-03:00` : ref;
     if (tipo) body.p_tipo = tipo;
     const d = await callRpc('bot_despesas_rod', body);
     return d && d.ok !== false ? d : null;
@@ -1144,7 +1162,7 @@ async function handleFechamentoParcial(chatId) {
     linhas.push(`💵 Dinheiro com o Rod: R$ ${fmtBR(dinheiro)}`);
     if (aPagar != null) linhas.push(linhaAcerto(dinheiro, aPagar));
   }
-  linhas.push('', '_Parcial: os números ainda mudam até o fechamento das 23:59 do último dia._');
+  linhas.push('', '_Parcial: os números ainda mudam até o fechamento das 3h depois do último dia._');
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
@@ -1169,9 +1187,7 @@ function parseDataComando(text) {
   const dia = parseInt(m[1], 10);
   const mes = parseInt(m[2], 10);
   if (dia < 1 || dia > 31 || mes < 1 || mes > 12) return null;
-  const anoCorrente = new Date()
-    .toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' })
-    .split('/')[2];
+  const anoCorrente = hojeISO().slice(0, 4);
   const ano = m[3] || anoCorrente;
   return `${ano}-${String(mes).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
 }
@@ -1198,7 +1214,7 @@ async function handleRefazerFechamento(chatId, text, userId) {
   const [, mes, dia] = data.split('-');
   const texto = montarFechamento(d, await dadosRegistrosRod(data), await dadosRegistrosRod(data, 'dinheiro'), {
     titulo: `🔁 *FECHAMENTO CORRIGIDO — ${escapeMd(String(d.mes ?? ''))}*`,
-    rodape: `_Novo corte: ${dia}/${mes} às 23:59. Substitui o fechamento anterior._`,
+    rodape: `_Novo corte: fim do dia ${dia}/${mes} (2h59 da madrugada seguinte). Substitui o fechamento anterior._`,
     ref: data,
   });
 
@@ -2189,11 +2205,21 @@ function valorConfiavel(lido) {
 // Nunca lança: qualquer erro vira texto pedindo o valor. Isso é o que garante
 // que a leitura do comprovante não encoste na baixa.
 async function lerERegistrarComprovante(chatId, msg) {
+  const r = await registrarComprovante(chatId, msg);
+  return r ? r.texto : null;
+}
+
+// O mesmo, devolvendo o que aconteceu — é o que a trava de comprovante
+// repetido precisa saber ANTES de dar baixa:
+//   { texto, lido: false }                  -> não leu o valor (nada gravado)
+//   { texto, lido: true, duplicado, quando } -> leu e mandou registrar
+// Nunca lança.
+async function registrarComprovante(chatId, msg) {
   const arquivo = arquivoComprovante(msg);
   if (!arquivo) return null;
 
   if (arquivo.size > COMPROVANTE_MAX_BYTES) {
-    return `📎 Esse arquivo é grande demais pra eu ler. ${PEDE_VALOR}`;
+    return { texto: `📎 Esse arquivo é grande demais pra eu ler. ${PEDE_VALOR}`, lido: false };
   }
 
   let lido = null;
@@ -2207,7 +2233,7 @@ async function lerERegistrarComprovante(chatId, msg) {
   const valor = valorConfiavel(lido);
   if (valor == null) {
     // Inclui imagem que nem é comprovante: sem valor, não registra nada.
-    return PEDE_VALOR;
+    return { texto: PEDE_VALOR, lido: false };
   }
 
   let r = null;
@@ -2226,16 +2252,24 @@ async function lerERegistrarComprovante(chatId, msg) {
     });
   } catch (err) {
     console.error('bot_comprovante_registrar:', err.message);
-    return rpcAusente(err.message)
-      ? '⚠️ A RPC `bot_comprovante_registrar` não existe no banco — falta rodar o SQL do comprovante.'
-      : `⚠️ Li R$ ${fmtBR(valor)}, mas não consegui registrar. Tente reenviar em instantes.`;
+    return {
+      lido: true,
+      texto: rpcAusente(err.message)
+        ? '⚠️ A RPC `bot_comprovante_registrar` não existe no banco — falta rodar o SQL do comprovante.'
+        : `⚠️ Li R$ ${fmtBR(valor)}, mas não consegui registrar. Tente reenviar em instantes.`,
+    };
   }
   if (!r || r.ok === false) {
     const detalhe = r && (r.erro || r.msg);
-    return `⚠️ ${detalhe || `Li R$ ${fmtBR(valor)}, mas não consegui registrar.`}`;
+    return { lido: true, texto: `⚠️ ${detalhe || `Li R$ ${fmtBR(valor)}, mas não consegui registrar.`}` };
   }
 
-  return textoComprovante(r, valor);
+  return {
+    lido: true,
+    duplicado: !!r.duplicado,
+    quando: String(r.quando ?? r.anterior_em ?? ''),
+    texto: textoComprovante(r, valor),
+  };
 }
 
 // Foto sozinha: a resposta é só o comprovante.
@@ -2277,7 +2311,7 @@ function textoComprovante(r, valor) {
 const CAIXA_MAX_LISTA = 15;
 
 // `data` ISO (YYYY-MM-DD) ou null = hoje. `compacto` corta a lista de itens —
-// é o modo do resumo das 23:59, que já é uma mensagem longa. Nunca lança.
+// é o modo do resumo das 3h, que já é uma mensagem longa. Nunca lança.
 async function textoCaixa(data, { compacto = false } = {}) {
   let d = null;
   try {
@@ -2400,10 +2434,30 @@ async function handleSetGrupoFaturamento(chatId, text, from) {
     `✅ Grupo de faturamento definido: \`${alvo}\`\n/faturamento e /relatorio mes passam a valer aqui e no seu privado.\nO resumo automático das 23:30 vem pra cá.`);
 }
 
-// Data de hoje em São Paulo, ISO (YYYY-MM-DD). 'en-CA' já devolve nesse
+// DIA DA LOJA: vira às 3h, não à meia-noite. Tudo entre 3h00 de um dia e 2h59
+// do seguinte é o mesmo dia — venda de 1h da manhã do dia 1º ainda é do mês
+// que acabou. No banco a mesma regra é a função dia_loja(); aqui é esta.
+// Subtrair 3h do instante e pegar a data em São Paulo dá exatamente isso.
+const HORA_VIRADA_DIA = 3;
+
+// Dia da loja (ISO YYYY-MM-DD) de um instante. 'en-CA' já devolve nesse
 // formato — mais seguro que montar na mão a partir do pt-BR.
+function diaLojaISO(instante = new Date()) {
+  const t = new Date(new Date(instante).getTime() - HORA_VIRADA_DIA * 3600e3);
+  return Number.isNaN(t.getTime()) ? '' : t.toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+}
+
+// "Hoje" do bot inteiro é o dia da loja.
 function hojeISO() {
-  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+  return diaLojaISO();
+}
+
+// Dia da loja anterior a `diaISO` (padrão: hoje). Às 3h, quando o fechamento
+// roda, o dia novo já começou — o dia que acabou é este.
+function ontemISO(diaISO = hojeISO()) {
+  const d = new Date(`${diaISO}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
 }
 
 // "09/2026" -> "2026-09-01". Null quando não veio ou não casa.
@@ -3211,10 +3265,9 @@ function textoUmaLinha(s) {
   return String(s ?? '').replace(/\s+/g, ' ').trim();
 }
 
-// Data (YYYY-MM-DD) de um timestamp, em São Paulo.
+// Dia da loja (YYYY-MM-DD) de um timestamp — mesma régua do "hoje".
 function diaSP(iso) {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+  return iso ? diaLojaISO(iso) : '';
 }
 
 // "hoje", "ontem", "há 3 dias". Por DIA e não por hora de propósito: a lista
@@ -3548,8 +3601,9 @@ function resetVendasDoDia() {
   for (const k of Object.keys(vendasDoDia)) delete vendasDoDia[k];
 }
 
-async function enviarResumoVendas() {
-  const data = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+// `dia` (ISO) é o dia da loja que está fechando. Às 3h é o de ontem.
+async function enviarResumoVendas(dia = ontemISO()) {
+  const data = dia.split('-').reverse().join('/');
   const entries = Object.entries(vendasDoDia).sort((a, b) => b[1] - a[1]);
   const linhas = ['📊 *RESUMO DE VENDAS – 015 PODS*', data, ''];
   if (!entries.length) {
@@ -3565,14 +3619,23 @@ async function enviarResumoVendas() {
   }
   // Bloco final: comissão (com cabeçalho de FECHAMENTO no último dia do período)
   // e o caixa do dia — é o fechamento de dinheiro ao lado do de unidades.
-  linhas.push('', await textoComissaoRelatorio());
-  linhas.push('', await textoCaixa(null, { compacto: true }));
+  linhas.push('', await textoComissaoRelatorio(dia));
+  linhas.push('', await textoCaixa(dia, { compacto: true }));
   await sendTelegram(VENDAS_CHAT_ID, linhas.join('\n'));
 }
 
-cron.schedule('59 23 * * *', async () => {
-  try { await enviarResumoVendas(); }
+// Fechamento diário às 3h, quando o dia da loja vira. Pede os números do dia
+// que ACABOU (ontem) e só depois zera o contador em memória — os dois juntos,
+// num cron só: em crons separados, no mesmo minuto, a ordem não é garantida.
+const CRON_RESUMO_VENDAS = '0 3 * * *';
+
+cron.schedule(CRON_RESUMO_VENDAS, async () => {
+  try { await enviarResumoVendas(ontemISO()); }
   catch (err) { console.error('Erro no resumo de vendas:', err); }
+  finally {
+    resetVendasDoDia();
+    console.log('vendasDoDia resetado');
+  }
 }, { timezone: 'America/Sao_Paulo' });
 
 cron.schedule(CRON_FATURAMENTO, async () => {
@@ -3590,11 +3653,6 @@ cron.schedule(CRON_LEMBRETE_TAREFAS, async () => {
   catch (err) { console.error('Erro no lembrete das atualizações:', err); }
 }, { timezone: 'America/Sao_Paulo' });
 
-cron.schedule('0 0 * * *', () => {
-  resetVendasDoDia();
-  console.log('vendasDoDia resetado');
-}, { timezone: 'America/Sao_Paulo' });
-
 cron.schedule(CRON_RELATORIO_SEMANAL, async () => {
   try { await enviarRelatorioSemanal(); }
   catch (err) { console.error('Erro no relatório semanal:', err); }
@@ -3609,7 +3667,8 @@ cron.schedule('0 10 * * 2', async () => {
 
 const KEEPALIVE_URL = 'https://zero15pods-bot.onrender.com/ping';
 
-cron.schedule('*/10 0-2,10-23 * * *', async () => {
+// Até 3h50: o fechamento das 3h precisa do serviço acordado.
+cron.schedule('*/10 0-3,10-23 * * *', async () => {
   try {
     const fetch = (await import('node-fetch')).default;
     const resp = await fetch(KEEPALIVE_URL);
@@ -3719,7 +3778,10 @@ app.post('/webhook', async (req, res) => {
     if (!text) return;
 
     // A foto viaja junto pro fluxo de movimento; comando (/) não leva.
-    const msgComprovante = temComprovante && !cmd.startsWith('/') ? msg : null;
+    // Exceção: legenda começando com "/atacado" — é o jeito de lançar atacado
+    // que o /ajuda ensina, e o comprovante sumia calado justamente aí.
+    const legendaAtacado = RE_CONTROLE_ATACADO.test(text);
+    const msgComprovante = temComprovante && (!cmd.startsWith('/') || legendaAtacado) ? msg : null;
 
     // Onde /fornecedor, /apelido e /pedido valem.
     const pedidosAqui = podePedidos(chatKey, isPrivadoLucas, pedidosId);
@@ -3806,6 +3868,9 @@ app.post('/webhook', async (req, res) => {
     // "/atacado" (ou "atacado") SOZINHO: correção da última venda.
     if (controleAtacado && !linhasSemControle.length) {
       await handleAtacado(chatId, msg.from);
+      // Foto junto do "/atacado" sozinho: a correção é da venda anterior, mas
+      // o comprovante é dinheiro que entrou — não pode sumir.
+      if (msgComprovante) await handleComprovante(chatId, msgComprovante);
       return;
     }
     // Cabeçalho de atacado com texto que não é item nenhum: explicar, nunca
@@ -3815,6 +3880,7 @@ app.post('/webhook', async (req, res) => {
         '🤔 Não reconheci item nenhum nessa mensagem.\n' +
         'Pra lançar: `/atacado` e as linhas de baixa embaixo (`-2 Elfbar 30000 Cherry`).\n' +
         'Pra corrigir a última venda: mande `/atacado` sozinho.');
+      if (msgComprovante) await handleComprovante(chatId, msgComprovante);
       return;
     }
 
@@ -4002,6 +4068,10 @@ module.exports = {
   LEMBRETE_CHIPS,
   CRON_LEMBRETE_CHIPS,
   parseValorArg,
+  diaLojaISO,
+  hojeISO,
+  ontemISO,
+  CRON_RESUMO_VENDAS,
   fixoDoCiclo,
   periodoDoCiclo,
   handleFechamentoParcial,
