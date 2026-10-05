@@ -429,8 +429,11 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
   if (!parsed.length) return;
 
   // TRAVA DE COMPROVANTE REPETIDO: com foto junto, o comprovante é registrado
-  // ANTES da baixa. Se o banco disser que ele já entrou, nada é baixado — é o
-  // golpe de reenviar o comprovante de ontem pra levar pedido novo. Isso custa
+  // ANTES da baixa. Se o banco disser que o MESMO CÓDIGO de transação já
+  // entrou, nada é baixado — é o golpe de reenviar o comprovante de ontem pra
+  // levar pedido novo. Repetido só por VALOR (outro código, ou sem código) não
+  // trava: duas vendas de R$ 100 em poucos minutos são normais. A baixa sai e
+  // o bot pede pra conferir. Isso custa
   // a latência do Gemini na frente da baixa, e é de propósito: baixar primeiro
   // e descobrir o repetido depois deixaria o estoque já mexido.
   // Foto que não deu pra ler não trava nada: a baixa sai e o bot avisa.
@@ -443,14 +446,18 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
       // Rede de segurança: a baixa não pode cair por causa da foto.
       console.error('comprovante junto da baixa:', err.message);
     }
-    if (comp && comp.duplicado) {
+    if (comp && comp.duplicado && comp.motivo === 'codigo') {
       const quando = comp.quando ? ` em ${escapeMd(comp.quando)}` : '';
       await sendTelegram(chatId, `⚠️ Esse comprovante já foi registrado${quando}. Nenhuma baixa feita.`);
       return;
     }
-    textoComprovanteFinal = comp && comp.lido
-      ? comp.texto
-      : '🤔 Não consegui ler o comprovante — a baixa foi feita normalmente. Confere o valor.';
+    if (comp && comp.duplicado) {
+      textoComprovanteFinal = '⚠️ Já entrou um comprovante de mesmo valor há pouco. Confira se não é repetido.';
+    } else {
+      textoComprovanteFinal = comp && comp.lido
+        ? comp.texto
+        : '🤔 Não consegui ler o comprovante — a baixa foi feita normalmente. Confere o valor.';
+    }
   }
 
   // Linhas que o parser entendeu viram itens { produto, qty } para a RPC; qty
@@ -2267,6 +2274,7 @@ async function registrarComprovante(chatId, msg) {
   return {
     lido: true,
     duplicado: !!r.duplicado,
+    motivo: String(r.motivo ?? ''),
     quando: String(r.quando ?? r.anterior_em ?? ''),
     texto: textoComprovante(r, valor),
   };
@@ -2431,7 +2439,7 @@ async function handleSetGrupoFaturamento(chatId, text, from) {
     return;
   }
   await sendTelegram(chatId,
-    `✅ Grupo de faturamento definido: \`${alvo}\`\n/faturamento e /relatorio mes passam a valer aqui e no seu privado.\nO resumo automático das 23:30 vem pra cá.`);
+    `✅ Grupo de faturamento definido: \`${alvo}\`\n/faturamento e /relatorio mes passam a valer aqui e no seu privado.\nO resumo automático das 3h (o dia que fechou) vem pra cá.`);
 }
 
 // DIA DA LOJA: vira às 3h, não à meia-noite. Tudo entre 3h00 de um dia e 2h59
@@ -2482,7 +2490,10 @@ function diaCurto(valor) {
 async function dadosFaturamento(ref) {
   try {
     const body = { p_token: BOT_SYNC_TOKEN };
-    if (ref) body.p_ref = ref;
+    // Data pura vai ao meio-dia de SP: se p_ref for timestamptz, "2026-10-01"
+    // viraria 21h do dia 30 em SP e o banco devolveria o mês ANTERIOR. Se for
+    // date, o Postgres descarta a hora e dá no mesmo.
+    if (ref) body.p_ref = /^\d{4}-\d{2}-\d{2}$/.test(ref) ? `${ref}T12:00:00-03:00` : ref;
     const d = await callRpc('bot_caixa_mes', body);
     if (!d || d.ok === false) return { erro: `⚠️ ${(d && (d.erro || d.msg)) || 'Não consegui consultar o faturamento.'}` };
     return { dados: d };
@@ -2501,9 +2512,21 @@ async function dadosFaturamento(ref) {
 // Mês fechado = o mês CALENDÁRIO já acabou. Usa mes_ate, não `ate`: desde que
 // a RPC passou a medir período parcial, `ate` é o fim do que foi MEDIDO, e um
 // mês corrente parcial seria lido como mês passado.
-function mesFechado(d) {
+// `diaFechado` (ISO): o resumo das 3h fecha esse dia — se ele é o último do
+// mês, o mês acabou junto com ele.
+function mesFechado(d, diaFechado) {
   const ate = String(d.mes_ate ?? d.ate ?? '');
-  return /^\d{4}-\d{2}-\d{2}/.test(ate) && ate.slice(0, 10) < hojeISO();
+  if (!/^\d{4}-\d{2}-\d{2}/.test(ate)) return false;
+  return diaFechado ? ate.slice(0, 10) <= diaFechado : ate.slice(0, 10) < hojeISO();
+}
+
+// Total de UM dia, tirado do dia a dia que a própria RPC devolve (mesma
+// fonte do total do mês). O `hoje` da RPC não serve às 3h: é o dia que mal
+// começou.
+function faturamentoDoDia(d, dia) {
+  const alvo = diaCurto(dia);
+  const it = (Array.isArray(d.dias) ? d.dias : []).find(x => diaCurto(x.dia) === alvo) || {};
+  return { total: Number(it.total) || 0, qtd: Number(it.qtd) || 0 };
 }
 
 // Período parcial: o registro de comprovantes começou depois do dia 1, então a
@@ -2526,13 +2549,22 @@ function notaParcial(d) {
   return `_Começamos a registrar os comprovantes em ${diaCurto(d.primeiro_registro)}, então este mês ainda não está completo._`;
 }
 
-function formatFaturamento(d) {
+// `opts.dia` (ISO): modo do resumo das 3h — fecha esse dia (que já acabou)
+// em vez de mostrar o "hoje" em andamento.
+function formatFaturamento(d, opts = {}) {
   const hoje = d.hoje || {};
-  const fechado = mesFechado(d);
+  const diaFechado = opts.dia || null;
+  const fechado = mesFechado(d, diaFechado);
   const parcial = ehParcial(d);
   const linhas = [];
 
-  if (fechado) {
+  if (diaFechado) {
+    const doDia = faturamentoDoDia(d, diaFechado);
+    linhas.push(`💰 *FATURAMENTO · ${escapeMd(diaCurto(diaFechado))}*`);
+    linhas.push(`No dia: *R$ ${fmtBR(doDia.total)}* (${doDia.qtd} pagamentos)`);
+    linhas.push('');
+    if (fechado && !parcial) linhas.push(`📅 *${escapeMd(String(d.mes ?? ''))} fechado*`);
+  } else if (fechado) {
     linhas.push(`💰 *FATURAMENTO · ${escapeMd(String(d.mes ?? ''))}*`);
   } else {
     linhas.push(`💰 *FATURAMENTO · ${escapeMd(diaCurto(hojeISO()))}*`);
@@ -2581,10 +2613,10 @@ function formatFaturamento(d) {
   return linhas.join('\n');
 }
 
-// /faturamento — resumo do mês (o mesmo texto do automático das 23:30).
-async function textoFaturamento(ref) {
+// /faturamento — resumo do mês. `opts.dia` é o modo do automático das 3h.
+async function textoFaturamento(ref, opts = {}) {
   const { dados, erro } = await dadosFaturamento(ref);
-  return erro || formatFaturamento(dados);
+  return erro || formatFaturamento(dados, opts);
 }
 
 // /relatorio mes — dia a dia. Devolve uma LISTA de mensagens: mês cheio passa
@@ -2634,15 +2666,16 @@ async function handleFaturamento(chatId, text) {
   await sendTelegram(chatId, await textoFaturamento(ref));
 }
 
-// Resumo automático das 23:30, só no grupo de faturamento. Sem grupo
-// configurado não manda nada (não tem pra onde: o privado do dono seria
-// spam diário não pedido).
-const CRON_FATURAMENTO = '30 23 * * *';
+// Resumo automático das 3h, só no grupo de faturamento — junto com o
+// fechamento, quando o dia da loja vira. Fecha o dia que ACABOU (ontem) e o
+// mês dele. Sem grupo configurado não manda nada (não tem pra onde: o
+// privado do dono seria spam diário não pedido).
+const CRON_FATURAMENTO = '0 3 * * *';
 
-async function enviarFaturamentoDiario() {
+async function enviarFaturamentoDiario(dia = ontemISO()) {
   const grupo = await chatFaturamento();
   if (!grupo) { console.log('faturamento: grupo não configurado, resumo não enviado'); return; }
-  await sendTelegram(grupo, await textoFaturamento(null));
+  await sendTelegram(grupo, await textoFaturamento(dia, { dia }));
 }
 
 // ---------------------------------------------------------------------------
@@ -3587,7 +3620,7 @@ async function enviarLembreteTarefas() {
   return true;
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 23:30)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -3639,7 +3672,7 @@ cron.schedule(CRON_RESUMO_VENDAS, async () => {
 }, { timezone: 'America/Sao_Paulo' });
 
 cron.schedule(CRON_FATURAMENTO, async () => {
-  try { await enviarFaturamentoDiario(); }
+  try { await enviarFaturamentoDiario(ontemISO()); }
   catch (err) { console.error('Erro no faturamento diário:', err); }
 }, { timezone: 'America/Sao_Paulo' });
 

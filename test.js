@@ -2176,15 +2176,17 @@ teste('comprovante repetido com legenda de baixa: nenhuma baixa feita', async (c
   assert.strictEqual(enviadas.length, 1);
 });
 
-teste('repetido por valor (sem código) também trava a baixa', async (ctx) => {
+teste('repetido só por valor NÃO trava: baixa sai e o bot pede pra conferir', async (ctx) => {
   respostas.bot_movimentar_estoque = baixaParaComprovante();
   respostaGemini = { status: 200, body: geminiJson({ valor: 165, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = {
-    status: 200, body: { ok: true, duplicado: true, motivo: 'valor', valor: 165, anterior_em: '05/10 14:02' },
+    status: 200, body: { ok: true, duplicado: true, motivo: 'valor_repetido', valor: 165, anterior_em: '05/10 14:02' },
   };
   const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
-  assert.strictEqual(resp.text, '⚠️ Esse comprovante já foi registrado em 05/10 14:02. Nenhuma baixa feita.');
-  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1, 'a baixa tem que sair');
+  assert.ok(resp.text.includes('Baixa registrada'), resp.text);
+  assert.ok(resp.text.includes('⚠️ Já entrou um comprovante de mesmo valor há pouco. Confira se não é repetido.'), resp.text);
+  assert.ok(!resp.text.includes('Nenhuma baixa feita'), resp.text);
 });
 
 teste('comprovante novo: registra ANTES e só então dá a baixa', async (ctx) => {
@@ -2534,7 +2536,8 @@ teste('/faturamento 08/2026 consulta o mês pedido', async (ctx) => {
     body: { ...CAIXA_MES, mes: 'Agosto', de: '2026-08-01', ate: '2026-08-31', mes_total: 31200 },
   };
   const [resp] = await mandar(ctx.webhook, update('/faturamento 08/2026', { chat: GRUPO_FATURAMENTO }));
-  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_mes')[0].body.p_ref, '2026-08-01');
+  // Meio-dia de SP: em timestamptz, "2026-08-01" puro cairia em 31/07 (mês errado).
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_mes')[0].body.p_ref, '2026-08-01T12:00:00-03:00');
   // Mês fechado: "hoje" e "projeção" não fazem sentido.
   assert.ok(!resp.text.includes('Hoje:'), resp.text);
   assert.ok(!resp.text.includes('Projeção'), resp.text);
@@ -2598,7 +2601,7 @@ teste('RPC de faturamento ausente diz qual SQL falta', async (ctx) => {
   assert.ok(resp.text.includes('falta rodar o SQL'), resp.text);
 });
 
-teste('o resumo das 23:30 vai SÓ pro grupo de faturamento', async (ctx) => {
+teste('o resumo das 3h vai SÓ pro grupo de faturamento', async (ctx) => {
   configComFaturamento();
   respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES };
   await ctx.mod.enviarFaturamentoDiario();
@@ -2616,8 +2619,46 @@ teste('sem grupo configurado, o resumo automático não manda nada', async (ctx)
   assert.strictEqual(enviadas.length, 0, `não tem pra onde mandar: ${JSON.stringify(enviadas)}`);
 });
 
-teste('o resumo de faturamento é agendado às 23:30 de Brasília', async (ctx) => {
-  assert.strictEqual(ctx.mod.CRON_FATURAMENTO, '30 23 * * *');
+teste('o resumo de faturamento é agendado às 3h de Brasília', async (ctx) => {
+  assert.strictEqual(ctx.mod.CRON_FATURAMENTO, '0 3 * * *');
+});
+
+// Às 3h o dia novo já começou: o resumo fecha o dia que ACABOU, com o total
+// dele tirado do dia a dia da RPC (o "hoje" da RPC seria o dia que mal começou).
+const CAIXA_MES_OUTUBRO = {
+  ok: true, mes: 'Outubro', de: '2026-10-01', ate: '2026-10-31', mes_de: '2026-10-01', mes_ate: '2026-10-31',
+  hoje: { total: 0, qtd: 0 },
+  mes_total: 30000, mes_qtd: 200, media_dia: 1000, projecao: 31000,
+  melhor_dia: { dia: '2026-10-12', total: 2500 },
+  mes_anterior: 28000,
+  dias: [
+    { dia: '2026-10-14', total: 900, qtd: 7 },
+    { dia: '2026-10-15', total: 1350, qtd: 11 },
+  ],
+};
+
+teste('resumo das 3h no meio do mês: fecha o dia anterior e pede o mês dele', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES_OUTUBRO };
+  await ctx.mod.enviarFaturamentoDiario('2026-10-15');
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_caixa_mes').body.p_ref, '2026-10-15T12:00:00-03:00');
+  const t = enviadas[0].text;
+  assert.ok(t.startsWith('💰 *FATURAMENTO · 15/10*\nNo dia: *R$ 1.350,00* (11 pagamentos)'), t);
+  assert.ok(t.includes('Outubro até agora'), t);
+  assert.ok(t.includes('Projeção do mês: R$ 31.000,00'), t);
+  assert.ok(!t.includes('Hoje:'), 'às 3h o "hoje" é o dia que mal começou');
+});
+
+teste('resumo das 3h do último dia: dia e mês fechados', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: { ...CAIXA_MES_OUTUBRO, dias: [{ dia: '2026-10-31', total: 2000, qtd: 15 }] } };
+  await ctx.mod.enviarFaturamentoDiario('2026-10-31');
+  const t = enviadas[0].text;
+  assert.ok(t.startsWith('💰 *FATURAMENTO · 31/10*\nNo dia: *R$ 2.000,00* (15 pagamentos)'), t);
+  assert.ok(t.includes('📅 *Outubro fechado*'), t);
+  assert.ok(t.includes('Total: *R$ 30.000,00*'), t);
+  assert.ok(!t.includes('Projeção'), 'mês fechado não projeta');
+  assert.ok(t.includes('📈 acima do mês passado'), t);
 });
 
 // --- Período parcial (registro começou depois do dia 1) --------------------
