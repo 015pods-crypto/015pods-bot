@@ -3551,15 +3551,17 @@ teste('/nova anota, responde com o número e publica a lista fixada', async (ctx
   assert.strictEqual(rpc[0].body.p_texto, 'Atualizar foto do V500 no site');
   assert.strictEqual(rpc[0].body.p_autor, 'Dedé');
   assert.strictEqual(rpc[0].body.p_autor_id, FUNCIONARIO);
-  assert.strictEqual(resp.text, '📌 #12 anotada: Atualizar foto do V500 no site');
+  assert.strictEqual(resp.text, '📌 <b>Tarefa 12 anotada</b>\nAtualizar foto do V500 no site');
+  assert.strictEqual(resp.parse_mode, 'HTML');
 
   await esperar(() => chamadasTelegram.some(c => c.metodo === 'pinChatMessage'));
-  const fixada = chamadasTelegram.find(c => c.metodo === 'sendMessage' && c.body.text.startsWith('📋 ATUALIZAÇÕES'));
+  const fixada = chamadasTelegram.find(c => c.metodo === 'sendMessage' && c.body.text.startsWith('📋 <b>ATUALIZAÇÕES'));
   assert.ok(fixada, 'faltou mandar a lista');
   assert.strictEqual(fixada.body.chat_id, String(GRUPO_ATUALIZACOES));
   assert.strictEqual(fixada.body.disable_notification, true);
-  assert.ok(fixada.body.text.includes('#12 · Atualizar foto do V500 no site · Dedé, hoje'), fixada.body.text);
-  assert.ok(fixada.body.text.endsWith('Concluiu? Manda /feito e o número. Dúvidas: /instrucoes'));
+  assert.ok(fixada.body.text.startsWith('📋 <b>ATUALIZAÇÕES PENDENTES</b> (2)\n\n<b>12.</b> Atualizar foto do V500 no site\n<i>anotada hoje · Dedé</i>\n\n<b>15.</b> Trocar banner'), fixada.body.text);
+  assert.strictEqual(fixada.body.parse_mode, 'HTML');
+  assert.ok(fixada.body.text.endsWith('\n\n✅ Concluir: /feito 1   ➕ Nova: /nova texto'), fixada.body.text);
   const pin = chamadasTelegram.find(c => c.metodo === 'pinChatMessage');
   assert.strictEqual(pin.body.disable_notification, true);
   await esperar(() => chamadas.some(c => c.fn === 'bot_tarefas_estado' && c.body.p_msg_fixada));
@@ -3574,7 +3576,7 @@ teste('/nova respondendo uma mensagem usa o texto dela', async (ctx) => {
   upd.message.reply_to_message = { message_id: 1, caption: 'foto nova do Elfbar' };
   const [resp] = await mandar(ctx.webhook, upd);
   assert.strictEqual(chamadas.find(c => c.fn === 'bot_tarefa_nova').body.p_texto, 'foto nova do Elfbar');
-  assert.strictEqual(resp.text, '📌 #13 anotada: foto nova do Elfbar');
+  assert.strictEqual(resp.text, '📌 <b>Tarefa 13 anotada</b>\nfoto nova do Elfbar');
 });
 
 teste('/nova sem texto e sem resposta explica o uso', async (ctx) => {
@@ -3593,15 +3595,16 @@ teste('/feito com vários números, vírgula e #; edita a fixada existente', asy
   assert.deepStrictEqual(chamadas.find(c => c.fn === 'bot_tarefa_feito').body.p_ids, [12, 15, 18]);
   assert.strictEqual(chamadas.find(c => c.fn === 'bot_tarefa_feito').body.p_quem, 'Rod');
   assert.strictEqual(resp.text, [
-    '✅ #12 concluída por Rod: Foto V500',
-    '✅ #15 concluída por Rod: Banner',
-    '⚠️ Não encontrei pendente: #18 (não existe ou já foi concluída)',
-  ].join('\n'));
+    '✅ <b>Tarefa 12 concluída</b>\nFoto V500\n<i>por Rod</i>',
+    '✅ <b>Tarefa 15 concluída</b>\nBanner\n<i>por Rod</i>',
+    '⚠️ Não encontrei pendente: 18 (não existe ou já foi concluída)',
+  ].join('\n\n'));
 
   await esperar(() => chamadasTelegram.some(c => c.metodo === 'editMessageText'));
   const edit = chamadasTelegram.find(c => c.metodo === 'editMessageText');
   assert.strictEqual(edit.body.message_id, 777);
-  assert.strictEqual(edit.body.text, '📋 Nenhuma atualização pendente ✅\n\nConcluiu? Manda /feito e o número. Dúvidas: /instrucoes');
+  assert.strictEqual(edit.body.text, '✅ <b>Nenhuma atualização pendente</b>');
+  assert.strictEqual(edit.body.parse_mode, 'HTML');
   await new Promise(r => setTimeout(r, 100));
   assert.strictEqual(chamadasTelegram.filter(c => c.metodo === 'pinChatMessage').length, 0, 'editou: não devia fixar outra');
 });
@@ -3611,7 +3614,7 @@ teste('fixada apagada: manda outra, fixa e grava o id novo', async (ctx) => {
   respostas.bot_tarefa_apagar = { status: 200, body: { ok: true, id: 15, texto: 'Banner', pendentes: 1 } };
   respostasTelegram.editMessageText = { status: 400, body: { ok: false, description: 'Bad Request: message to edit not found' } };
   const [resp] = await mandar(ctx.webhook, update('/apagar 15', { chat: GRUPO_ATUALIZACOES }));
-  assert.strictEqual(resp.text, '🗑️ #15 apagada: Banner');
+  assert.strictEqual(resp.text, '🗑️ <b>Tarefa 15 apagada</b>\nBanner');
   await esperar(() => chamadas.some(c => c.fn === 'bot_tarefas_estado' && c.body.p_msg_fixada));
   const pin = await (async () => { await esperar(() => chamadasTelegram.some(c => c.metodo === 'pinChatMessage')); return chamadasTelegram.find(c => c.metodo === 'pinChatMessage'); })();
   assert.strictEqual(chamadas.find(c => c.fn === 'bot_tarefas_estado' && c.body.p_msg_fixada).body.p_msg_fixada, pin.body.message_id);
@@ -3622,7 +3625,7 @@ teste('"message is not modified" conta como sucesso', async (ctx) => {
   respostas.bot_tarefa_reabrir = { status: 200, body: { ok: true, id: 12, texto: 'Foto', pendentes: 1 } };
   respostasTelegram.editMessageText = { status: 400, body: { ok: false, description: 'Bad Request: message is not modified' } };
   const [resp] = await mandar(ctx.webhook, update('/reabrir 12', { chat: GRUPO_ATUALIZACOES }));
-  assert.strictEqual(resp.text, '↩️ #12 reaberta: Foto');
+  assert.strictEqual(resp.text, '↩️ <b>Tarefa 12 reaberta</b>\nFoto');
   await esperar(() => chamadasTelegram.some(c => c.metodo === 'editMessageText'));
   await new Promise(r => setTimeout(r, 100));
   assert.strictEqual(chamadasTelegram.filter(c => c.metodo === 'sendMessage').length, 1, 'só a resposta, sem lista nova');
@@ -3632,7 +3635,7 @@ teste('/reabrir com erro do banco mostra o erro', async (ctx) => {
   configTarefas();
   respostas.bot_tarefa_reabrir = { status: 200, body: { ok: false, erro: 'tarefa não está concluída' } };
   const [resp] = await mandar(ctx.webhook, update('/reabrir 12', { chat: GRUPO_ATUALIZACOES }));
-  assert.strictEqual(resp.text, '⚠️ #12: tarefa não está concluída');
+  assert.strictEqual(resp.text, '⚠️ Tarefa 12: tarefa não está concluída');
 });
 
 teste('comandos de tarefa são ignorados em outros grupos', async (ctx) => {
@@ -3654,7 +3657,7 @@ teste('no grupo de atualizações, conversa e outros comandos são ignorados', a
 teste('/lista funciona no privado do dono', async (ctx) => {
   configTarefas({ pendentes: PENDENTES });
   const [resp] = await mandar(ctx.webhook, update('/lista', { chat: DONO, tipo: 'private' }));
-  assert.ok(resp.text.startsWith('📋 ATUALIZAÇÕES PENDENTES (2)\n#12 · Atualizar foto do V500 no site · Dedé, hoje'), resp.text);
+  assert.ok(resp.text.startsWith('📋 <b>ATUALIZAÇÕES PENDENTES</b> (2)\n\n<b>12.</b> Atualizar foto do V500 no site\n<i>anotada hoje · Dedé</i>'), resp.text);
 });
 
 teste('/nova editada não cria tarefa de novo', async (ctx) => {
@@ -3681,7 +3684,7 @@ teste('/feitas lista as concluídas com quem e quando', async (ctx) => {
   ] } };
   const [resp] = await mandar(ctx.webhook, update('/feitas', { chat: GRUPO_ATUALIZACOES }));
   assert.strictEqual(chamadas.find(c => c.fn === 'bot_tarefas_feitas').body.p_limite, 10);
-  assert.strictEqual(resp.text, '📗 ÚLTIMAS CONCLUÍDAS\n✅ #9 · Foto · Rod, 28/09 14:30');
+  assert.strictEqual(resp.text, '📗 <b>ÚLTIMAS CONCLUÍDAS</b>\n\n<b>9.</b> Foto\n<i>Rod · 28/09 14:30</i>');
 });
 
 teste('/setgrupoatualizacoes: só o dono, e grava o grupo', async (ctx) => {
@@ -3699,9 +3702,9 @@ teste('lista fixada longa é cortada em 4096 com "... e mais X"', async (ctx) =>
   for (let i = 1; i <= 300; i++) muitas.push({ id: i, texto: `Tarefa comprida número ${i} `.repeat(3), criado_por: 'Dedé', criado_em: '2026-09-27T12:00:00Z' });
   const txt = ctx.mod.textoFixada(muitas, '2026-09-29');
   assert.ok(txt.length <= 4096, `passou: ${txt.length}`);
-  assert.ok(txt.startsWith('📋 ATUALIZAÇÕES PENDENTES (300)'));
-  assert.ok(/\.\.\. e mais \d+ \(use \/lista\)\n\nConcluiu\?/.test(txt), txt.slice(-200));
-  assert.ok(txt.includes('#1 · ') && txt.includes('Dedé, há 2 dias'));
+  assert.ok(txt.startsWith('📋 <b>ATUALIZAÇÕES PENDENTES</b> (300)'));
+  assert.ok(/<i>\.\.\. e mais \d+ \(use \/lista\)<\/i>\n\n✅ Concluir/.test(txt), txt.slice(-200));
+  assert.ok(txt.includes('<b>1.</b> ') && txt.includes('<i>há 2 dias · Dedé</i>'), txt.slice(0, 300));
 });
 
 teste('haQuanto conta por dia em São Paulo', async (ctx) => {
@@ -3720,7 +3723,8 @@ teste('lembrete diário: manda só quando o banco libera e tem pendente', async 
   assert.strictEqual(await ctx.mod.enviarLembreteTarefas(), true);
   const msg = chamadasTelegram.find(c => c.metodo === 'sendMessage');
   assert.strictEqual(msg.body.chat_id, String(GRUPO_ATUALIZACOES));
-  assert.ok(msg.body.text.startsWith('Bom dia! Tem 2 atualizações esperando:\n#12 · '), msg.body.text);
+  assert.ok(msg.body.text.startsWith('☀️ <b>Bom dia!</b> Tem 2 atualizações esperando:\n\n<b>12.</b> '), msg.body.text);
+  assert.strictEqual(msg.body.parse_mode, 'HTML');
 });
 
 teste('lembrete sem grupo cadastrado não gasta o envio do dia', async (ctx) => {
@@ -3744,9 +3748,9 @@ teste('/nova com várias linhas vira uma tarefa por linha, fixada uma vez', asyn
   const textos = chamadas.filter(c => c.fn === 'bot_tarefa_nova').map(c => c.body.p_texto);
   assert.deepStrictEqual(textos, ['tarefa um', 'tarefa dois', 'tarefa três', 'quatro', 'cinco', 'seis', 'sete', 'oito']);
   assert.strictEqual(resp.text, [
-    '📌 8 tarefas anotadas:',
-    '#20 · tarefa um', '#21 · tarefa dois', '#22 · tarefa três', '#23 · quatro',
-    '#24 · cinco', '#25 · seis', '#26 · sete', '#27 · oito',
+    '📌 <b>8 tarefas anotadas</b>',
+    '<b>20.</b> tarefa um', '<b>21.</b> tarefa dois', '<b>22.</b> tarefa três', '<b>23.</b> quatro',
+    '<b>24.</b> cinco', '<b>25.</b> seis', '<b>26.</b> sete', '<b>27.</b> oito',
   ].join('\n'));
   await esperar(() => chamadasTelegram.some(c => c.metodo === 'editMessageText'));
   await new Promise(r => setTimeout(r, 150));
@@ -3758,7 +3762,7 @@ teste('/nova de uma linha continua com a resposta de sempre', async (ctx) => {
   configTarefas();
   novaComIds(12);
   const [resp] = await mandar(ctx.webhook, update('/nova 2.5k de estoque no site', { chat: GRUPO_ATUALIZACOES }));
-  assert.strictEqual(resp.text, '📌 #12 anotada: 2.5k de estoque no site');
+  assert.strictEqual(resp.text, '📌 <b>Tarefa 12 anotada</b>\n2.5k de estoque no site');
 });
 
 teste('/nova respondendo mensagem de várias linhas cria uma por linha', async (ctx) => {
@@ -3768,7 +3772,7 @@ teste('/nova respondendo mensagem de várias linhas cria uma por linha', async (
   upd.message.reply_to_message = { message_id: 1, text: '1) foto V500\n2) banner\n\n3) preço Elfbar' };
   const [resp] = await mandar(ctx.webhook, upd);
   assert.deepStrictEqual(chamadas.filter(c => c.fn === 'bot_tarefa_nova').map(c => c.body.p_texto), ['foto V500', 'banner', 'preço Elfbar']);
-  assert.ok(resp.text.startsWith('📌 3 tarefas anotadas:\n#30 · foto V500'), resp.text);
+  assert.ok(resp.text.startsWith('📌 <b>3 tarefas anotadas</b>\n<b>30.</b> foto V500'), resp.text);
 });
 
 teste('/nova com mais de 20 linhas cria as 20 primeiras e avisa', async (ctx) => {
@@ -3780,7 +3784,7 @@ teste('/nova com mais de 20 linhas cria as 20 primeiras e avisa', async (ctx) =>
   const rpc = chamadas.filter(c => c.fn === 'bot_tarefa_nova');
   assert.strictEqual(rpc.length, 20);
   assert.strictEqual(rpc[19].body.p_texto, 'item 20');
-  assert.ok(resp.text.startsWith('📌 20 tarefas anotadas:'), resp.text);
+  assert.ok(resp.text.startsWith('📌 <b>20 tarefas anotadas</b>'), resp.text);
   assert.ok(resp.text.includes('3 linhas ficaram de fora'), resp.text);
 });
 
@@ -3792,7 +3796,61 @@ teste('/nova com falha no meio diz quais entraram', async (ctx) => {
     : { status: 200, body: { ok: true, id: 40 + n, pendentes: 1 } });
   const [resp] = await mandar(ctx.webhook, update('/nova a\nb\nc', { chat: GRUPO_ATUALIZACOES }));
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_tarefa_nova').length, 2, 'para na primeira falha');
-  assert.strictEqual(resp.text, '📌 #41 anotada: a\n⚠️ 2 não foram anotadas: texto vazio');
+  assert.strictEqual(resp.text, '📌 <b>Tarefa 41 anotada</b>\na\n\n⚠️ 2 não foram anotadas: texto vazio');
+});
+
+// Texto digitado pela equipe com caracteres especiais: < > & viram código do
+// HTML; * e _ passam como estão (não são especiais no HTML do Telegram).
+const TEXTO_ESPECIAL = 'Preço <R$ 50> & *promo* _nova_ <b>x</b>';
+const TEXTO_ESPECIAL_HTML = 'Preço &lt;R$ 50&gt; &amp; *promo* _nova_ &lt;b&gt;x&lt;/b&gt;';
+
+teste('escHtml troca só & < >', async (ctx) => {
+  assert.strictEqual(ctx.mod.escHtml(TEXTO_ESPECIAL), TEXTO_ESPECIAL_HTML);
+  assert.strictEqual(ctx.mod.escHtml('a &amp; b'), 'a &amp;amp; b', 'escapa de novo: o texto é literal');
+});
+
+teste('tarefa com < > & * _ não quebra /nova, /lista, /feito, /feitas e a fixada', async (ctx) => {
+  const pend = [{ id: 7, texto: TEXTO_ESPECIAL, criado_por: 'Dé<b>', criado_em: new Date().toISOString() }];
+  configTarefas({ pendentes: pend });
+  respostas.bot_tarefa_nova = { status: 200, body: { ok: true, id: 7, pendentes: 1 } };
+  const [nova] = await mandar(ctx.webhook, update(`/nova ${TEXTO_ESPECIAL}`, { chat: GRUPO_ATUALIZACOES }));
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_tarefa_nova').body.p_texto, TEXTO_ESPECIAL, 'o banco recebe o texto cru');
+  assert.strictEqual(nova.text, `📌 <b>Tarefa 7 anotada</b>\n${TEXTO_ESPECIAL_HTML}`);
+
+  await esperar(() => chamadasTelegram.some(c => c.metodo === 'pinChatMessage'));
+  const fixada = chamadasTelegram.find(c => c.metodo === 'sendMessage' && c.body.text.startsWith('📋'));
+  assert.ok(fixada.body.text.includes(`<b>7.</b> ${TEXTO_ESPECIAL_HTML}\n<i>anotada hoje · Dé&lt;b&gt;</i>`), fixada.body.text);
+
+  enviadas.length = 0;
+  const [lista] = await mandar(ctx.webhook, update('/lista', { chat: GRUPO_ATUALIZACOES }));
+  assert.ok(lista.text.includes(TEXTO_ESPECIAL_HTML), lista.text);
+
+  respostas.bot_tarefa_feito = { status: 200, body: { ok: true, concluidas: [{ id: 7, texto: TEXTO_ESPECIAL }], nao_encontradas: [], pendentes: 0 } };
+  const [feito] = await mandar(ctx.webhook, update('/feito 7', { chat: GRUPO_ATUALIZACOES, nome: 'R&D' }));
+  assert.strictEqual(feito.text, `✅ <b>Tarefa 7 concluída</b>\n${TEXTO_ESPECIAL_HTML}\n<i>por R&amp;D</i>`);
+
+  respostas.bot_tarefas_feitas = { status: 200, body: { ok: true, feitas: [{ id: 7, texto: TEXTO_ESPECIAL, feito_por: 'R&D', feito_em: '2026-10-05T13:00:00Z' }] } };
+  const [feitas] = await mandar(ctx.webhook, update('/feitas', { chat: GRUPO_ATUALIZACOES }));
+  assert.strictEqual(feitas.text, `📗 <b>ÚLTIMAS CONCLUÍDAS</b>\n\n<b>7.</b> ${TEXTO_ESPECIAL_HTML}\n<i>R&amp;D · 05/10 10:00</i>`);
+
+  // Nenhum "<" cru sobrou fora das tags que o bot pôs.
+  for (const m of chamadasTelegram.filter(c => c.body.parse_mode === 'HTML')) {
+    const semTags = m.body.text.replace(/<\/?[bi]>/g, '');
+    assert.ok(!/[<>]/.test(semTags), `HTML com < ou > cru: ${m.body.text}`);
+    assert.ok(!/&(?!amp;|lt;|gt;)/.test(semTags), `& sem escapar: ${m.body.text}`);
+  }
+});
+
+teste('se o Telegram recusar o HTML, manda o mesmo texto sem formatação', async (ctx) => {
+  configTarefas();
+  respostasTelegram.sendMessage = (body) => body.parse_mode === 'HTML'
+    ? { status: 400, body: { ok: false, description: "Bad Request: can't parse entities" } }
+    : { status: 200, body: { ok: true, result: { message_id: 1 } } };
+  respostas.bot_tarefa_nova = { status: 200, body: { ok: true, id: 9, pendentes: 1 } };
+  await mandar(ctx.webhook, update('/nova a < b', { chat: GRUPO_ATUALIZACOES }));
+  await esperar(() => chamadasTelegram.some(c => c.metodo === 'sendMessage' && !c.body.parse_mode));
+  const puro = chamadasTelegram.find(c => c.metodo === 'sendMessage' && !c.body.parse_mode);
+  assert.strictEqual(puro.body.text, '📌 Tarefa 9 anotada\na < b');
 });
 
 teste('/instrucoes explica o /nova de várias linhas', async (ctx) => {
@@ -3841,6 +3899,10 @@ async function main() {
     mod._resetEstadoTeste(); // config, fornecedor pendente e marcação de atacado
     try {
       await t.fn(ctx);
+      // A fixada das tarefas roda DEPOIS da resposta: espera ela terminar
+      // aqui, pra não vazar mensagem pro próximo teste.
+      await new Promise(r => setTimeout(r, 30));
+      await mod._esperarFixadaTeste();
       console.log(`✅ ${t.nome}`);
     } catch (err) {
       falhas++;

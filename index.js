@@ -241,6 +241,12 @@ function _resetEstadoTeste() {
   ultimaFixada = null;
 }
 
+// Só pro teste: espera a atualização da fixada que um comando deixou rodando,
+// senão ela cai no meio do teste seguinte.
+function _esperarFixadaTeste() {
+  return filaFixada;
+}
+
 // `palavras` é a lista já resolvida (o parser é síncrono de propósito: o
 // webhook busca a lista uma vez por mensagem e reusa em todas as linhas).
 function parseRegistroRod(line, palavras) {
@@ -3071,8 +3077,11 @@ async function handleTraduzir(chatId, texto) {
 // Tudo passa pelas RPCs bot_tarefa_* / bot_tarefas_*: o bot não guarda tarefa
 // nenhuma, só o texto da última mensagem fixada (pra não editar à toa).
 //
-// Mensagens daqui saem em TEXTO PURO (sem Markdown): o texto das tarefas é
-// digitado pela equipe, e um "_" ou "*" solto derrubaria o envio.
+// Listas e confirmações saem em HTML (negrito no número, itálico no "há
+// quanto tempo"). O texto das tarefas é digitado pela equipe, então TODO ele
+// passa por escHtml: um "<" ou "&" solto derrubaria o envio. HTML e não
+// Markdown porque no HTML só esses três caracteres são especiais — "_" e "*"
+// passam como estão. Avisos sem texto de tarefa continuam em texto puro.
 // ---------------------------------------------------------------------------
 
 const TAREFA_CMDS = new Set(['/nova', '/lista', '/feito', '/reabrir', '/apagar', '/feitas', '/instrucoes']);
@@ -3094,7 +3103,7 @@ const INSTRUCOES_TAREFAS = [
   'A lista atualizada fica sempre fixada no topo do grupo.',
 ].join('\n');
 
-const RODAPE_TAREFAS = 'Concluiu? Manda /feito e o número. Dúvidas: /instrucoes';
+const RODAPE_TAREFAS = '✅ Concluir: /feito 1   ➕ Nova: /nova texto';
 
 // Chamada crua à API do Telegram: devolve o JSON ({ ok, result, description })
 // em vez de lançar, porque aqui o motivo da falha decide o que fazer (editar
@@ -3115,6 +3124,28 @@ async function telegramApi(metodo, corpo) {
     return data;
   } catch (err) {
     return { ok: false, description: err.message };
+  }
+}
+
+function escHtml(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Volta do HTML pro texto que a pessoa leria — só pro reenvio de emergência.
+function htmlParaTexto(html) {
+  return String(html).replace(/<\/?[bi]>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+// Quebra nos blocos (linha em branco entre tarefas), nunca no meio de uma
+// tarefa. Se o Telegram recusar o HTML, manda o mesmo conteúdo sem formatação
+// em vez de ficar mudo.
+async function enviarHtml(chatId, html) {
+  for (const parte of dividirBlocos(String(html).split('\n\n'))) {
+    const r = await telegramApi('sendMessage', { chat_id: chatId, text: parte, parse_mode: 'HTML' });
+    if (r.ok) continue;
+    console.error(`tarefas: sendMessage HTML falhou: ${r.description || ''}`);
+    const r2 = await telegramApi('sendMessage', { chat_id: chatId, text: htmlParaTexto(parte) });
+    if (!r2.ok) console.error(`tarefas: sendMessage texto puro falhou: ${r2.description || ''}`);
   }
 }
 
@@ -3197,29 +3228,41 @@ function haQuanto(iso, hoje = hojeISO()) {
   return `há ${dias} dias`;
 }
 
-function linhaTarefa(t, hoje) {
-  const quando = haQuanto(t.criado_em, hoje);
-  const quem = [t.criado_por, quando].filter(Boolean).join(', ');
-  return `#${t.id} · ${textoUmaLinha(t.texto)}${quem ? ` · ${quem}` : ''}`;
+// Bloco HTML de uma tarefa: número em negrito, texto, e embaixo, em itálico,
+// há quanto tempo foi anotada e por quem.
+//   <b>12.</b> Trocar foto do V500
+//   <i>anotada hoje · Dedé</i>
+function blocoTarefa(t, hoje) {
+  const ha = haQuanto(t.criado_em, hoje);
+  const quando = ha === 'hoje' || ha === 'ontem' ? `anotada ${ha}` : ha;
+  const meta = [quando, t.criado_por].filter(Boolean).join(' · ');
+  return `<b>${escHtml(t.id)}.</b> ${escHtml(textoUmaLinha(t.texto))}${meta ? `\n<i>${escHtml(meta)}</i>` : ''}`;
 }
 
-// Cabeçalho + linhas + rodapé, cortando linhas do fim até caber no limite.
-function montarComCorte(cabecalho, linhas, rodape, max = LIMITE_TELEGRAM) {
-  const juntar = (ls, resto) => [cabecalho, ...ls, ...(resto ? [resto] : []), '', rodape].join('\n');
-  let texto = juntar(linhas);
+// Cabeçalho + blocos + rodapé (linha em branco entre cada um), cortando
+// blocos do fim até caber no limite do Telegram.
+function montarComCorte(cabecalho, blocos, rodape, max = LIMITE_TELEGRAM) {
+  const juntar = (bs, resto) => [cabecalho, ...bs, ...(resto ? [resto] : []), rodape].join('\n\n');
+  let texto = juntar(blocos);
   if (texto.length <= max) return texto;
-  for (let n = linhas.length - 1; n >= 0; n--) {
-    texto = juntar(linhas.slice(0, n), `... e mais ${linhas.length - n} (use /lista)`);
+  for (let n = blocos.length - 1; n >= 0; n--) {
+    texto = juntar(blocos.slice(0, n), `<i>... e mais ${blocos.length - n} (use /lista)</i>`);
     if (texto.length <= max) return texto;
   }
   return texto.slice(0, max);
 }
 
+const SEM_PENDENTES = '✅ <b>Nenhuma atualização pendente</b>';
+
+function cabecalhoPendentes(n) {
+  return `📋 <b>ATUALIZAÇÕES PENDENTES</b> (${n})`;
+}
+
 function textoFixada(pendentes, hoje = hojeISO(), max = LIMITE_TELEGRAM) {
-  if (!pendentes.length) return `📋 Nenhuma atualização pendente ✅\n\n${RODAPE_TAREFAS}`;
+  if (!pendentes.length) return SEM_PENDENTES;
   return montarComCorte(
-    `📋 ATUALIZAÇÕES PENDENTES (${pendentes.length})`,
-    pendentes.map(t => linhaTarefa(t, hoje)),
+    cabecalhoPendentes(pendentes.length),
+    pendentes.map(t => blocoTarefa(t, hoje)),
     RODAPE_TAREFAS,
     max,
   );
@@ -3273,7 +3316,7 @@ async function atualizarFixadaAgora() {
       if (ultimaFixada && ultimaFixada.grupo === grupo && ultimaFixada.msgId === msgFixada && ultimaFixada.texto === texto) {
         return { ok: true };
       }
-      const r = await telegramApi('editMessageText', { chat_id: grupo, message_id: msgFixada, text: texto });
+      const r = await telegramApi('editMessageText', { chat_id: grupo, message_id: msgFixada, text: texto, parse_mode: 'HTML' });
       if (r.ok || /message is not modified/i.test(r.description || '')) {
         ultimaFixada = { grupo, msgId: msgFixada, texto };
         return { ok: true };
@@ -3281,7 +3324,7 @@ async function atualizarFixadaAgora() {
       console.log(`tarefas: não deu pra editar a fixada ${msgFixada} (${r.description || '?'}) — mandando outra`);
     }
 
-    const env = await telegramApi('sendMessage', { chat_id: grupo, text: texto, disable_notification: true });
+    const env = await telegramApi('sendMessage', { chat_id: grupo, text: texto, parse_mode: 'HTML', disable_notification: true });
     const novoId = env.ok && env.result && env.result.message_id;
     if (!novoId) {
       console.error(`tarefas: não consegui mandar a lista no grupo: ${env.description || '?'}`);
@@ -3367,21 +3410,24 @@ async function handleNovaTarefa(chatId, msg, text) {
     criadas.push({ id: d.id, texto });
   }
 
+  // Blocos separados por linha em branco: confirmação, depois os avisos.
   const saida = [];
-  if (criadas.length === 1) saida.push(`📌 #${criadas[0].id} anotada: ${criadas[0].texto}`);
-  else if (criadas.length > 1) {
-    saida.push(`📌 ${criadas.length} tarefas anotadas:`, ...criadas.map(t => `#${t.id} · ${t.texto}`));
+  if (criadas.length === 1) {
+    saida.push(`📌 <b>Tarefa ${escHtml(criadas[0].id)} anotada</b>\n${escHtml(criadas[0].texto)}`);
+  } else if (criadas.length > 1) {
+    saida.push([`📌 <b>${criadas.length} tarefas anotadas</b>`,
+      ...criadas.map(t => `<b>${escHtml(t.id)}.</b> ${escHtml(t.texto)}`)].join('\n'));
   }
   if (falha) {
     const faltou = linhas.length - criadas.length;
-    saida.push(criadas.length
+    saida.push(escHtml(criadas.length
       ? `⚠️ ${faltou} não ${faltou === 1 ? 'foi anotada' : 'foram anotadas'}: ${falha}`
-      : `⚠️ Não anotei: ${falha}`);
+      : `⚠️ Não anotei: ${falha}`));
   }
   if (excedentes) {
     saida.push(`⚠️ Máximo de ${MAX_TAREFAS_POR_MSG} por mensagem: ${excedentes} ${excedentes === 1 ? 'linha ficou' : 'linhas ficaram'} de fora. Mande de novo só ${excedentes === 1 ? 'ela' : 'elas'}.`);
   }
-  await enviarTextoPuro(chatId, saida.join('\n'));
+  await enviarHtml(chatId, saida.join('\n\n'));
   // Fixada UMA vez, depois de todas.
   if (criadas.length) await atualizarFixadaAvisando(chatId);
 }
@@ -3391,10 +3437,10 @@ async function handleListaTarefas(chatId) {
   if (erro) { await enviarTextoPuro(chatId, `⚠️ Não consegui ler a lista: ${erro}`); return; }
   const pendentes = Array.isArray(d.pendentes) ? d.pendentes : [];
   // /lista não corta: é o lugar pra ver tudo (a fixada manda pra cá).
-  if (!pendentes.length) { await enviarTextoPuro(chatId, '📋 Nenhuma atualização pendente ✅'); return; }
+  if (!pendentes.length) { await enviarHtml(chatId, SEM_PENDENTES); return; }
   const hoje = hojeISO();
-  await enviarTextoPuro(chatId,
-    [`📋 ATUALIZAÇÕES PENDENTES (${pendentes.length})`, ...pendentes.map(t => linhaTarefa(t, hoje))].join('\n'));
+  await enviarHtml(chatId,
+    [cabecalhoPendentes(pendentes.length), ...pendentes.map(t => blocoTarefa(t, hoje)), RODAPE_TAREFAS].join('\n\n'));
 }
 
 async function handleFeito(chatId, msg, text) {
@@ -3406,11 +3452,12 @@ async function handleFeito(chatId, msg, text) {
 
   const concluidas = Array.isArray(d.concluidas) ? d.concluidas : [];
   const faltam = Array.isArray(d.nao_encontradas) ? d.nao_encontradas : [];
-  const linhas = concluidas.map(t => `✅ #${t.id} concluída por ${quem}: ${textoUmaLinha(t.texto)}`);
+  const blocos = concluidas.map(t =>
+    `✅ <b>Tarefa ${escHtml(t.id)} concluída</b>\n${escHtml(textoUmaLinha(t.texto))}\n<i>por ${escHtml(quem)}</i>`);
   if (faltam.length) {
-    linhas.push(`⚠️ Não encontrei pendente: ${faltam.map(n => `#${n}`).join(', ')} (não existe ou já foi concluída)`);
+    blocos.push(`⚠️ Não encontrei pendente: ${faltam.map(escHtml).join(', ')} (não existe ou já foi concluída)`);
   }
-  await enviarTextoPuro(chatId, linhas.join('\n') || '⚠️ Nada foi marcado.');
+  await enviarHtml(chatId, blocos.join('\n\n') || '⚠️ Nada foi marcado.');
   if (concluidas.length) await atualizarFixadaAvisando(chatId);
 }
 
@@ -3419,8 +3466,8 @@ async function handleTarefaUnica(chatId, text, fn, verbo, emoji) {
   const [id] = parseNumerosTarefa(text);
   if (!id) { await enviarTextoPuro(chatId, `Diga o número. Ex: ${text.split(/\s+/)[0].split('@')[0]} 12`); return; }
   const { d, erro } = await rpcTarefa(fn, { p_id: id });
-  if (erro) { await enviarTextoPuro(chatId, `⚠️ #${id}: ${erro}`); return; }
-  await enviarTextoPuro(chatId, `${emoji} #${d.id ?? id} ${verbo}: ${textoUmaLinha(d.texto)}`);
+  if (erro) { await enviarTextoPuro(chatId, `⚠️ Tarefa ${id}: ${erro}`); return; }
+  await enviarHtml(chatId, `${emoji} <b>Tarefa ${escHtml(d.id ?? id)} ${verbo}</b>\n${escHtml(textoUmaLinha(d.texto))}`);
   await atualizarFixadaAvisando(chatId);
 }
 
@@ -3439,11 +3486,11 @@ async function handleFeitas(chatId) {
   if (erro) { await enviarTextoPuro(chatId, `⚠️ Não consegui ler as concluídas: ${erro}`); return; }
   const feitas = Array.isArray(d.feitas) ? d.feitas : [];
   if (!feitas.length) { await enviarTextoPuro(chatId, 'Nenhuma tarefa concluída ainda.'); return; }
-  const linhas = feitas.map(t => {
-    const quem = [t.feito_por, dataHoraCurta(t.feito_em)].filter(Boolean).join(', ');
-    return `✅ #${t.id} · ${textoUmaLinha(t.texto)}${quem ? ` · ${quem}` : ''}`;
+  const blocos = feitas.map(t => {
+    const meta = [t.feito_por, dataHoraCurta(t.feito_em)].filter(Boolean).join(' · ');
+    return `<b>${escHtml(t.id)}.</b> ${escHtml(textoUmaLinha(t.texto))}${meta ? `\n<i>${escHtml(meta)}</i>` : ''}`;
   });
-  await enviarTextoPuro(chatId, ['📗 ÚLTIMAS CONCLUÍDAS', ...linhas].join('\n'));
+  await enviarHtml(chatId, ['📗 <b>ÚLTIMAS CONCLUÍDAS</b>', ...blocos].join('\n\n'));
 }
 
 async function handleComandoTarefa(chatId, cmd, text, msg) {
@@ -3475,9 +3522,9 @@ async function enviarLembreteTarefas() {
   if (pendentes.length) {
     const n = pendentes.length;
     const hoje = hojeISO();
-    await enviarTextoPuro(grupo, montarComCorte(
-      `Bom dia! Tem ${n} ${n === 1 ? 'atualização esperando' : 'atualizações esperando'}:`,
-      pendentes.map(t => linhaTarefa(t, hoje)),
+    await enviarHtml(grupo, montarComCorte(
+      `☀️ <b>Bom dia!</b> Tem ${n} ${n === 1 ? 'atualização esperando' : 'atualizações esperando'}:`,
+      pendentes.map(t => blocoTarefa(t, hoje)),
       RODAPE_TAREFAS,
     ));
   }
@@ -3906,6 +3953,7 @@ module.exports = {
   lerConfig,
   gravarConfig,
   _resetEstadoTeste,
+  _esperarFixadaTeste,
   parseListaFornecedor,
   pareceListaFornecedor,
   podePedidos,
@@ -3960,6 +4008,7 @@ module.exports = {
   FIXO_MENSAL,
   chatAtualizacoes,
   textoFixada,
+  escHtml,
   haQuanto,
   parseNumerosTarefa,
   atualizarFixada,
