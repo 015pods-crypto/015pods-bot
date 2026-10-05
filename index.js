@@ -2479,6 +2479,19 @@ function parseMesComando(text) {
   return `${m[2]}-${String(mes).padStart(2, '0')}-01`;
 }
 
+// p_ref do mês pedido. A bot_caixa_mes conta os dias ATÉ p_ref: mandar o dia
+// 1º fazia um mês passado parecer ter um dia só (média = total do mês,
+// projeção errada, dia a dia só com o dia 1º).
+//   mês que já acabou -> último dia dele
+//   mês atual         -> null (sem data, como o /faturamento normal)
+// Mês futuro também vai com o último dia: dá zero, que é a verdade.
+function refMesPedido(inicioMesISO, hoje = hojeISO()) {
+  if (!inicioMesISO) return null;
+  if (inicioMesISO.slice(0, 7) === hoje.slice(0, 7)) return null;
+  const [a, m] = inicioMesISO.split('-').map(Number);
+  return new Date(Date.UTC(a, m, 0)).toISOString().slice(0, 10);
+}
+
 // "2026-09-12" ou "12/09" -> "12/09". A RPC pode mandar nos dois formatos.
 function diaCurto(valor) {
   const s = String(valor ?? '');
@@ -2652,7 +2665,7 @@ async function handleFaturamento(chatId, text) {
   const arg = tokens.find(t => /^\d{1,2}\/\d{4}$/.test(t));
   // parseMesComando lê o 2º token; com "detalhe" na frente, reescreve o texto
   // pra ele achar o mês no lugar certo.
-  const ref = arg ? parseMesComando(`x ${arg}`) : null;
+  const ref = arg ? refMesPedido(parseMesComando(`x ${arg}`)) : null;
 
   if (tokens.length && !detalhe && !arg) {
     await sendTelegram(chatId, 'Uso: /faturamento · /faturamento 09/2026 · /faturamento detalhe');
@@ -4084,6 +4097,7 @@ module.exports = {
   chatFaturamento,
   podeFaturamento,
   parseMesComando,
+  refMesPedido,
   formatFaturamento,
   ehParcial,
   textoFaturamento,

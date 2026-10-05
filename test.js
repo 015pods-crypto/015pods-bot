@@ -2493,6 +2493,44 @@ teste('/faturamento responde no grupo de faturamento', async (ctx) => {
   assert.ok(resp.text.includes('📈 acima do mês passado'), resp.text);
 });
 
+teste('refMesPedido: mês passado = último dia; mês atual = sem data', async (ctx) => {
+  assert.strictEqual(ctx.mod.refMesPedido('2026-09-01', '2026-10-06'), '2026-09-30');
+  assert.strictEqual(ctx.mod.refMesPedido('2026-02-01', '2026-10-06'), '2026-02-28');
+  assert.strictEqual(ctx.mod.refMesPedido('2026-12-01', '2027-01-03'), '2026-12-31');
+  assert.strictEqual(ctx.mod.refMesPedido('2026-10-01', '2026-10-06'), null);
+  // 1h do dia 1º ainda é o dia da loja anterior: o mês "atual" é o que acabou.
+  assert.strictEqual(ctx.mod.refMesPedido('2026-09-01', '2026-09-30'), null);
+  assert.strictEqual(ctx.mod.refMesPedido(null), null);
+});
+
+teste('/faturamento 09/2026 pede setembro inteiro e mostra a média do período medido', async (ctx) => {
+  configComFaturamento();
+  // Setembro com registro desde 15/09: 16 dias com comprovante.
+  respostas.bot_caixa_mes = { status: 200, body: {
+    ok: true, mes: 'Setembro', parcial: true,
+    de: '2026-09-15', ate: '2026-09-30', mes_de: '2026-09-01', mes_ate: '2026-09-30',
+    dias_contados: 16, primeiro_registro: '2026-09-15',
+    hoje: { total: 0, qtd: 0 }, mes_total: 32000, mes_qtd: 210, media_dia: 2000,
+    melhor_dia: { dia: '2026-09-20', total: 3500 }, mes_anterior: 0, dias: [],
+  } };
+  const [resp] = await mandar(ctx.webhook, update('/faturamento 09/2026', { chat: GRUPO_FATURAMENTO }));
+  // Antes ia '2026-09-01' e a RPC contava só o dia 1º.
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_caixa_mes').body.p_ref, '2026-09-30');
+  assert.ok(resp.text.includes('Período medido: 15/09 a 30/09* (16 dias)'), resp.text);
+  assert.ok(resp.text.includes('Total: *R$ 32.000,00*'), resp.text);
+  assert.ok(resp.text.includes('Média por dia: R$ 2.000,00'), resp.text); // 32.000 ÷ 16
+  assert.ok(!resp.text.includes('Hoje:'), resp.text);
+  assert.ok(!resp.text.includes('Projeção'), resp.text);
+});
+
+teste('/faturamento do mês atual com MM/AAAA vai sem data, como o normal', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES };
+  const [a, m] = ctx.mod.hojeISO().split('-');
+  await mandar(ctx.webhook, update(`/faturamento ${m}/${a}`, { chat: GRUPO_FATURAMENTO }));
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_caixa_mes').body.p_ref, undefined);
+});
+
 // O ponto do grupo: faturamento não pode vazar pro grupo de vendas.
 teste('/faturamento é recusado no grupo de VENDAS', async (ctx) => {
   configComFaturamento();
@@ -2536,7 +2574,8 @@ teste('/faturamento 08/2026 consulta o mês pedido', async (ctx) => {
     body: { ...CAIXA_MES, mes: 'Agosto', de: '2026-08-01', ate: '2026-08-31', mes_total: 31200 },
   };
   const [resp] = await mandar(ctx.webhook, update('/faturamento 08/2026', { chat: GRUPO_FATURAMENTO }));
-  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_mes')[0].body.p_ref, '2026-08-01');
+  // Mês que já acabou: o ÚLTIMO dia (a RPC conta os dias até p_ref).
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_mes')[0].body.p_ref, '2026-08-31');
   // Mês fechado: "hoje" e "projeção" não fazem sentido.
   assert.ok(!resp.text.includes('Hoje:'), resp.text);
   assert.ok(!resp.text.includes('Projeção'), resp.text);
