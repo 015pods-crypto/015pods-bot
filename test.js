@@ -2536,8 +2536,7 @@ teste('/faturamento 08/2026 consulta o mês pedido', async (ctx) => {
     body: { ...CAIXA_MES, mes: 'Agosto', de: '2026-08-01', ate: '2026-08-31', mes_total: 31200 },
   };
   const [resp] = await mandar(ctx.webhook, update('/faturamento 08/2026', { chat: GRUPO_FATURAMENTO }));
-  // Meio-dia de SP: em timestamptz, "2026-08-01" puro cairia em 31/07 (mês errado).
-  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_mes')[0].body.p_ref, '2026-08-01T12:00:00-03:00');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_mes')[0].body.p_ref, '2026-08-01');
   // Mês fechado: "hoje" e "projeção" não fazem sentido.
   assert.ok(!resp.text.includes('Hoje:'), resp.text);
   assert.ok(!resp.text.includes('Projeção'), resp.text);
@@ -2641,7 +2640,8 @@ teste('resumo das 3h no meio do mês: fecha o dia anterior e pede o mês dele', 
   configComFaturamento();
   respostas.bot_caixa_mes = { status: 200, body: CAIXA_MES_OUTUBRO };
   await ctx.mod.enviarFaturamentoDiario('2026-10-15');
-  assert.strictEqual(chamadas.find(c => c.fn === 'bot_caixa_mes').body.p_ref, '2026-10-15T12:00:00-03:00');
+  // p_ref = o dia que ACABOU (date puro): é o que acerta média e projeção às 3h.
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_caixa_mes').body.p_ref, '2026-10-15');
   const t = enviadas[0].text;
   assert.ok(t.startsWith('💰 *FATURAMENTO · 15/10*\nNo dia: *R$ 1.350,00* (11 pagamentos)'), t);
   assert.ok(t.includes('Outubro até agora'), t);

@@ -2490,10 +2490,10 @@ function diaCurto(valor) {
 async function dadosFaturamento(ref) {
   try {
     const body = { p_token: BOT_SYNC_TOKEN };
-    // Data pura vai ao meio-dia de SP: se p_ref for timestamptz, "2026-10-01"
-    // viraria 21h do dia 30 em SP e o banco devolveria o mês ANTERIOR. Se for
-    // date, o Postgres descarta a hora e dá no mesmo.
-    if (ref) body.p_ref = /^\d{4}-\d{2}-\d{2}$/.test(ref) ? `${ref}T12:00:00-03:00` : ref;
+    // p_ref é DATE (dia da loja): vai a data pura. No resumo das 3h é o dia que
+    // acabou — é o que deixa a média e a projeção contarem os dias certos, em
+    // vez de incluir o dia que mal começou.
+    if (ref) body.p_ref = ref;
     const d = await callRpc('bot_caixa_mes', body);
     if (!d || d.ok === false) return { erro: `⚠️ ${(d && (d.erro || d.msg)) || 'Não consegui consultar o faturamento.'}` };
     return { dados: d };
