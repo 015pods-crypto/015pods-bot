@@ -1,5 +1,6 @@
 const express = require('express');
 const cron = require('node-cron');
+const { Anthropic } = require('@anthropic-ai/sdk');
 
 const app = express();
 app.use(express.json());
@@ -1794,46 +1795,77 @@ function ehRuidoFornecedor(linha, ehBullet) {
   return false;
 }
 
-// Devolve [{ modelo, sabor }]. Sabor antes do primeiro modelo é descartado:
-// sem modelo não dá pra dizer de que produto ele é.
+// "🍇 2- Grape Pop / Peach Ice": quantidade, traço, sabor. O emoji da frente
+// já saiu no limparNome.
+const RE_QTD_TRACO = /^(\d+)\s*[-–—]\s*(\S.*)$/;
+// Preço colado no fim do sabor: "Grape Ice R$ 45" / "Grape Ice - 45,00".
+const RE_PRECO_FIM = /\s*(?:[-–—|]\s*)?R?\$\s*\d+(?:[.,]\d{1,2})?\s*$/i;
+
+// Linha só de maiúsculas (com pelo menos duas letras): título de modelo
+// ("IGNITE V400 MIX", "RABBEATS RC50K"). Número no meio é permitido — é o que
+// todo nome de modelo tem; o que não pode é COMEÇAR com quantidade.
+function ehLinhaMaiuscula(limpa) {
+  const letras = limpa.replace(/[^\p{L}]/gu, '');
+  return letras.length >= 2 && letras === letras.toUpperCase() && !/^\d/.test(limpa);
+}
+
+// Leitura SEM IA (o plano B quando a API falha ou não tem chave). Devolve
+// [{ modelo, sabor }] — com `qtd` quando a linha diz quanto tem. Regras, na
+// ordem: ruído e separador saem; 🃏/🔱 é modelo; "2- sabor" é sabor com
+// quantidade; bullet é sabor; linha toda em maiúsculas é modelo. Sabor antes
+// do primeiro modelo é descartado: sem modelo não dá pra dizer de que produto
+// ele é.
 function parseListaFornecedor(texto) {
   const itens = [];
   const vistos = new Set();
   let modelo = null;
 
+  const pushItem = (sabor, qtd) => {
+    if (!modelo || !sabor) return;
+    const chave = `${modelo} ${sabor}`.toLowerCase();
+    if (vistos.has(chave)) return;
+    vistos.add(chave);
+    itens.push(qtd == null ? { modelo, sabor } : { modelo, sabor, qtd });
+  };
+
   for (const bruta of String(texto || '').split('\n')) {
     const linha = bruta.trim();
     if (!linha || RE_SEPARADOR.test(linha)) continue;
+    const limpa = limparNome(linha);
+    // Sem letra nem número ("⸻", "🎉"): separador que o RE_SEPARADOR não conhece.
+    if (!/[\p{L}\d]/u.test(limpa)) continue;
 
+    const mQtd = limpa.match(RE_QTD_TRACO);
     const ehBullet = RE_BULLET.test(linha);
-    if (ehRuidoFornecedor(linha, ehBullet)) continue;
+    if (ehRuidoFornecedor(linha, ehBullet || !!mQtd)) continue;
 
     if (RE_LINHA_MODELO.test(linha)) {
-      const nome = limparNome(linha);
-      if (nome) modelo = nome;
+      if (limpa) modelo = limpa;
+      continue;
+    }
+
+    if (mQtd) {
+      pushItem(limparNome(mQtd[2].replace(RE_PRECO_FIM, '')), parseInt(mQtd[1], 10));
       continue;
     }
 
     if (ehBullet) {
-      if (!modelo) continue;
-      const sabor = limparNome(linha.replace(RE_BULLET, ''));
-      if (!sabor) continue;
-      const chave = `${modelo} ${sabor}`.toLowerCase();
-      if (vistos.has(chave)) continue;
-      vistos.add(chave);
-      itens.push({ modelo, sabor });
+      pushItem(limparNome(linha.replace(RE_BULLET, '')));
+      continue;
     }
+
+    if (ehLinhaMaiuscula(limpa)) modelo = limpa;
   }
   return itens;
 }
 
-// Heurística de "isto é a lista, não conversa": lista de fornecedor tem dezenas
-// de linhas. O piso alto é de propósito — mensagem curta solta no grupo não
-// pode ser confundida com lista.
+// Heurística de "isto é a lista, não conversa": pelo menos um modelo e dois
+// sabores, ou seja, 3 linhas com conteúdo. Era 5 linhas e 200 caracteres,
+// mas lista de fornecedor pequeno ("IGNITE V400 MIX" + 4 sabores) ficava
+// abaixo disso e o bot pedia a lista de novo. Conversa ("beleza, já mando")
+// continua de fora: é uma linha só.
 function pareceListaFornecedor(texto) {
-  const t = String(texto || '');
-  const linhas = t.split('\n').filter(l => l.trim()).length;
-  return linhas >= 5 && t.length >= 200;
+  return String(texto || '').split('\n').filter(l => l.trim()).length >= 3;
 }
 
 // /fornecedor sem lista junto arma a espera: a PRÓXIMA mensagem longa daquele
@@ -1870,22 +1902,346 @@ function rotuloItem(x) {
 const DICA_APELIDO =
   '_Se quiser vender algum, cadastre no sistema. Para corrigir nome: /apelido NOME DO FORNECEDOR = Nome no sistema_';
 
+// ---------------------------------------------------------------------------
+// Leitura da lista com IA (Claude Haiku)
+//
+// Cada fornecedor manda a lista de um jeito, e o formato muda sem aviso. Regra
+// fixa quebrava calada: "Não achei nenhum item", a lista salva ficava velha e
+// o /pedido deixava de fora o que o fornecedor tem. A IA lê qualquer formato;
+// o parser de regras fica de plano B (API fora, sem chave, resposta ruim).
+//
+// A chave vem de ANTHROPIC_API_KEY (Render > Environment). Sem ela o bot não
+// quebra: lê pelas regras e avisa.
+// ---------------------------------------------------------------------------
+
+// Modelo em env var, como o do Gemini: trocar não pode depender de deploy.
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+
+let clienteAnthropic = null;
+
+// Criado na primeira chamada (não no topo do módulo): a chave pode não existir.
+function clienteIA() {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+  if (!clienteAnthropic) {
+    // Uma nova tentativa só: quem mandou a lista está esperando a resposta.
+    clienteAnthropic = new Anthropic({ maxRetries: 1, timeout: 90 * 1000 });
+  }
+  return clienteAnthropic;
+}
+
+// Uma chamada com saída em JSON garantida pelo schema (structured outputs).
+// Lança em erro de API, resposta cortada ou recusa — o chamador decide o
+// plano B.
+async function iaJson(cli, system, conteudo, schema, maxTokens = 16000) {
+  const resp = await cli.messages.create({
+    model: ANTHROPIC_MODEL,
+    max_tokens: maxTokens,
+    system,
+    messages: [{ role: 'user', content: conteudo }],
+    output_config: { format: { type: 'json_schema', schema } },
+  });
+  if (resp.stop_reason !== 'end_turn') throw new Error(`resposta incompleta (${resp.stop_reason})`);
+  const texto = resp.content.filter(b => b.type === 'text').map(b => b.text).join('');
+  return JSON.parse(texto);
+}
+
+const QTD_OU_NULL = { anyOf: [{ type: 'integer' }, { type: 'null' }] };
+
+const SCHEMA_LISTA = {
+  type: 'object',
+  properties: {
+    itens: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { modelo: { type: 'string' }, sabor: { type: 'string' }, qtd: QTD_OU_NULL },
+        required: ['modelo', 'sabor', 'qtd'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['itens'],
+  additionalProperties: false,
+};
+
+const PROMPT_LISTA = [
+  'Você lê listas de estoque que fornecedores de pods (cigarro eletrônico) mandam por WhatsApp.',
+  'Cada fornecedor escreve de um jeito: o modelo vem numa linha (às vezes com emoji, negrito, traços ou o puff count como "50K"),',
+  'e os sabores vêm embaixo, um por linha, às vezes com a quantidade disponível na frente ("2- Grape Ice", "2x Grape Ice", "Grape Ice (2)").',
+  'Devolva um item para cada sabor, ligado ao modelo da linha de título acima dele.',
+  '- "modelo": o nome do modelo como o fornecedor escreveu, sem emojis nem enfeites. Não traduza nem complete.',
+  '- "sabor": o nome do sabor como está escrito, sem emoji, sem quantidade e sem preço. Sabor duplo fica inteiro ("Grape Pop / Peach Ice").',
+  '- "qtd": quantas unidades o fornecedor tem daquele sabor, se a lista disser; null se não disser.',
+  'Ignore emojis soltos, separadores, preços, títulos de seção, saudações, recados, regras de pedido e propaganda.',
+  'Não invente item que não está no texto. Se não houver nenhum sabor, devolva {"itens": []}.',
+].join('\n');
+
+// Normaliza o que a IA devolveu: tira vazio, emoji que escapou, repetido e
+// quantidade que não é inteiro >= 0. A IA não é confiável só por ter respondido.
+function limparItensIA(itens) {
+  const vistos = new Set();
+  const out = [];
+  for (const it of Array.isArray(itens) ? itens : []) {
+    const modelo = limparNome(String(it && it.modelo || ''));
+    const sabor = limparNome(String(it && it.sabor || ''));
+    if (!modelo || !sabor) continue;
+    const chave = `${modelo} ${sabor}`.toLowerCase();
+    if (vistos.has(chave)) continue;
+    vistos.add(chave);
+    const qtd = Number.isInteger(it.qtd) && it.qtd >= 0 ? it.qtd : null;
+    out.push({ modelo, sabor, qtd });
+  }
+  return out;
+}
+
+// { itens, viaIA, motivo } — motivo diz por que caiu no plano B.
+async function lerListaFornecedor(texto) {
+  const cli = clienteIA();
+  let motivo = 'sem ANTHROPIC_API_KEY';
+  if (cli) {
+    try {
+      const r = await iaJson(cli, PROMPT_LISTA, `<lista>\n${texto}\n</lista>`, SCHEMA_LISTA);
+      const itens = limparItensIA(r && r.itens);
+      if (itens.length) return { itens, viaIA: true };
+      motivo = 'a IA não achou item';
+    } catch (err) {
+      console.error('fornecedor IA (leitura):', err.message);
+      motivo = 'a IA falhou';
+    }
+  }
+  const itens = parseListaFornecedor(texto).map(it => ({ ...it, qtd: it.qtd ?? null }));
+  return { itens, viaIA: false, motivo };
+}
+
+// ---------------------------------------------------------------------------
+// Ligar nome do fornecedor -> cadastro do sistema
+//
+// Antes isso era só no banco (bot_fornecedor_importar + /apelido), por nome
+// quase exato. Agora o bot liga primeiro e manda o NOME DO SISTEMA pro banco:
+//   1. comparação normalizada (sem maiúscula, acento, emoji, espaço e
+//      pontuação; "50K" = "50000"; código V do nome "(V400Mix)");
+//   2. o que sobrar vai pra IA junto com o cadastro, e só vale ligação com
+//      certeza "alta" que aponte um nome que EXISTE no cadastro.
+// O que nenhum dos dois ligar vai com o nome original — o banco ainda tenta
+// pelos apelidos cadastrados.
+// ---------------------------------------------------------------------------
+
+// "THE BLACK SHEEP 40K — DUAL FLAVOR" -> "theblacksheep40000dualflavor"
+function chaveNome(s) {
+  return semAcento(String(s || ''))
+    .replace(RE_EMOJI, ' ')
+    .toLowerCase()
+    .replace(/(\d)\s*k(?![a-z])/g, '$1000')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+// Chaves de um modelo do sistema. "Ignite 40000 Mix (V400Mix)" também vale
+// como "ignite" + "v400mix" — é como o fornecedor escreve ("IGNITE V400 MIX").
+function chavesModeloSistema(nome) {
+  const chaves = new Set([chaveNome(nome)]);
+  const semParen = String(nome).replace(/\([^)]*\)/g, ' ');
+  chaves.add(chaveNome(semParen));
+  const codigo = (String(nome).match(/\(([^)]+)\)/) || [])[1];
+  const marca = semParen.trim().split(/\s+/)[0];
+  if (codigo && marca) chaves.add(chaveNome(`${marca} ${codigo}`));
+  chaves.delete('');
+  return chaves;
+}
+
+// chave -> nome, só quando a chave aponta UM nome (ambíguo não liga).
+function indiceUnico(nomes, chavesDe) {
+  const mapa = new Map();
+  for (const nome of nomes) {
+    for (const k of chavesDe(nome)) {
+      if (!mapa.has(k)) mapa.set(k, new Set());
+      mapa.get(k).add(nome);
+    }
+  }
+  const unico = new Map();
+  for (const [k, set] of mapa) if (set.size === 1) unico.set(k, [...set][0]);
+  return unico;
+}
+
+function ligarModeloNormalizado(nomeFornecedor, indice) {
+  for (const k of [chaveNome(nomeFornecedor), chaveNome(String(nomeFornecedor).replace(/\([^)]*\)/g, ' '))]) {
+    if (k && indice.has(k)) return indice.get(k);
+  }
+  return null;
+}
+
+const CERTEZA = { type: 'string', enum: ['alta', 'media', 'baixa'] };
+
+const SCHEMA_LIGA_MODELOS = {
+  type: 'object',
+  properties: {
+    ligacoes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          fornecedor: { type: 'string' },
+          sistema: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+          certeza: CERTEZA,
+        },
+        required: ['fornecedor', 'sistema', 'certeza'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['ligacoes'],
+  additionalProperties: false,
+};
+
+const SCHEMA_LIGA_SABORES = {
+  type: 'object',
+  properties: {
+    ligacoes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' },
+          sistema: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+          certeza: CERTEZA,
+        },
+        required: ['id', 'sistema', 'certeza'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['ligacoes'],
+  additionalProperties: false,
+};
+
+const PROMPT_LIGA = [
+  'Você liga nomes de produtos (pods) escritos por um fornecedor aos nomes do cadastro de uma loja.',
+  'Os nomes nunca são iguais: abreviação, erro de digitação ("DINER" = "Dinner"), puff count escrito como "50K" = "50000",',
+  'palavras coladas ou separadas, ordem diferente. Para cada nome do fornecedor, aponte o nome do cadastro que é o MESMO produto.',
+  'Copie o nome do cadastro exatamente como está na lista de opções.',
+  'certeza "alta" só quando não houver dúvida razoável de que é o mesmo produto (mesma marca, mesmo modelo, mesmo puff count).',
+  'Se dois nomes do cadastro forem plausíveis, ou se nenhum for, use sistema null e certeza "baixa". Nunca chute.',
+].join('\n');
+
+// Liga os modelos que a normalização não ligou. Devolve Map fornecedor -> sistema.
+async function ligarModelosIA(cli, pendentes, modelosSistema) {
+  const out = new Map();
+  if (!cli || !pendentes.length) return out;
+  const r = await iaJson(cli, PROMPT_LIGA,
+    `<cadastro>\n${modelosSistema.join('\n')}\n</cadastro>\n<fornecedor>\n${pendentes.join('\n')}\n</fornecedor>`,
+    SCHEMA_LIGA_MODELOS, 8000);
+  const validos = new Set(modelosSistema);
+  const pedidos = new Set(pendentes);
+  for (const l of (r && r.ligacoes) || []) {
+    if (l.certeza === 'alta' && pedidos.has(l.fornecedor) && validos.has(l.sistema)) out.set(l.fornecedor, l.sistema);
+  }
+  return out;
+}
+
+// Liga sabores dentro do modelo já ligado. `pendentes`: [{ id, modelo, sabor,
+// opcoes }]. Devolve Map id -> sabor do sistema.
+async function ligarSaboresIA(cli, pendentes) {
+  const out = new Map();
+  if (!cli || !pendentes.length) return out;
+  const blocos = pendentes.map(p =>
+    `<item id="${p.id}" modelo="${p.modelo}">\nfornecedor: ${p.sabor}\nopções do cadastro:\n${p.opcoes.join('\n')}\n</item>`);
+  const r = await iaJson(cli, PROMPT_LIGA, blocos.join('\n'), SCHEMA_LIGA_SABORES, 8000);
+  const porId = new Map(pendentes.map(p => [p.id, p]));
+  for (const l of (r && r.ligacoes) || []) {
+    const p = porId.get(l.id);
+    if (p && l.certeza === 'alta' && p.opcoes.includes(l.sistema)) out.set(l.id, l.sistema);
+  }
+  return out;
+}
+
+// Cadastro { modelo -> [sabores] } lido do estoque (zerados inclusos).
+async function lerCadastro() {
+  const produtos = await readEstoque();
+  const cadastro = new Map();
+  for (const p of produtos) {
+    if (!p.modelo) continue;
+    if (!cadastro.has(p.modelo)) cadastro.set(p.modelo, []);
+    if (p.sabor && !cadastro.get(p.modelo).includes(p.sabor)) cadastro.get(p.modelo).push(p.sabor);
+  }
+  return cadastro;
+}
+
+// Itens do fornecedor -> cada um com `sistema: { modelo, sabor } | null`.
+async function ligarAoCadastro(itens, cadastro) {
+  const cli = clienteIA();
+  const modelosSistema = [...cadastro.keys()];
+  const indiceModelos = indiceUnico(modelosSistema, chavesModeloSistema);
+
+  // 1) modelos: normalização, depois IA no que sobrou
+  const nomesFornecedor = [...new Set(itens.map(it => it.modelo))];
+  const modeloDe = new Map();
+  for (const n of nomesFornecedor) {
+    const m = ligarModeloNormalizado(n, indiceModelos);
+    if (m) modeloDe.set(n, m);
+  }
+  const semModelo = nomesFornecedor.filter(n => !modeloDe.has(n));
+  try {
+    for (const [f, sis] of await ligarModelosIA(cli, semModelo, modelosSistema)) modeloDe.set(f, sis);
+  } catch (err) {
+    console.error('fornecedor IA (modelos):', err.message);
+  }
+
+  // 2) sabores dentro do modelo ligado: normalização, depois IA
+  const ligados = itens.map(it => ({ ...it, sistema: null }));
+  const pendentes = [];
+  ligados.forEach((it, id) => {
+    const modelo = modeloDe.get(it.modelo);
+    if (!modelo) return;
+    const opcoes = cadastro.get(modelo) || [];
+    const sabor = indiceUnico(opcoes, s => [chaveNome(s)]).get(chaveNome(it.sabor));
+    if (sabor) it.sistema = { modelo, sabor };
+    else if (opcoes.length) pendentes.push({ id, modelo, sabor: it.sabor, opcoes });
+  });
+  try {
+    for (const [id, sabor] of await ligarSaboresIA(cli, pendentes)) {
+      ligados[id].sistema = { modelo: modeloDe.get(ligados[id].modelo), sabor };
+    }
+  } catch (err) {
+    console.error('fornecedor IA (sabores):', err.message);
+  }
+  // Modelo ligado sem sabor ligado: vai com o modelo do sistema e o sabor
+  // original — o banco ainda tenta pelo apelido.
+  for (const it of ligados) it.modeloSistema = modeloDe.get(it.modelo) || null;
+  return ligados;
+}
+
+const MAX_NAO_RECONHECIDOS = 40;
+
 async function handleFornecedor(chatId, texto, from) {
   if (!ehDono(from && from.id)) {
     await sendTelegram(chatId, '⛔ Só o dono pode importar a lista do fornecedor.');
     return;
   }
 
-  const itens = parseListaFornecedor(texto);
+  const { itens, viaIA, motivo } = await lerListaFornecedor(texto);
   if (!itens.length) {
     await sendTelegram(chatId,
-      '❌ Não achei nenhum item nessa lista.\nA lista precisa ter os modelos marcados com \u{1F0CF} (ou \u{1F531}) e os sabores em `•`, `*` ou `-`.');
+      `❌ Não achei nenhum item nessa lista${viaIA ? '' : ` (li sem IA: ${motivo})`}.\nConfere se colou a lista inteira, com os nomes dos modelos e os sabores.`);
     return;
   }
 
+  // Sem cadastro não dá pra ligar nada: manda como veio (o banco ainda casa
+  // pelo nome e pelos apelidos) e avisa.
+  let ligados = null;
+  try {
+    ligados = await ligarAoCadastro(itens, await lerCadastro());
+  } catch (err) {
+    console.error('fornecedor: cadastro:', err.message);
+  }
+
+  const pItens = (ligados || itens.map(it => ({ ...it, sistema: null, modeloSistema: null }))).map(it => ({
+    modelo: it.sistema ? it.sistema.modelo : (it.modeloSistema || it.modelo),
+    sabor: it.sistema ? it.sistema.sabor : it.sabor,
+    qtd: it.qtd ?? null,
+  }));
+
   let r = null;
   try {
-    r = await callRpc('bot_fornecedor_importar', { p_token: BOT_SYNC_TOKEN, p_itens: itens });
+    r = await callRpc('bot_fornecedor_importar', { p_token: BOT_SYNC_TOKEN, p_itens: pItens });
   } catch (err) {
     console.error('bot_fornecedor_importar:', err.message);
     await sendTelegram(chatId, rpcAusente(err.message)
@@ -1899,27 +2255,31 @@ async function handleFornecedor(chatId, texto, from) {
     return;
   }
 
-  // Contrato da RPC: { casaram, nao_casaram, modelos_novos[], sabores_novos[] }.
-  // O total não vem pronto — é a soma dos dois contadores.
-  const casaram = Number(r.casaram) || 0;
-  const naoCasaram = Number(r.nao_casaram) || 0;
-  const total = casaram + naoCasaram;
-  const pct = total ? Math.round((casaram * 100) / total) : 0;
-  const modelosNovos = Array.isArray(r.modelos_novos) ? r.modelos_novos : [];
-  // sabores_novos vem truncado em 30; quem conta de verdade é o nao_casaram.
-  const saboresNovos = Array.isArray(r.sabores_novos) ? r.sabores_novos : [];
+  const casaramBanco = Number(r.casaram) || 0;
+  const linhas = [];
+  if (ligados) {
+    const ok = ligados.filter(it => it.sistema);
+    const modelos = new Set(ok.map(it => it.sistema.modelo)).size;
+    linhas.push(`✅ *${ok.length} ${ok.length === 1 ? 'sabor reconhecido' : 'sabores reconhecidos'} em ${modelos} ${modelos === 1 ? 'modelo' : 'modelos'}*`);
+    // O banco ainda liga pelos apelidos o que o bot não ligou.
+    if (casaramBanco > ok.length) linhas.push(`🔗 +${casaramBanco - ok.length} ligados pelos apelidos cadastrados`);
+    if (casaramBanco < ok.length) linhas.push(`⚠️ O banco só confirmou ${casaramBanco} — confira o cadastro.`);
+    linhas.push(viaIA ? '_Lista lida com IA._' : `_Lista lida sem IA (${escapeMd(motivo)})._`);
 
-  const linhas = [`✅ *Lista importada* — ${casaram} de ${total} itens casaram (${pct}%)`];
-
-  if (modelosNovos.length) {
-    linhas.push(`⚠️ Modelos que você não tem cadastrado: ${modelosNovos.map(rotuloItem).map(escapeMd).join(', ')}`);
+    const falta = ligados.filter(it => !it.sistema);
+    if (falta.length) {
+      linhas.push('', `⚠️ *Não reconhecidos (${falta.length}):*`);
+      for (const it of falta.slice(0, MAX_NAO_RECONHECIDOS)) {
+        linhas.push(`• ${escapeMd(it.modelo)} · ${escapeMd(it.sabor)}${it.modeloSistema ? ' _(modelo ok, sabor não)_' : ''}`);
+      }
+      if (falta.length > MAX_NAO_RECONHECIDOS) linhas.push(`… e mais ${falta.length - MAX_NAO_RECONHECIDOS}`);
+      linhas.push('', DICA_APELIDO);
+    }
+  } else {
+    linhas.push(`✅ *Lista importada* — ${casaramBanco} de ${itens.length} itens casaram pelo nome`);
+    linhas.push('⚠️ Não consegui ler o cadastro pra ligar os nomes; mandei a lista como veio.');
+    linhas.push(viaIA ? '_Lista lida com IA._' : `_Lista lida sem IA (${escapeMd(motivo)})._`);
   }
-  if (naoCasaram) {
-    const exemplos = saboresNovos.slice(0, 10).map(rotuloItem).map(escapeMd).join(' · ');
-    const reticencia = saboresNovos.length > 10 || naoCasaram > saboresNovos.length ? ' …' : '';
-    linhas.push(`⚠️ ${naoCasaram} sabores sem cadastro${exemplos ? ` (ex.: ${exemplos}${reticencia})` : ''}`);
-  }
-  if (modelosNovos.length || naoCasaram) linhas.push('', DICA_APELIDO);
 
   await sendTelegram(chatId, linhas.join('\n'));
 }
@@ -4002,7 +4362,9 @@ app.post('/webhook', async (req, res) => {
 
       // /fornecedor: lista na mesma mensagem, ou arma a espera pela próxima.
       const lista = text.replace(/^\/fornecedor(@\S+)?[ \t]*/i, '');
-      if (pareceListaFornecedor(lista)) { await handleFornecedor(chatId, lista, msg.from); return; }
+      // Texto colado junto do comando é a lista, seja do tamanho que for. O
+      // piso de linhas só vale pra mensagem SEGUINTE, que pode ser conversa.
+      if (lista.trim()) { await handleFornecedor(chatId, lista, msg.from); return; }
       if (!ehDono(fromId)) { await sendTelegram(chatId, '⛔ Só o dono pode importar a lista do fornecedor.'); return; }
       armarFornecedorPendente(chatKey, fromId);
       await sendTelegram(chatId, '📋 Manda a lista do fornecedor na próxima mensagem (colada inteira). Expira em 10 min.');
@@ -4067,6 +4429,10 @@ module.exports = {
   _resetEstadoTeste,
   _esperarFixadaTeste,
   parseListaFornecedor,
+  lerListaFornecedor,
+  ligarAoCadastro,
+  chaveNome,
+  chavesModeloSistema,
   pareceListaFornecedor,
   podePedidos,
   parseArgsPedido,

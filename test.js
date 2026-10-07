@@ -15,6 +15,20 @@ let respostasTelegram = {};  // { [metodo]: { status, body } } — o que o Teleg
 let ultimoMsgIdTelegram = 5000;
 const chamadasGemini = []; // { url, body } de cada leitura de comprovante
 let respostaGemini = null; // o que o Gemini falso devolve (null = valor padrão)
+const chamadasClaude = [];  // corpo de cada chamada à API da Anthropic
+let respostaClaude = null;  // (body) => { status, body } | null = erro 400 (cai no plano B)
+
+// Envelope de resposta da Messages API com o JSON como texto.
+function claudeJson(obj, stop = 'end_turn') {
+  return {
+    status: 200,
+    body: {
+      id: 'msg_teste', type: 'message', role: 'assistant', model: 'claude-haiku-4-5-20251001',
+      content: [{ type: 'text', text: JSON.stringify(obj) }],
+      stop_reason: stop, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 10 },
+    },
+  };
+}
 
 // Envelope de resposta do Gemini: o JSON do comprovante vem como TEXTO dentro
 // de candidates[0].content.parts[0].text.
@@ -83,11 +97,22 @@ async function subirFalsos() {
     res.end(JSON.stringify(r.body));
   });
 
+  const claude = await servidorFalso((req, raw, res) => {
+    let body = null;
+    try { body = JSON.parse(raw); } catch (_) {}
+    chamadasClaude.push(body);
+    const r = (respostaClaude && respostaClaude(body)) ||
+      { status: 400, body: { type: 'error', error: { type: 'invalid_request_error', message: 'sem resposta configurada' } } };
+    res.writeHead(r.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(r.body));
+  });
+
   return {
+    claude: `http://127.0.0.1:${claude.address().port}`,
     telegram: `http://127.0.0.1:${telegram.address().port}`,
     supabase: `http://127.0.0.1:${supabase.address().port}`,
     gemini: `http://127.0.0.1:${gemini.address().port}`,
-    fechar: () => { telegram.close(); supabase.close(); gemini.close(); },
+    fechar: () => { telegram.close(); supabase.close(); gemini.close(); claude.close(); },
   };
 }
 
@@ -1221,30 +1246,212 @@ teste('parse: sabor antes de qualquer modelo é descartado, e repetido não dupl
   assert.deepStrictEqual(itens, [{ modelo: 'IGNITE 5500', sabor: 'Grape' }]);
 });
 
-teste('/fornecedor com a lista na mesma mensagem importa e resume', async (ctx) => {
-  // Corpo real da RPC (números do import de verdade: 295 de 337).
-  respostas.bot_fornecedor_importar = {
-    status: 200,
-    body: {
-      ok: true, lista_id: '11111111-2222-3333-4444-555555555555',
-      casaram: 295, nao_casaram: 42,
-      modelos_novos: ['ADJUST ICE 40K - BY ELFBAR', 'V400 MIX SLIM'],
-      sabores_novos: [{ modelo: 'LOST MARY MT 20k', sabor: 'Hawaii juice' }],
-    },
+// --- /fornecedor lendo qualquer formato (IA + plano B) ---------------------
+
+// Cadastro falso (formato da bot_ler_estoque).
+const CADASTRO = {
+  status: 200,
+  body: [
+    { modelo: 'Ignite 40000 Mix (V400Mix)', sabores: [
+      { sabor: 'Grape Pop Peach Ice', qty: 0 }, { sabor: 'Mighty Melon Menthol', qty: 1 },
+      { sabor: 'Strawberry Kiwi Ice', qty: 3 }] },
+    { modelo: 'Rabbeats RC50000', sabores: [{ sabor: 'Watermelon Ice', qty: 0 }, { sabor: 'Triple Berry', qty: 2 }] },
+    { modelo: 'TheBlackSheep 40000 DualFlavor', sabores: [{ sabor: 'Banana Ice / Mint', qty: 1 }] },
+    { modelo: 'Dinner Lady 50000 DualFlavor', sabores: [{ sabor: 'Menthol Passion Fruit Ice', qty: 0 }] },
+    { modelo: 'Ignite 50000 (V500)', sabores: [{ sabor: 'Grape Ice', qty: 4 }] },
+    { modelo: 'Elfbar 30000', sabores: [{ sabor: 'Cherry Cola', qty: 2 }, { sabor: 'Watermelon Bubblegum', qty: 0 }] },
+  ],
+};
+
+// O exemplo real que o dono mandou.
+const LISTA_EXEMPLO = [
+  'IGNITE V400 MIX',
+  '🍇 2- Grape Pop / Peach Ice',
+  '🍈 1- Mighty Melon / Menthol',
+  '',
+  '⸻',
+  '',
+  'RABBEATS RC50K',
+  '🍉 2- Watermelon Ice',
+  '🫐 3- Triple Berry',
+  '',
+  'DINER LADY DUAL FLAVOR 50K',
+  '🌿 3- Menthol / Passion Fruit Ice',
+].join('\n');
+
+// Lista bagunçada inventada: abreviação, preço no meio, sem quantidade,
+// português misturado, recado.
+const LISTA_BAGUNCADA = [
+  '*** LISTA DO DIA 07/10 ***',
+  'Pedido mínimo 10 un!!',
+  'ign v400mix',
+  'grape pop peach ice ..... R$ 48',
+  'strawbery kiwi ice R$48',
+  'elf 30k',
+  'cherry cola',
+  'melancia chiclete',
+  'TBS 40k dual',
+  'banana ice/mint - 3un',
+  'obrigado pela preferência',
+].join('\n');
+
+// Roteia o Claude falso pela tarefa: leitura da lista, ligação de modelos ou
+// de sabores. Parte não configurada responde erro (cai no plano B).
+function roteiroClaude({ extracao, modelos, sabores } = {}) {
+  respostaClaude = (body) => {
+    if (String(body.system).startsWith('Você lê listas')) return extracao ? claudeJson({ itens: extracao }) : null;
+    const props = body.output_config.format.schema.properties.ligacoes.items.properties;
+    if (props.fornecedor) return modelos ? claudeJson({ ligacoes: modelos }) : null;
+    return sabores ? claudeJson({ ligacoes: sabores }) : null;
   };
+}
+
+function mostrar(nome, texto) {
+  if (process.env.MOSTRAR) console.log(`\n----- ${nome} -----\n${texto}\n`);
+}
+
+teste('chaveNome liga os exemplos do dono sem IA', async (ctx) => {
+  const { chaveNome, chavesModeloSistema } = ctx.mod;
+  assert.ok(chavesModeloSistema('Ignite 40000 Mix (V400Mix)').has(chaveNome('IGNITE V400 MIX')));
+  assert.ok(chavesModeloSistema('Rabbeats RC50000').has(chaveNome('RABBEATS RC50K')));
+  assert.ok(chavesModeloSistema('TheBlackSheep 40000 DualFlavor').has(chaveNome('THE BLACK SHEEP 40K — DUAL FLAVOR')));
+  // "DINER" com um N só não liga na normalização: é trabalho pra IA.
+  assert.ok(!chavesModeloSistema('Dinner Lady 50000 DualFlavor').has(chaveNome('DINER LADY DUAL FLAVOR 50K')));
+});
+
+teste('exemplo real COM IA: lê, liga (DINER pela IA) e manda nomes do sistema + quantidade', async (ctx) => {
+  respostas.bot_ler_estoque = CADASTRO;
+  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, casaram: 5, nao_casaram: 0 } };
+  roteiroClaude({
+    extracao: [
+      { modelo: 'IGNITE V400 MIX', sabor: 'Grape Pop / Peach Ice', qtd: 2 },
+      { modelo: 'IGNITE V400 MIX', sabor: 'Mighty Melon / Menthol', qtd: 1 },
+      { modelo: 'RABBEATS RC50K', sabor: 'Watermelon Ice', qtd: 2 },
+      { modelo: 'RABBEATS RC50K', sabor: 'Triple Berry', qtd: 3 },
+      { modelo: 'DINER LADY DUAL FLAVOR 50K', sabor: 'Menthol / Passion Fruit Ice', qtd: 3 },
+    ],
+    modelos: [{ fornecedor: 'DINER LADY DUAL FLAVOR 50K', sistema: 'Dinner Lady 50000 DualFlavor', certeza: 'alta' }],
+  });
+  const [resp] = await mandar(ctx.webhook, update(`/fornecedor\n${LISTA_EXEMPLO}`));
+  mostrar('EXEMPLO REAL (com IA)', resp.text);
+
+  const p = chamadas.find(c => c.fn === 'bot_fornecedor_importar').body.p_itens;
+  assert.deepStrictEqual(p, [
+    { modelo: 'Ignite 40000 Mix (V400Mix)', sabor: 'Grape Pop Peach Ice', qtd: 2 },
+    { modelo: 'Ignite 40000 Mix (V400Mix)', sabor: 'Mighty Melon Menthol', qtd: 1 },
+    { modelo: 'Rabbeats RC50000', sabor: 'Watermelon Ice', qtd: 2 },
+    { modelo: 'Rabbeats RC50000', sabor: 'Triple Berry', qtd: 3 },
+    { modelo: 'Dinner Lady 50000 DualFlavor', sabor: 'Menthol Passion Fruit Ice', qtd: 3 },
+  ]);
+  assert.strictEqual(chamadasClaude[0].model, 'claude-haiku-4-5-20251001');
+  assert.strictEqual(chamadasClaude[0].output_config.format.type, 'json_schema');
+  // Só o DINER foi pra IA de ligação; os outros a normalização resolveu.
+  const ligaModelos = chamadasClaude.find(b => b.output_config.format.schema.properties.ligacoes?.items.properties.fornecedor);
+  assert.ok(ligaModelos.messages[0].content.includes('<fornecedor>\nDINER LADY DUAL FLAVOR 50K\n</fornecedor>'));
+  assert.ok(resp.text.startsWith('✅ *5 sabores reconhecidos em 3 modelos*'), resp.text);
+  assert.ok(resp.text.includes('Lista lida com IA'), resp.text);
+  assert.ok(!resp.text.includes('Não reconhecidos'), resp.text);
+});
+
+teste('exemplo real SEM IA (API fora): plano B lê "2- sabor" e a normalização liga 4 de 5', async (ctx) => {
+  respostas.bot_ler_estoque = CADASTRO;
+  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, casaram: 4, nao_casaram: 1 } };
+  // respostaClaude null = toda chamada à IA dá erro
+  const [resp] = await mandar(ctx.webhook, update(`/fornecedor\n${LISTA_EXEMPLO}`));
+  mostrar('EXEMPLO REAL (sem IA)', resp.text);
+
+  assert.deepStrictEqual(ctx.mod.parseListaFornecedor(LISTA_EXEMPLO), [
+    { modelo: 'IGNITE V400 MIX', sabor: 'Grape Pop / Peach Ice', qtd: 2 },
+    { modelo: 'IGNITE V400 MIX', sabor: 'Mighty Melon / Menthol', qtd: 1 },
+    { modelo: 'RABBEATS RC50K', sabor: 'Watermelon Ice', qtd: 2 },
+    { modelo: 'RABBEATS RC50K', sabor: 'Triple Berry', qtd: 3 },
+    { modelo: 'DINER LADY DUAL FLAVOR 50K', sabor: 'Menthol / Passion Fruit Ice', qtd: 3 },
+  ]);
+  assert.ok(resp.text.startsWith('✅ *4 sabores reconhecidos em 2 modelos*'), resp.text);
+  assert.ok(resp.text.includes('Lista lida sem IA (a IA falhou)'), resp.text);
+  assert.ok(resp.text.includes('Não reconhecidos (1)'), resp.text);
+  assert.ok(resp.text.includes('• DINER LADY DUAL FLAVOR 50K · Menthol / Passion Fruit Ice'), resp.text);
+  // Não reconhecido vai com o nome original: o banco ainda tenta pelo apelido.
+  const p = chamadas.find(c => c.fn === 'bot_fornecedor_importar').body.p_itens;
+  assert.deepStrictEqual(p[4], { modelo: 'DINER LADY DUAL FLAVOR 50K', sabor: 'Menthol / Passion Fruit Ice', qtd: 3 });
+});
+
+teste('formato ANTIGO (🃏 + bullet) continua funcionando sem IA', async (ctx) => {
+  respostas.bot_ler_estoque = CADASTRO;
+  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, casaram: 2, nao_casaram: 4 } };
   const [resp] = await mandar(ctx.webhook, update(`/fornecedor\n${LISTA_REAL}`));
+  mostrar('FORMATO ANTIGO (sem IA)', resp.text);
 
-  const rpc = chamadas.filter(c => c.fn === 'bot_fornecedor_importar');
-  assert.strictEqual(rpc.length, 1);
-  assert.strictEqual(rpc[0].body.p_itens.length, 6);
-  assert.deepStrictEqual(rpc[0].body.p_itens[0], { modelo: 'IGNITE 5500 (V55)', sabor: 'Strawberry Ice' });
-
-  // 337 = casaram + nao_casaram (a RPC não manda o total pronto).
-  assert.ok(resp.text.includes('295 de 337 itens casaram (88%)'), resp.text);
-  assert.ok(resp.text.includes('ADJUST ICE 40K - BY ELFBAR, V400 MIX SLIM'), resp.text);
-  assert.ok(resp.text.includes('42 sabores sem cadastro'), resp.text);
-  assert.ok(resp.text.includes('LOST MARY MT 20k · Hawaii juice'), resp.text);
+  const p = chamadas.find(c => c.fn === 'bot_fornecedor_importar').body.p_itens;
+  assert.strictEqual(p.length, 6);
+  // ELFBAR 30000 liga pela normalização; Cherry Cola e Watermelon Bubblegum existem.
+  assert.ok(p.some(x => x.modelo === 'Elfbar 30000' && x.sabor === 'Cherry Cola' && x.qtd === null), JSON.stringify(p));
+  assert.ok(resp.text.startsWith('✅ *2 sabores reconhecidos em 1 modelo*'), resp.text);
+  assert.ok(resp.text.includes('Não reconhecidos (4)'), resp.text);
+  assert.ok(resp.text.includes('• IGNITE 5500 (V55) · Strawberry Ice'), resp.text);
   assert.ok(resp.text.includes('/apelido'), resp.text);
+});
+
+teste('lista bagunçada: IA lê; ligação só aceita certeza ALTA e nome que existe', async (ctx) => {
+  respostas.bot_ler_estoque = CADASTRO;
+  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, casaram: 3, nao_casaram: 2 } };
+  roteiroClaude({
+    extracao: [
+      { modelo: 'ign v400mix', sabor: 'grape pop peach ice', qtd: null },
+      { modelo: 'ign v400mix', sabor: 'strawbery kiwi ice', qtd: null },
+      { modelo: 'elf 30k', sabor: 'cherry cola', qtd: null },
+      { modelo: 'elf 30k', sabor: 'melancia chiclete', qtd: null },
+      { modelo: 'TBS 40k dual', sabor: 'banana ice/mint', qtd: 3 },
+    ],
+    modelos: [
+      { fornecedor: 'ign v400mix', sistema: 'Ignite 40000 Mix (V400Mix)', certeza: 'alta' },
+      { fornecedor: 'elf 30k', sistema: 'Elfbar 30000', certeza: 'alta' },
+      { fornecedor: 'TBS 40k dual', sistema: 'TheBlackSheep 40000 DualFlavor', certeza: 'media' }, // não vale
+    ],
+    sabores: [
+      { id: 1, sistema: 'Strawberry Kiwi Ice', certeza: 'alta' },
+      { id: 3, sistema: 'Watermelon Bubblegum', certeza: 'media' }, // não vale
+    ],
+  });
+  const [resp] = await mandar(ctx.webhook, update(`/fornecedor\n${LISTA_BAGUNCADA}`));
+  mostrar('LISTA BAGUNÇADA (com IA)', resp.text);
+
+  assert.ok(resp.text.startsWith('✅ *3 sabores reconhecidos em 2 modelos*'), resp.text);
+  assert.ok(resp.text.includes('• elf 30k · melancia chiclete _(modelo ok, sabor não)_'), resp.text);
+  assert.ok(resp.text.includes('• TBS 40k dual · banana ice/mint'), resp.text);
+  const p = chamadas.find(c => c.fn === 'bot_fornecedor_importar').body.p_itens;
+  assert.deepStrictEqual(p[1], { modelo: 'Ignite 40000 Mix (V400Mix)', sabor: 'Strawberry Kiwi Ice', qtd: null });
+  // Modelo ligado, sabor não: vai com o modelo do sistema e o sabor original.
+  assert.deepStrictEqual(p[3], { modelo: 'Elfbar 30000', sabor: 'melancia chiclete', qtd: null });
+});
+
+teste('IA apontando nome que não existe no cadastro é ignorada', async (ctx) => {
+  respostas.bot_ler_estoque = CADASTRO;
+  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, casaram: 0, nao_casaram: 1 } };
+  roteiroClaude({
+    extracao: [{ modelo: 'XPTO 9000', sabor: 'Mango', qtd: 1 }],
+    modelos: [{ fornecedor: 'XPTO 9000', sistema: 'Xpto 9000 Inventado', certeza: 'alta' }],
+  });
+  const [resp] = await mandar(ctx.webhook, update('/fornecedor\nXPTO 9000\n1- Mango'));
+  assert.ok(resp.text.startsWith('✅ *0 sabores reconhecidos em 0 modelos*'), resp.text);
+  assert.ok(resp.text.includes('• XPTO 9000 · Mango'), resp.text);
+});
+
+teste('resposta da IA cortada (max_tokens) cai no plano B', async (ctx) => {
+  respostas.bot_ler_estoque = CADASTRO;
+  respostas.bot_fornecedor_importar = { status: 200, body: { ok: true, casaram: 4, nao_casaram: 1 } };
+  respostaClaude = () => claudeJson({ itens: [] }, 'max_tokens');
+  const [resp] = await mandar(ctx.webhook, update(`/fornecedor\n${LISTA_EXEMPLO}`));
+  assert.ok(resp.text.includes('Lista lida sem IA'), resp.text);
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_fornecedor_importar').body.p_itens.length, 5);
+});
+
+teste('lista bagunçada SEM IA: avisa que não achou item em vez de importar lixo', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update(`/fornecedor\n${LISTA_BAGUNCADA}`));
+  mostrar('LISTA BAGUNÇADA (sem IA)', resp.text);
+  assert.ok(resp.text.includes('Não achei nenhum item'), resp.text);
+  assert.ok(resp.text.includes('li sem IA'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_fornecedor_importar').length, 0);
 });
 
 teste('/fornecedor sozinho espera a lista na mensagem seguinte', async (ctx) => {
@@ -1256,7 +1463,7 @@ teste('/fornecedor sozinho espera a lista na mensagem seguinte', async (ctx) => 
 
   const [resp] = await mandar(ctx.webhook, update(LISTA_REAL));
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_fornecedor_importar').length, 1);
-  assert.ok(resp.text.includes('Lista importada'), resp.text);
+  assert.ok(resp.text.includes('Lista importada') || resp.text.includes('reconhecidos'), resp.text);
 });
 
 // A lista tem dezenas de linhas começando com "-": sem o desvio, a primeira
@@ -4062,6 +4269,8 @@ async function main() {
   process.env.SUPABASE_URL = falsos.supabase;
   process.env.GEMINI_API_BASE = falsos.gemini;
   process.env.GEMINI_API_KEY = 'chave-de-teste';
+  process.env.ANTHROPIC_API_KEY = 'chave-claude-de-teste';
+  process.env.ANTHROPIC_BASE_URL = falsos.claude;
   process.env.SUPABASE_ANON_KEY = 'anon-de-teste';
   process.env.BOT_SYNC_TOKEN = 'token-de-teste';
   process.env.ADMIN_USER_ID = String(DONO);
@@ -4084,6 +4293,8 @@ async function main() {
     chamadas.length = 0;
     chamadasGemini.length = 0;
     chamadasTelegram.length = 0;
+    chamadasClaude.length = 0;
+    respostaClaude = null;
     respostas = {};
     respostasTelegram = {};
     respostaGemini = null;
