@@ -2062,13 +2062,6 @@ function indiceUnico(nomes, chavesDe) {
   return unico;
 }
 
-function ligarModeloNormalizado(nomeFornecedor, indice) {
-  for (const k of [chaveNome(nomeFornecedor), chaveNome(String(nomeFornecedor).replace(/\([^)]*\)/g, ' '))]) {
-    if (k && indice.has(k)) return indice.get(k);
-  }
-  return null;
-}
-
 const CERTEZA = { type: 'string', enum: ['alta', 'media', 'baixa'] };
 
 const SCHEMA_LIGA_MODELOS = {
@@ -2165,47 +2158,194 @@ async function lerCadastro() {
   return cadastro;
 }
 
-// Itens do fornecedor -> cada um com `sistema: { modelo, sabor } | null`.
-async function ligarAoCadastro(itens, cadastro) {
+// ---------------------------------------------------------------------------
+// Ligar o MODELO por partes: marca + puffs + palavras
+//
+// Juntar o nome inteiro num texto só falhava por causa da ORDEM das palavras
+// ("ELFBAR ICE KING 40K" = "elfbaricekind40000" contra "elfbar40000iceking")
+// e deixou 84 sabores sem reconhecer numa lista real. Agora o nome é quebrado
+// em partes e comparado peça por peça:
+//   marca  - primeira palavra (com apelidos de marca: DINER = Dinner, TBS =
+//            TheBlackSheep); no fornecedor pode vir separada ("THE BLACK
+//            SHEEP" = "TheBlackSheep")
+//   puffs  - número com K vira mil, mesmo grudado em letra (TE30K = 30000),
+//            ou número de 4+ dígitos (40000)
+//   resto  - as outras palavras (ICE, KING, MIX, DUAL, FLAVOR...)
+// Candidatos: mesma marca e mesmos puffs. Um só -> ele. Vários -> o de mais
+// palavras em comum. Empate -> o único onde os SABORES daquele bloco existem.
+// Continua empatado -> não liga (não chuta).
+// ---------------------------------------------------------------------------
+
+const MARCA_APELIDO = { diner: 'dinner', tbs: 'theblacksheep' };
+
+// "TheBlackSheep 40000 DualFlavor" -> palavras ["TheBlackSheep", "40000", "Dual", "Flavor"]
+// (o CamelCase só é quebrado depois da marca, que é comparada inteira).
+function palavrasBrutas(nome) {
+  return semAcento(String(nome || ''))
+    .replace(RE_EMOJI, ' ')
+    .replace(/[()[\]{}]/g, ' ')
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean);
+}
+
+// Tira os puffs de uma palavra: "TE30K" -> { puffs: 30000, resto: "te" },
+// "RC50000" -> { 50000, "rc" }, "40K" -> { 40000, "" }. V-code ("V400")
+// não é puff: fica como palavra.
+function separarPuffs(palavra) {
+  const p = palavra.toLowerCase();
+  let m = p.match(/^(.*?)(\d+)k$/);
+  if (m) return { puffs: parseInt(m[2], 10) * 1000, resto: m[1] };
+  m = p.match(/^(.*?)(\d{4,})$/);
+  if (m) return { puffs: parseInt(m[2], 10), resto: m[1] };
+  return { puffs: null, resto: p };
+}
+
+// Palavra composta do sistema vira as partes: "DualFlavor" -> dual, flavor;
+// "V400Mix" -> v400, mix.
+function quebrarPalavra(palavra) {
+  return (String(palavra).replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().match(/[a-z]+\d*|\d+/g) || []);
+}
+
+// Modelo do SISTEMA em partes.
+function partesSistema(nome) {
+  const brutas = palavrasBrutas(nome);
+  const marca = (brutas[0] || '').toLowerCase();
+  let puffs = null;
+  const palavras = new Set();
+  for (const w of brutas.slice(1)) {
+    const sp = separarPuffs(w);
+    if (sp.puffs && puffs == null) puffs = sp.puffs;
+    for (const q of quebrarPalavra(sp.puffs ? sp.resto : w)) palavras.add(q);
+  }
+  return { nome, marca, puffs, palavras };
+}
+
+// Modelo do FORNECEDOR em partes. A marca é decidida contra a lista de marcas
+// do sistema: "the black sheep" junta as três primeiras palavras.
+function partesFornecedor(nome, marcasSistema) {
+  const brutas = palavrasBrutas(nome).map(w => w.toLowerCase());
+  if (!brutas.length) return null;
+  brutas[0] = MARCA_APELIDO[brutas[0]] || brutas[0];
+  let marca = brutas[0];
+  let usadas = 1;
+  for (let k = Math.min(3, brutas.length); k >= 1; k--) {
+    const junta = brutas.slice(0, k).join('');
+    const alvo = MARCA_APELIDO[junta] || junta;
+    if (marcasSistema.has(alvo)) { marca = alvo; usadas = k; break; }
+  }
+  let puffs = null;
+  const palavras = new Set();
+  for (const w of brutas.slice(usadas)) {
+    const sp = separarPuffs(w);
+    if (sp.puffs && puffs == null) puffs = sp.puffs;
+    for (const q of quebrarPalavra(sp.puffs ? sp.resto : w)) palavras.add(q);
+  }
+  return { nome, marca, puffs, palavras };
+}
+
+function saborCasa(saborFornecedor, opcoes) {
+  const k = chaveNome(saborFornecedor);
+  return !!k && opcoes.some(o => chaveNome(o) === k);
+}
+
+// Escolhe o modelo do sistema para um bloco da lista. `sabores` são os
+// sabores daquele bloco (o desempate final). Devolve o nome ou null.
+function escolherModelo(nomeFornecedor, sabores, sistemas, cadastro, marcasSistema) {
+  const f = partesFornecedor(nomeFornecedor, marcasSistema);
+  if (!f) return null;
+  // Sem puffs no nome do fornecedor ("IGNITE V400 MIX"): qualquer puff da
+  // marca serve, e as palavras (o V-code entra aqui) decidem.
+  let cands = sistemas.filter(s => s.marca === f.marca && (f.puffs == null || s.puffs === f.puffs));
+  if (!cands.length) return null;
+  if (cands.length === 1 && f.puffs != null) return cands[0].nome;
+
+  const comuns = s => [...f.palavras].filter(w => s.palavras.has(w)).length;
+  const melhor = Math.max(...cands.map(comuns));
+  if (melhor > 0) {
+    cands = cands.filter(s => comuns(s) === melhor);
+    if (cands.length === 1) return cands[0].nome;
+  } else if (f.puffs == null) {
+    // Sem puffs E sem palavra em comum: é só a marca — fraco demais.
+    return null;
+  }
+
+  // Empate: fica o único candidato onde os sabores do bloco existem.
+  const porSabor = cands.map(s => ({ s, n: sabores.filter(sb => saborCasa(sb, cadastro.get(s.nome) || [])).length }));
+  const max = Math.max(...porSabor.map(x => x.n));
+  const vencedores = porSabor.filter(x => x.n === max);
+  return max > 0 && vencedores.length === 1 ? vencedores[0].s.nome : null;
+}
+
+// Apelidos cadastrados pelo /apelido: { chave do nome do fornecedor -> modelo
+// do sistema }. Têm prioridade sobre a regra acima. A leitura depende da RPC
+// bot_fornecedor_apelidos; enquanto ela não existir no banco, o mapa fica
+// vazio (e o banco continua aplicando os apelidos do lado dele).
+async function lerApelidos() {
+  const mapa = new Map();
+  try {
+    const d = await callRpc('bot_fornecedor_apelidos', { p_token: BOT_SYNC_TOKEN });
+    const lista = Array.isArray(d) ? d : (d && Array.isArray(d.apelidos) ? d.apelidos : []);
+    for (const a of lista) {
+      const k = chaveNome(a && a.apelido);
+      if (k && a.modelo) mapa.set(k, String(a.modelo));
+    }
+  } catch (err) {
+    if (!rpcAusente(err.message)) console.error('bot_fornecedor_apelidos:', err.message);
+  }
+  return mapa;
+}
+
+// Itens do fornecedor -> cada um com `sistema: { modelo, sabor } | null` e
+// `modeloSistema` (o modelo ligado, mesmo quando o sabor não ligou).
+async function ligarAoCadastro(itens, cadastro, apelidos = new Map()) {
   const cli = clienteIA();
   const modelosSistema = [...cadastro.keys()];
-  const indiceModelos = indiceUnico(modelosSistema, chavesModeloSistema);
+  const sistemas = modelosSistema.map(partesSistema);
+  const marcasSistema = new Set(sistemas.map(s => s.marca));
 
-  // 1) modelos: normalização, depois IA no que sobrou
-  const nomesFornecedor = [...new Set(itens.map(it => it.modelo))];
-  const modeloDe = new Map();
-  for (const n of nomesFornecedor) {
-    const m = ligarModeloNormalizado(n, indiceModelos);
-    if (m) modeloDe.set(n, m);
+  // Blocos: um por nome de modelo do fornecedor, com os sabores dele.
+  const blocos = new Map();
+  for (const it of itens) {
+    if (!blocos.has(it.modelo)) blocos.set(it.modelo, []);
+    blocos.get(it.modelo).push(it.sabor);
   }
-  const semModelo = nomesFornecedor.filter(n => !modeloDe.has(n));
+
+  // 1) modelos: apelido > regra das partes > IA (só pra quem não teve nem
+  //    candidato — empate não vai pra IA: não chutar vale pra ela também)
+  const modeloDe = new Map();
+  const semCandidato = [];
+  for (const [nome, sabores] of blocos) {
+    const porApelido = apelidos.get(chaveNome(nome));
+    if (porApelido && cadastro.has(porApelido)) { modeloDe.set(nome, porApelido); continue; }
+    const m = escolherModelo(nome, sabores, sistemas, cadastro, marcasSistema);
+    if (m) { modeloDe.set(nome, m); continue; }
+    const f = partesFornecedor(nome, marcasSistema);
+    if (!f || !sistemas.some(s => s.marca === f.marca)) semCandidato.push(nome);
+  }
   try {
-    for (const [f, sis] of await ligarModelosIA(cli, semModelo, modelosSistema)) modeloDe.set(f, sis);
+    for (const [f, sis] of await ligarModelosIA(cli, semCandidato, modelosSistema)) modeloDe.set(f, sis);
   } catch (err) {
     console.error('fornecedor IA (modelos):', err.message);
   }
 
-  // 2) sabores dentro do modelo ligado: normalização, depois IA
-  const ligados = itens.map(it => ({ ...it, sistema: null }));
+  // 2) sabores dentro do modelo ligado: comparação sem maiúscula, espaço,
+  //    barra e pontuação; depois IA no que sobrar
+  const ligados = itens.map(it => ({ ...it, sistema: null, modeloSistema: modeloDe.get(it.modelo) || null }));
   const pendentes = [];
   ligados.forEach((it, id) => {
-    const modelo = modeloDe.get(it.modelo);
-    if (!modelo) return;
-    const opcoes = cadastro.get(modelo) || [];
-    const sabor = indiceUnico(opcoes, s => [chaveNome(s)]).get(chaveNome(it.sabor));
-    if (sabor) it.sistema = { modelo, sabor };
-    else if (opcoes.length) pendentes.push({ id, modelo, sabor: it.sabor, opcoes });
+    if (!it.modeloSistema) return;
+    const opcoes = cadastro.get(it.modeloSistema) || [];
+    const sabor = indiceUnico(opcoes, sb => [chaveNome(sb)]).get(chaveNome(it.sabor));
+    if (sabor) it.sistema = { modelo: it.modeloSistema, sabor };
+    else if (opcoes.length) pendentes.push({ id, modelo: it.modeloSistema, sabor: it.sabor, opcoes });
   });
   try {
     for (const [id, sabor] of await ligarSaboresIA(cli, pendentes)) {
-      ligados[id].sistema = { modelo: modeloDe.get(ligados[id].modelo), sabor };
+      ligados[id].sistema = { modelo: ligados[id].modeloSistema, sabor };
     }
   } catch (err) {
     console.error('fornecedor IA (sabores):', err.message);
   }
-  // Modelo ligado sem sabor ligado: vai com o modelo do sistema e o sabor
-  // original — o banco ainda tenta pelo apelido.
-  for (const it of ligados) it.modeloSistema = modeloDe.get(it.modelo) || null;
   return ligados;
 }
 
@@ -2228,7 +2368,7 @@ async function handleFornecedor(chatId, texto, from) {
   // pelo nome e pelos apelidos) e avisa.
   let ligados = null;
   try {
-    ligados = await ligarAoCadastro(itens, await lerCadastro());
+    ligados = await ligarAoCadastro(itens, await lerCadastro(), await lerApelidos());
   } catch (err) {
     console.error('fornecedor: cadastro:', err.message);
   }
@@ -2266,15 +2406,29 @@ async function handleFornecedor(chatId, texto, from) {
     if (casaramBanco < ok.length) linhas.push(`⚠️ O banco só confirmou ${casaramBanco} — confira o cadastro.`);
     linhas.push(viaIA ? '_Lista lida com IA._' : `_Lista lida sem IA (${escapeMd(motivo)})._`);
 
-    const falta = ligados.filter(it => !it.sistema);
-    if (falta.length) {
-      linhas.push('', `⚠️ *Não reconhecidos (${falta.length}):*`);
-      for (const it of falta.slice(0, MAX_NAO_RECONHECIDOS)) {
-        linhas.push(`• ${escapeMd(it.modelo)} · ${escapeMd(it.sabor)}${it.modeloSistema ? ' _(modelo ok, sabor não)_' : ''}`);
-      }
-      if (falta.length > MAX_NAO_RECONHECIDOS) linhas.push(`… e mais ${falta.length - MAX_NAO_RECONHECIDOS}`);
-      linhas.push('', DICA_APELIDO);
+    // Dois grupos, pra mensagem caber e dizer o que fazer: modelo que não
+    // existe (cadastrar ou /apelido) aparece UMA vez, com quantos sabores; sabor
+    // que não existe dentro de um modelo que existe aparece um por um.
+    const semModelo = new Map();
+    for (const it of ligados) {
+      if (!it.modeloSistema) semModelo.set(it.modelo, (semModelo.get(it.modelo) || 0) + 1);
     }
+    const semSabor = ligados.filter(it => it.modeloSistema && !it.sistema);
+    if (semModelo.size) {
+      linhas.push('', `❓ *Modelo não encontrado (${semModelo.size}):*`);
+      for (const [nome, n] of [...semModelo].slice(0, MAX_NAO_RECONHECIDOS)) {
+        linhas.push(`• ${escapeMd(nome)} (${n} ${n === 1 ? 'sabor' : 'sabores'})`);
+      }
+      if (semModelo.size > MAX_NAO_RECONHECIDOS) linhas.push(`… e mais ${semModelo.size - MAX_NAO_RECONHECIDOS}`);
+    }
+    if (semSabor.length) {
+      linhas.push('', `❓ *Sabor não encontrado (${semSabor.length}):*`);
+      for (const it of semSabor.slice(0, MAX_NAO_RECONHECIDOS)) {
+        linhas.push(`• ${escapeMd(it.modeloSistema)} · ${escapeMd(it.sabor)}`);
+      }
+      if (semSabor.length > MAX_NAO_RECONHECIDOS) linhas.push(`… e mais ${semSabor.length - MAX_NAO_RECONHECIDOS}`);
+    }
+    if (semModelo.size || semSabor.length) linhas.push('', DICA_APELIDO);
   } else {
     linhas.push(`✅ *Lista importada* — ${casaramBanco} de ${itens.length} itens casaram pelo nome`);
     linhas.push('⚠️ Não consegui ler o cadastro pra ligar os nomes; mandei a lista como veio.');
@@ -4433,6 +4587,9 @@ module.exports = {
   ligarAoCadastro,
   chaveNome,
   chavesModeloSistema,
+  partesSistema,
+  partesFornecedor,
+  escolherModelo,
   pareceListaFornecedor,
   podePedidos,
   parseArgsPedido,
