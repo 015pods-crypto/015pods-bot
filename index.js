@@ -42,7 +42,7 @@ const COMANDOS = [
   '/setgrupofaturamento', '/faturamento', '/lembrete-teste',
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
-  '/apagar', '/instrucoes', '/fechamento',
+  '/apagar', '/instrucoes', '/fechamento', '/consignado',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -4147,7 +4147,93 @@ async function enviarLembreteTarefas() {
   return true;
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
+// ---------------------------------------------------------------------------
+// /consignado — tira do estoque SEM virar venda
+//
+// Produto que sai em consignação (fica com alguém, volta ou é acertado depois)
+// não pode entrar no faturamento, no caixa nem na comissão do Rod. Quem garante
+// isso é a RPC bot_consignado, que tem o mesmo contrato da
+// bot_movimentar_estoque (itens com qty POSITIVA; resposta com `resultados`,
+// direction = 'consignado'). As mensagens de erro são as mesmas da baixa.
+//
+//   /consignado 2 Ignite V50 Grape
+//   /consignado pra João        <- opcional; também "para" e "p/"
+//   2 Ignite V50 Grape
+//   1 Elfbar 40000 Ice King Miami Mint
+// ---------------------------------------------------------------------------
+
+const RE_CONSIGNADO_PESSOA = /^(?:pra|para|p\/)\s+(\S.*)$/i;
+// "2 Ignite V50 Grape" ou "2x Ignite..." — sinal na frente é tolerado ("-2"),
+// é o hábito de quem lança baixa o dia todo.
+const RE_CONSIGNADO_ITEM = /^[-+]?\s*(\d+)\s*x?\s+(\S.*)$/i;
+
+const USO_CONSIGNADO =
+  'Uso: `/consignado 2 Ignite V50 Grape`\nVários itens: um por linha embaixo do `/consignado`.\nPra quem foi (opcional): `/consignado pra João` na primeira linha.';
+
+// { pessoa, itens: [{ produto, qty }], invalidas: [linha] }
+function parseConsignado(texto) {
+  const linhas = String(texto || '').split('\n');
+  const primeira = linhas[0].replace(/^\/consignado(@\S+)?/i, '').trim();
+  const resto = linhas.slice(1).map(l => l.trim()).filter(Boolean);
+
+  let pessoa = null;
+  const candidatas = [];
+  const mPessoa = primeira.match(RE_CONSIGNADO_PESSOA);
+  if (mPessoa) pessoa = mPessoa[1].trim();
+  else if (primeira) candidatas.push(primeira);
+  candidatas.push(...resto);
+
+  const itens = [];
+  const invalidas = [];
+  for (const l of candidatas) {
+    const m = l.match(RE_CONSIGNADO_ITEM);
+    const qty = m ? parseInt(m[1], 10) : 0;
+    if (m && qty > 0) itens.push({ produto: m[2].trim(), qty });
+    else invalidas.push(l);
+  }
+  return { pessoa, itens, invalidas };
+}
+
+async function handleConsignado(chatId, text) {
+  const { pessoa, itens, invalidas } = parseConsignado(text);
+  if (!itens.length) {
+    const ruins = invalidas.length ? `Não entendi: ${invalidas.map(l => `\`${escapeMd(l)}\``).join(', ')}\n\n` : '';
+    await sendTelegram(chatId, `${ruins}${USO_CONSIGNADO}`);
+    return;
+  }
+
+  let data = null;
+  try {
+    data = await callRpc('bot_consignado', { p_token: BOT_SYNC_TOKEN, p_items: itens, p_pessoa: pessoa });
+  } catch (err) {
+    console.error('bot_consignado:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC `bot_consignado` não existe no banco — falta rodar o SQL do consignado.'
+      : '⚠️ Erro ao registrar o consignado. Nada foi tirado do estoque.');
+    return;
+  }
+
+  const resultados = (data && data.resultados) || [];
+  const linhas = [`📦 *Consignado*${pessoa ? ` (pra ${escapeMd(pessoa)})` : ''}`];
+  let saiu = 0;
+  itens.forEach((it, i) => {
+    const r = resultados[i];
+    if (r && r.status === 'ok') {
+      saiu++;
+      const nome = [r.model, r.flavor].filter(Boolean).join(' – ') || it.produto;
+      const antes = r.stock_before != null ? r.stock_before : Number(r.stock_after) + Number(r.qty);
+      linhas.push(`• ${r.qty}x ${escapeMd(nome)} (estoque ${antes} → ${r.stock_after})`);
+    } else {
+      const m = mapResultado(r || { status: 'erro', input: it.produto }, 'baixa');
+      linhas.push(`❌ ${escapeMd(m.msg)}`);
+    }
+  });
+  for (const l of invalidas) linhas.push(`❌ Formato inválido: \`${escapeMd(l)}\` — use \`2 Ignite V50 Grape\``);
+  linhas.push(saiu ? '_Não conta como venda nem comissão._' : '_Nada foi tirado do estoque._');
+  await sendTelegram(chatId, linhas.join('\n'));
+}
+
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -4491,6 +4577,14 @@ app.post('/webhook', async (req, res) => {
       return;
     }
     if (cmd === '/caixa') { await handleCaixa(chatId, text, msg.from); return; }
+    if (cmd === '/consignado') {
+      if (!isVendas && !isReposicao) {
+        await sendTelegram(chatId, '📦 O /consignado é no grupo de VENDAS ou de REPOSIÇÃO.');
+        return;
+      }
+      await handleConsignado(chatId, text);
+      return;
+    }
     if (cmd === '/faturamento') {
       if (!faturamentoAqui) { await sendTelegram(chatId, '💰 Esse comando é no grupo de faturamento (ou no privado do dono).'); return; }
       await handleFaturamento(chatId, text);
@@ -4638,6 +4732,8 @@ module.exports = {
   LEMBRETE_CHIPS,
   CRON_LEMBRETE_CHIPS,
   parseValorArg,
+  parseConsignado,
+  handleConsignado,
   diaLojaISO,
   hojeISO,
   ontemISO,

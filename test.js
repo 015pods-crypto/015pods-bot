@@ -4319,6 +4319,89 @@ teste('/instrucoes explica o /nova de várias linhas', async (ctx) => {
     '/nova <texto> → anota uma tarefa. Ex: /nova trocar foto do V500 no site\nVárias de uma vez: uma por linha, no mesmo /nova\nResponder uma mensagem'), resp.text);
 });
 
+// --- /consignado ---------------------------------------------------------
+
+function consignadoOk(model, flavor, qty, before) {
+  return { input: `${model} ${flavor}`, status: 'ok', direction: 'consignado', qty,
+    model, flavor, stock_before: before, stock_after: before - qty };
+}
+
+teste('/consignado com um item: chama bot_consignado com qty positiva e responde', async (ctx) => {
+  respostas.bot_consignado = { status: 200, body: { resultados: [consignadoOk('Ignite V50', 'Grape', 2, 5)], resumo: {} } };
+  const [resp] = await mandar(ctx.webhook, update('/consignado 2 Ignite V50 Grape'));
+  mostrar('CONSIGNADO 1 ITEM', resp.text);
+  const rpc = chamadas.filter(c => c.fn === 'bot_consignado');
+  assert.strictEqual(rpc.length, 1);
+  assert.deepStrictEqual(rpc[0].body.p_items, [{ produto: 'Ignite V50 Grape', qty: 2 }]);
+  assert.strictEqual(rpc[0].body.p_pessoa, null);
+  assert.strictEqual(resp.text, '📦 *Consignado*\n• 2x Ignite V50 – Grape (estoque 5 → 3)\n_Não conta como venda nem comissão._');
+  // Não é venda: nada de baixa, comissão ou contador do resumo.
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('/consignado pra João com vários itens, no grupo de REPOSIÇÃO', async (ctx) => {
+  respostas.bot_consignado = { status: 200, body: { resultados: [
+    consignadoOk('Ignite V50', 'Grape', 2, 5), consignadoOk('Elfbar 40000 Ice King', 'Miami Mint', 1, 4)] } };
+  const [resp] = await mandar(ctx.webhook, update(
+    '/consignado pra João\n2 Ignite V50 Grape\n1 Elfbar 40000 Ice King Miami Mint', { chat: GRUPO_REPOSICAO }));
+  mostrar('CONSIGNADO VÁRIOS (pra João)', resp.text);
+  const body = chamadas.find(c => c.fn === 'bot_consignado').body;
+  assert.strictEqual(body.p_pessoa, 'João');
+  assert.deepStrictEqual(body.p_items, [
+    { produto: 'Ignite V50 Grape', qty: 2 }, { produto: 'Elfbar 40000 Ice King Miami Mint', qty: 1 }]);
+  assert.ok(resp.text.startsWith('📦 *Consignado* (pra João)\n• 2x Ignite V50 – Grape (estoque 5 → 3)\n• 1x Elfbar 40000 Ice King – Miami Mint (estoque 4 → 3)'), resp.text);
+  // Reposição não confunde com entrada nem baixa.
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('"para" e "p/" também marcam a pessoa', async (ctx) => {
+  assert.strictEqual(ctx.mod.parseConsignado('/consignado para Maria Clara\n1 X Y').pessoa, 'Maria Clara');
+  assert.strictEqual(ctx.mod.parseConsignado('/consignado p/ Zé\n1 X Y').pessoa, 'Zé');
+  assert.strictEqual(ctx.mod.parseConsignado('/consignado 2 Ignite V50 Grape').pessoa, null);
+});
+
+teste('/consignado: produto que não existe e estoque insuficiente usam as mensagens da baixa', async (ctx) => {
+  respostas.bot_consignado = { status: 200, body: { resultados: [
+    { input: 'Produto Fantasma', status: 'nao_encontrado' },
+    { input: 'Ignite V50 Grape', status: 'estoque_insuficiente', model: 'Ignite V50', flavor: 'Grape', qty: 9, stock_before: 3 },
+  ] } };
+  const [resp] = await mandar(ctx.webhook, update('/consignado\n1 Produto Fantasma\n9 Ignite V50 Grape'));
+  mostrar('CONSIGNADO COM ERROS', resp.text);
+  assert.ok(resp.text.includes('❌ Produto não encontrado: "Produto Fantasma"'), resp.text);
+  assert.ok(resp.text.includes('❌ Ignite V50 – Grape sem estoque suficiente (tem 3, pediu 9)'), resp.text);
+  assert.ok(resp.text.endsWith('_Nada foi tirado do estoque._'), resp.text);
+});
+
+teste('/consignado com um ok e um erro avisa os dois', async (ctx) => {
+  respostas.bot_consignado = { status: 200, body: { resultados: [
+    consignadoOk('Ignite V50', 'Grape', 2, 5),
+    { input: 'elfbar', status: 'ambiguo', matches: [{ model: 'Elfbar 30000', flavor: 'Cherry' }, { model: 'Elfbar 40000', flavor: 'Cherry' }] },
+  ] } };
+  const [resp] = await mandar(ctx.webhook, update('/consignado\n2 Ignite V50 Grape\n1 elfbar'));
+  assert.ok(resp.text.includes('• 2x Ignite V50 – Grape (estoque 5 → 3)'), resp.text);
+  assert.ok(resp.text.includes('mais de um match para "elfbar"'), resp.text);
+  assert.ok(resp.text.endsWith('_Não conta como venda nem comissão._'), resp.text);
+});
+
+teste('/consignado sem item explica o uso e não chama o banco', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/consignado pra João'));
+  assert.ok(resp.text.includes('Uso: `/consignado 2 Ignite V50 Grape`'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_consignado').length, 0);
+});
+
+teste('/consignado fora de VENDAS/REPOSIÇÃO é recusado', async (ctx) => {
+  configComPedidos();
+  const [resp] = await mandar(ctx.webhook, update('/consignado 2 Ignite V50 Grape', { chat: GRUPO_PEDIDOS }));
+  assert.ok(resp.text.includes('grupo de VENDAS ou de REPOSIÇÃO'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_consignado').length, 0);
+});
+
+teste('/consignado sem a função no banco diz qual SQL falta', async (ctx) => {
+  respostas.bot_consignado = { status: 404, body: { message: 'Could not find the function' } };
+  const [resp] = await mandar(ctx.webhook, update('/consignado 2 Ignite V50 Grape'));
+  assert.ok(resp.text.includes('bot_consignado'), resp.text);
+});
+
 // --- Runner ----------------------------------------------------------------
 
 async function main() {
