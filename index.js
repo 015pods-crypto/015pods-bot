@@ -42,7 +42,7 @@ const COMANDOS = [
   '/setgrupofaturamento', '/faturamento', '/lembrete-teste',
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
-  '/apagar', '/instrucoes', '/fechamento', '/consignado',
+  '/apagar', '/instrucoes', '/fechamento', '/consignado', '/sou', '/meuid',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -425,7 +425,7 @@ function mapResultado(r, opFallback) {
   return { ok: false, op: opFallback, msg: `Não processado: "${input}" (${status || 'sem status'})` };
 }
 
-async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComprovante) {
+async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComprovante, from) {
   const parsed = lines.map(parseMovimentoLine).filter(Boolean);
   if (!parsed.length) return;
 
@@ -482,15 +482,20 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
   }
 
   let resultados = [];
+  // `vendedor`: nome de quem deu a baixa, null = Telegram não ligado a ninguém
+  // (/sou). undefined = a resposta não trouxe o campo, e aí não se diz nada.
+  let vendedor;
   if (items.length) {
     const data = await callRpc('bot_movimentar_estoque', {
       p_token: BOT_SYNC_TOKEN,
       p_items: items,
       // `atacado` aqui é só procedência: a marca que a bot_comissao lê é a
       // palavra no `notes`, gravada pela bot_marcar_atacado logo abaixo.
-      p_meta: { chat_id: chatId, message_id: messageId, atacado: pediuAtacado || undefined },
+      // user_id/nome/username: é por eles que o banco grava QUEM vendeu.
+      p_meta: { chat_id: chatId, message_id: messageId, atacado: pediuAtacado || undefined, ...metaUsuario(from) },
     });
     resultados = (data && data.resultados) || [];
+    if (data && 'vendedor' in data) vendedor = data.vendedor;
   }
 
   const results = [];
@@ -514,6 +519,13 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
   // falhou, marcar acertaria a venda ANTERIOR.
   const aMarcar = results.filter(r => r.ok && r.op === 'baixa' && r.atacado);
   if (aMarcar.length) linhasMsg.push(...(await marcarVendasAtacado(chatId, aMarcar)));
+
+  // De quem é a venda: só quando alguma baixa entrou (entrada não é venda).
+  if (results.some(r => r.ok && r.op === 'baixa') && vendedor !== undefined) {
+    linhasMsg.push(vendedor
+      ? `👤 Venda de: ${escapeMd(String(vendedor))}`
+      : '⚠️ Essa venda ficou sem vendedor. Mande /sou SeuNome uma vez para ligar seu Telegram.');
+  }
 
   if (textoComprovanteFinal) linhasMsg.push('', textoComprovanteFinal);
 
@@ -749,10 +761,14 @@ function fmtValor(n) {
 // `mes` é o período ("01/10 → 31/10"); `fecha_hoje` = último dia do período.
 // O bot NÃO sabe onde o ciclo começa ou termina: quem decide é a RPC (era
 // 21 → 20, virou mês cheio a partir de outubro/2026). Nada aqui tem dia fixo.
-async function dadosComissao(pMes) {
+// `meta` (opcional) vira p_meta: com ele a resposta depende de QUEM pergunta
+// (vendedor ligado, não ligado ou sócio — ver formatComissaoPorQuem). Sem ele,
+// vem o resumo do time no formato antigo (relatório, /geral, fechamento).
+async function dadosComissao(pMes, meta) {
   try {
     const body = { p_token: BOT_SYNC_TOKEN };
     if (pMes) body.p_mes = pMes;
+    if (meta) body.p_meta = meta;
     const d = await callRpc('bot_comissao', body);
     return d && d.ok !== false ? d : null;
   } catch (err) {
@@ -800,26 +816,100 @@ function formatComissao(d) {
   return linhas.join('\n');
 }
 
-// Texto do /comissao (formato padrão, sempre).
-async function textoComissao() {
-  const d = await dadosComissao();
-  return d ? formatComissao(d) : '⚠️ Erro ao consultar comissão.';
+// Linha de "quanto falta" — é sempre do TIME: a faixa sai do total de pods
+// de todos os vendedores, não dos de quem pergunta.
+function linhaFaltamTime(d) {
+  return d.faltam_para_proxima == null
+    ? '🏆 Time na faixa máxima'
+    : `🎯 Faltam ${d.faltam_para_proxima} pods do time para R$ ${fmtBR(d.proxima_taxa)} por pod`;
+}
+
+// Resposta de sócio: só ela traz `vendedores`. É o que libera /geral,
+// /fechamento e /refazerfechamento — quem é sócio quem diz é o banco.
+function ehSocio(d) {
+  return !!d && Array.isArray(d.vendedores);
+}
+
+const SO_SOCIOS = 'Esse comando é só para os sócios.';
+
+// Uma linha por vendedor + os pods que ficaram sem dono.
+function linhasVendedores(d) {
+  const linhas = (d.vendedores || []).map(v =>
+    `• ${escapeMd(String(v.nome ?? '?'))}: ${v.unidades_mes ?? 0} pods · R$ ${fmtBR(v.comissao)}`);
+  const semVendedor = Number(d.sem_vendedor_unidades) || 0;
+  if (semVendedor > 0) linhas.push(`⚠️ ${semVendedor} pods sem vendedor (definir no sistema)`);
+  return linhas;
+}
+
+// /comissao com p_meta: o formato depende de quem pergunta. Salário fixo
+// nunca aparece aqui (nem vem nessas respostas).
+//   pessoal    -> vendedor ligado: os pods e a comissão DELE + o time
+//   restrito   -> Telegram não ligado: aviso + só os números do time
+//   vendedores -> sócio: resumo do time + uma linha por vendedor
+// Sem nenhum dos três (resposta sem p_meta), cai no formato antigo.
+function formatComissaoPorQuem(d) {
+  const mes = d.mes ? escapeMd(String(d.mes)) : '';
+  if (d.pessoal) {
+    const linhas = [
+      `💰 *${escapeMd(String(d.vendedor ?? ''))}, sua comissão*${mes ? ` (${mes})` : ''}`,
+      `Seus pods no mês: *${d.unidades_mes ?? 0}* (hoje: ${d.unidades_hoje ?? 0})`,
+      `   varejo ${d.unidades_varejo ?? 0} · atacado ${d.unidades_atacado ?? 0}`,
+      `Faixa atual: R$ ${fmtBR(d.taxa_atual)} por pod`,
+      `Sua comissão: *R$ ${fmtBR(d.comissao)}*`,
+      '',
+      `👥 Time: ${d.time_unidades_mes ?? 0} pods no mês (hoje: ${d.time_unidades_hoje ?? 0})`,
+      linhaFaltamTime(d),
+    ];
+    if (d.fecha_hoje) linhas.push('📅 O mês fecha hoje');
+    return linhas.join('\n');
+  }
+  if (d.restrito) {
+    const linhas = [
+      `📊 *Comissão*${mes ? ` — ${mes}` : ''}`,
+      `⚠️ ${escapeMd(String(d.aviso || 'Seu Telegram não está ligado a nenhum vendedor. Mande /sou SeuNome.'))}`,
+      '',
+      `👥 Time: ${d.time_unidades_mes ?? 0} pods no mês (hoje: ${d.time_unidades_hoje ?? 0})`,
+      `Faixa atual: R$ ${fmtBR(d.taxa_atual)} por pod`,
+      linhaFaltamTime(d),
+    ];
+    if (d.fecha_hoje) linhas.push('📅 O mês fecha hoje');
+    return linhas.join('\n');
+  }
+  if (Array.isArray(d.vendedores)) {
+    const linhas = [
+      `📊 *Comissão do time*${mes ? ` — ${mes}` : ''}`,
+      `Pods no mês: *${d.unidades_mes ?? 0}*${d.unidades_hoje != null ? ` (hoje: ${d.unidades_hoje})` : ''}`,
+      `Faixa atual: R$ ${fmtBR(d.taxa_atual)} por pod`,
+      `💰 Comissão total: *R$ ${fmtBR(d.comissao)}*`,
+      linhaFaltamTime(d),
+      '',
+    ];
+    linhas.push(...linhasVendedores(d));
+    if (d.fecha_hoje) linhas.push('', '📅 O mês fecha hoje');
+    return linhas.join('\n');
+  }
+  return formatComissao(d);
+}
+
+// Texto do /comissao: a resposta é a de QUEM pergunta (`from`).
+async function textoComissao(from) {
+  const d = await dadosComissao(null, metaUsuario(from));
+  return d ? formatComissaoPorQuem(d) : '⚠️ Erro ao consultar comissão.';
 }
 
 // Bloco do resumo diário: no último dia do período (fecha_hoje=true) vira
-// cabeçalho de FECHAMENTO; nos demais dias é o formato padrão.
+// cabeçalho de FECHAMENTO; nos demais dias é o formato padrão. Vai pro grupo
+// de VENDAS, então é sem p_meta: só o time, sem valor por vendedor nem acerto.
 // `dia` (ISO) é o dia que o resumo fecha. O resumo roda às 3h, quando o dia
 // novo já começou: sem ele a RPC contaria o dia que mal começou.
 async function textoComissaoRelatorio(dia) {
   const d = await dadosComissao(dia);
   if (!d) return '⚠️ Erro ao consultar comissão.';
-  if (d.fecha_hoje) {
-    return montarFechamento(d, await dadosRegistrosRod(dia), await dadosRegistrosRod(dia, 'dinheiro'), { ref: dia });
-  }
+  if (d.fecha_hoje) return montarFechamentoTime(d);
   return formatComissao(d);
 }
 
-// Acerto do ciclo: dinheiro em mãos do Rod − (comissão + despesas).
+// Acerto do ciclo: dinheiro em mãos do Rod − (comissão do Rod + despesas).
 //   positivo -> sobra dinheiro da loja com o Rod: ele repassa a diferença.
 //   negativo -> a loja ainda deve: paga a diferença ao Rod.
 // (Convenção do sistema; trocar o sinal é trocar estas duas linhas.)
@@ -832,20 +922,17 @@ function linhaAcerto(dinheiro, aPagar) {
 }
 
 // ---------------------------------------------------------------------------
-// Fixo mensal do Rod
+// Fechamento
 //
-// Nunca esteve no banco: é pago junto com a comissão, e o fechamento só somava
-// comissão + despesas. Mês cheio (dia 1 ao último dia) paga o fixo inteiro;
-// ciclo que não é mês cheio (o de transição 21/09 → 30/09) paga proporcional:
-// FIXO ÷ 30 × dias. O proporcional nunca passa do fixo inteiro — um ciclo
-// antigo 21 → 20 de 31 dias, refeito pelo /refazerfechamento, paga 3.200 e
-// não 3.306,67.
+// Salário fixo e folha NÃO aparecem em mensagem nenhuma do bot: vivem só no
+// sistema (tela Equipe). O acerto do Rod sai sem o fixo e a linha
+// LINHA_FIXO_SISTEMA manda conferir lá.
 //
-// Os dias saem do período que a bot_comissao devolve em `mes` ("21/09 →
-// 30/09"), então o bot continua sem dia de ciclo fixo no código.
+// O período vem da bot_comissao em `mes` ("01/10 → 31/10"): o bot continua
+// sem dia de ciclo fixo no código.
 // ---------------------------------------------------------------------------
 
-const FIXO_MENSAL = 3200;
+const LINHA_FIXO_SISTEMA = '📌 Fixo e folha: ver no sistema, tela Equipe';
 
 // "21/09 → 30/09" (com ou sem ano) -> { inicio: Date, fim: Date } em UTC puro
 // (só data). O ano, quando não vem, é o de `refISO`; se o início tem mês
@@ -878,59 +965,47 @@ function diasEntre(a, b) {
   return Math.round((b - a) / 864e5) + 1; // inclusivo
 }
 
-// { valor, dias, cheio } do fixo de um ciclo; null se o período não for lido
-// (aí o fechamento avisa em vez de pagar um total errado).
-function fixoDoCiclo(mes, refISO) {
-  const p = periodoDoCiclo(mes, refISO);
-  if (!p) return null;
-  const dias = diasEntre(p.inicio, p.fim);
-  const ultimoDoMes = new Date(Date.UTC(p.inicio.getUTCFullYear(), p.inicio.getUTCMonth() + 1, 0));
-  const cheio = p.inicio.getUTCDate() === 1 &&
-    p.fim.getUTCFullYear() === ultimoDoMes.getUTCFullYear() &&
-    p.fim.getUTCMonth() === ultimoDoMes.getUTCMonth() &&
-    p.fim.getUTCDate() === ultimoDoMes.getUTCDate();
-  const valor = cheio ? FIXO_MENSAL : Math.min(FIXO_MENSAL, Math.round(FIXO_MENSAL / 30 * dias * 100) / 100);
-  return { valor, dias, cheio: cheio || valor === FIXO_MENSAL };
+// Pods, faixa e comissão do TIME (com a quebra varejo/atacado quando houver).
+function linhasComissaoTime(d, { rotuloTotal = 'Total', rotuloFaixa = 'Faixa final' } = {}) {
+  return [
+    ...(linhasQuebraAtacado(d) || [
+      `${rotuloTotal}: *${d.unidades_mes ?? 0}* produtos`,
+      `${rotuloFaixa}: R$ ${fmtBR(d.taxa_atual)}/produto`,
+    ]),
+    `💰 Comissão do time: *R$ ${fmtBR(d.comissao)}*`,
+  ];
 }
 
-function linhaFixo(fixo) {
-  return fixo.cheio
-    ? `📌 Fixo: R$ ${fmtBR(fixo.valor)}`
-    : `📌 Fixo proporcional (${fixo.dias} dias): R$ ${fmtBR(fixo.valor)}`;
+// Comissão do Rod = a linha DELE em `vendedores`. É ela, e não a do time, que
+// entra no acerto: dinheiro em mãos e despesas são só do Rod — com dois
+// vendedores, a comissão do Gabriel não sai do caixa do Rod.
+function comissaoRod(d) {
+  const v = (d.vendedores || []).find(x => /^rod/i.test(String(x.nome || '').trim()));
+  return v ? Number(v.comissao) || 0 : null;
 }
 
-const AVISO_FIXO = '⚠️ _Não consegui ler o período do ciclo pra calcular o fixo — confira antes de pagar._';
-
-// Fechamento = comissão + fixo + despesas do Rod + dinheiro em mãos do mesmo ciclo.
+// Despesas, dinheiro em mãos e acerto do Rod (painéis de sócio).
 // `desp`/`dinh` null = a RPC falhou: o total NÃO é somado e o texto avisa,
 // porque um total silenciosamente menor viraria pagamento errado.
-// `opts` troca título/rodapé — é como o /refazerfechamento publica a correção
-// sem se passar por um fechamento novo. `opts.ref` (ISO) é a data de
-// referência do ciclo, de onde sai o ano do período.
-function montarFechamento(d, desp, dinh, opts = {}) {
-  const comissao = Number(d.comissao) || 0;
-  const fixo = fixoDoCiclo(d, opts.ref);
-  const titulo = opts.titulo || `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`;
-  const rodape = opts.rodape || '_(o novo período já começou)_';
-  const quebra = linhasQuebraAtacado(d);
-  const linhas = [
-    titulo,
-    ...(quebra || [
-      `Total: *${d.unidades_mes ?? 0}* produtos`,
-      `Faixa final: R$ ${fmtBR(d.taxa_atual)}/produto`,
-    ]),
-    `💰 Comissão: *R$ ${fmtBR(comissao)}*`,
-  ];
-  if (fixo) linhas.push(linhaFixo(fixo));
-  else linhas.push(AVISO_FIXO);
-  let aPagar = null;
+function linhasAcertoRod(d, desp, dinh, { detalharDespesas = false, ateAgora = false } = {}) {
+  const linhas = [];
+  let despesas = null;
   if (!desp) {
     linhas.push('⚠️ _Não consegui somar as entregas/despesas do Rod — confira antes de pagar._');
-  } else if (fixo) {
-    const despesas = Number(desp.total) || 0;
-    aPagar = comissao + fixo.valor + despesas;
+  } else {
+    despesas = Number(desp.total) || 0;
     linhas.push(`🛵 Entregas/despesas Rod: R$ ${fmtBR(despesas)}`);
-    linhas.push(`🧾 *Total a pagar: R$ ${fmtBR(aPagar)}*`);
+    if (detalharDespesas) {
+      for (const [tipo, valor] of despesasPorTipo(desp.itens)) linhas.push(`   • ${escapeMd(tipo)}: R$ ${fmtBR(valor)}`);
+    }
+  }
+  const comRod = comissaoRod(d);
+  let aPagar = null;
+  if (comRod == null) {
+    linhas.push('⚠️ _Não achei o Rodrigo entre os vendedores — acerto não calculado._');
+  } else if (despesas != null) {
+    aPagar = comRod + despesas;
+    linhas.push(`🧾 *A pagar ao Rod${ateAgora ? ' até agora' : ''}: R$ ${fmtBR(aPagar)}* (comissão dele + despesas)`);
   }
   if (!dinh) {
     linhas.push('⚠️ _Não consegui somar o dinheiro em mãos do Rod — confira antes de acertar._');
@@ -939,7 +1014,31 @@ function montarFechamento(d, desp, dinh, opts = {}) {
     linhas.push(`💵 Dinheiro em mãos (Rod): R$ ${fmtBR(dinheiro)}`);
     if (aPagar != null) linhas.push(linhaAcerto(dinheiro, aPagar));
   }
-  linhas.push(rodape);
+  linhas.push(LINHA_FIXO_SISTEMA);
+  return linhas;
+}
+
+// Fechamento do grupo de VENDAS (automático e a correção publicada pelo
+// /refazerfechamento): só o time. `opts` troca título/rodapé.
+function montarFechamentoTime(d, opts = {}) {
+  return [
+    opts.titulo || `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`,
+    ...linhasComissaoTime(d),
+    opts.rodape || '_(o novo período já começou)_',
+  ].join('\n');
+}
+
+// Fechamento completo, só para sócio (em privado): time, uma linha por
+// vendedor e o acerto do Rod.
+function montarFechamentoSocio(d, desp, dinh, opts = {}) {
+  const linhas = [
+    opts.titulo || `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`,
+    ...linhasComissaoTime(d),
+    ...linhasVendedores(d),
+    '',
+    ...linhasAcertoRod(d, desp, dinh),
+  ];
+  if (opts.rodape) linhas.push(opts.rodape);
   return linhas.join('\n');
 }
 
@@ -1049,67 +1148,35 @@ async function handleListaRod(chatId, tipo) {
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
-// /geral — painel do ciclo vigente: comissão, despesas, dinheiro e o acerto.
-// As três fontes são independentes; se uma falhar o painel diz QUAL falhou em
-// vez de mostrar um número errado (o acerto só sai com as três disponíveis).
-async function handleGeral(chatId) {
+// /geral — painel do ciclo vigente, só de sócio: comissão do time e de cada
+// vendedor, despesas, dinheiro e o acerto do Rod. Quem é sócio é o banco que
+// diz (a resposta da bot_comissao com o p_meta de quem pediu traz
+// `vendedores`). Se uma fonte falhar, o painel diz QUAL em vez de mostrar um
+// número errado.
+async function handleGeral(chatId, from) {
   const [com, desp, dinh] = await Promise.all([
-    dadosComissao(),
+    dadosComissao(null, metaUsuario(from)),
     dadosRegistrosRod(null, 'despesa'),
     dadosRegistrosRod(null, 'dinheiro'),
   ]);
+  if (!com) { await sendTelegram(chatId, '⚠️ Erro ao consultar comissão.'); return; }
+  if (!ehSocio(com)) { await sendTelegram(chatId, SO_SOCIOS); return; }
 
-  const ciclo = (com && com.mes) || (desp && desp.ciclo) || (dinh && dinh.ciclo) || '';
-  const linhas = [`📋 *Geral — ${escapeMd(String(ciclo))}*`, ''];
-
-  const comissao = com ? Number(com.comissao) || 0 : null;
-  if (!com) {
-    linhas.push('💰 *Comissão*: ⚠️ não consegui consultar');
-  } else {
-    linhas.push('💰 *Comissão*');
-    linhas.push(`Unidades: *${com.unidades_mes ?? 0}* · faixa R$ ${fmtBR(com.taxa_atual)}/un`);
-    linhas.push(`Total: *R$ ${fmtBR(comissao)}*`);
-  }
-
-  const fixo = com ? fixoDoCiclo(com) : null;
-  linhas.push('');
-  if (fixo) linhas.push(linhaFixo(fixo));
-  else linhas.push('📌 *Fixo*: ⚠️ não consegui calcular');
-
-  const despesas = desp ? Number(desp.total) || 0 : null;
-  linhas.push('');
-  if (!desp) {
-    linhas.push('🛵 *Despesas Rod*: ⚠️ não consegui consultar');
-  } else {
-    const n = Array.isArray(desp.itens) ? desp.itens.length : 0;
-    linhas.push('🛵 *Despesas Rod*');
-    linhas.push(`${n} lançamento(s) → *R$ ${fmtBR(despesas)}*`);
-  }
-
-  const dinheiro = dinh ? Number(dinh.total) || 0 : null;
-  linhas.push('');
-  if (!dinh) {
-    linhas.push('💵 *Dinheiro em mãos*: ⚠️ não consegui consultar');
-  } else {
-    const n = Array.isArray(dinh.itens) ? dinh.itens.length : 0;
-    linhas.push('💵 *Dinheiro em mãos*');
-    linhas.push(`${n} lançamento(s) → *R$ ${fmtBR(dinheiro)}*`);
-  }
-
-  linhas.push('');
-  if (comissao == null || despesas == null || dinheiro == null || !fixo) {
-    linhas.push('⚖️ *Acerto*: ⚠️ falta dado acima — não dá pra fechar a conta.');
-  } else {
-    linhas.push(`🧾 A pagar: comissão + fixo + despesas = *R$ ${fmtBR(comissao + fixo.valor + despesas)}*`);
-    linhas.push(linhaAcerto(dinheiro, comissao + fixo.valor + despesas));
-  }
-
+  const linhas = [
+    `📋 *Geral — ${escapeMd(String(com.mes ?? ''))}*`,
+    '',
+    `Unidades: *${com.unidades_mes ?? 0}* · faixa R$ ${fmtBR(com.taxa_atual)}/un`,
+    `💰 Comissão do time: *R$ ${fmtBR(com.comissao)}*`,
+    ...linhasVendedores(com),
+    '',
+    ...linhasAcertoRod(com, desp, dinh),
+  ];
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
 // /fechamento — PARCIAL do ciclo vigente, no formato do fechamento, sem
-// fechar nada (não grava, não publica em outro grupo). Mesmas permissões do
-// /geral: onde ele responde, este responde.
+// fechar nada (não grava, não publica em outro grupo). Só de sócio, como o
+// /geral.
 function despesasPorTipo(itens) {
   const mapa = new Map();
   for (const it of itens || []) {
@@ -1119,13 +1186,14 @@ function despesasPorTipo(itens) {
   return [...mapa.entries()].sort((a, b) => b[1] - a[1]);
 }
 
-async function handleFechamentoParcial(chatId) {
+async function handleFechamentoParcial(chatId, from) {
   const [com, desp, dinh] = await Promise.all([
-    dadosComissao(),
+    dadosComissao(null, metaUsuario(from)),
     dadosRegistrosRod(null, 'despesa'),
     dadosRegistrosRod(null, 'dinheiro'),
   ]);
   if (!com) { await sendTelegram(chatId, '⚠️ Erro ao consultar comissão — não dá pra montar a parcial.'); return; }
+  if (!ehSocio(com)) { await sendTelegram(chatId, SO_SOCIOS); return; }
 
   const linhas = [`⏳ *FECHAMENTO PARCIAL — ${escapeMd(String(com.mes ?? ''))}*`, '_Até agora. Nada foi fechado._'];
   const periodo = periodoDoCiclo(com);
@@ -1136,46 +1204,49 @@ async function handleFechamentoParcial(chatId) {
     linhas.push(`📅 Dia ${passados} de ${total} do ciclo`);
   }
   linhas.push('');
-
-  const comissao = Number(com.comissao) || 0;
-  linhas.push(...(linhasQuebraAtacado(com) || [
-    `Pods até agora: *${com.unidades_mes ?? 0}*`,
-    `Faixa atual: R$ ${fmtBR(com.taxa_atual)}/produto`,
-  ]));
-  linhas.push(`💰 Comissão: *R$ ${fmtBR(comissao)}*`);
-
-  const fixo = fixoDoCiclo(com);
-  linhas.push(fixo ? linhaFixo(fixo) : AVISO_FIXO);
-
-  let despesas = null;
-  if (!desp) {
-    linhas.push('⚠️ _Não consegui somar as entregas/despesas do Rod._');
-  } else {
-    despesas = Number(desp.total) || 0;
-    const tipos = despesasPorTipo(desp.itens);
-    linhas.push(`🛵 Despesas extras: R$ ${fmtBR(despesas)}`);
-    for (const [tipo, valor] of tipos) linhas.push(`   • ${escapeMd(tipo)}: R$ ${fmtBR(valor)}`);
-  }
-
-  let aPagar = null;
-  if (despesas != null && fixo) {
-    aPagar = comissao + fixo.valor + despesas;
-    linhas.push(`🧾 *Total a pagar até agora: R$ ${fmtBR(aPagar)}*`);
-  }
-
-  if (!dinh) {
-    linhas.push('⚠️ _Não consegui somar o dinheiro em mãos do Rod._');
-  } else {
-    const dinheiro = Number(dinh.total) || 0;
-    linhas.push(`💵 Dinheiro com o Rod: R$ ${fmtBR(dinheiro)}`);
-    if (aPagar != null) linhas.push(linhaAcerto(dinheiro, aPagar));
-  }
+  linhas.push(...linhasComissaoTime(com, { rotuloTotal: 'Pods até agora', rotuloFaixa: 'Faixa atual' }));
+  linhas.push(...linhasVendedores(com));
+  linhas.push('');
+  linhas.push(...linhasAcertoRod(com, desp, dinh, { detalharDespesas: true, ateAgora: true }));
   linhas.push('', '_Parcial: os números ainda mudam até o fechamento das 3h depois do último dia._');
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
-async function handleComissao(chatId) {
-  await sendTelegram(chatId, await textoComissao());
+async function handleComissao(chatId, from) {
+  await sendTelegram(chatId, await textoComissao(from));
+}
+
+// /sou Nome — liga o Telegram de quem mandou ao vendedor com esse nome. Daí
+// em diante as baixas dele contam para a comissão DELE. Quem confere o nome
+// (e diz quais existem) é a bot_vincular_vendedor.
+async function handleSou(chatId, text, from) {
+  const nome = (text || '').replace(/^\/sou(@\S+)?/i, '').trim();
+  if (!nome) { await sendTelegram(chatId, 'Uso: `/sou SeuNome` (ex.: `/sou Gabriel`)'); return; }
+
+  let d = null;
+  try {
+    d = await callRpc('bot_vincular_vendedor', { p_token: BOT_SYNC_TOKEN, p_nome: nome, p_meta: metaUsuario(from) });
+  } catch (err) {
+    console.error('bot_vincular_vendedor:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC `bot_vincular_vendedor` não existe no banco — falta rodar o SQL dos vendedores.'
+      : '⚠️ Erro ao falar com o servidor. Tente de novo em instantes.');
+    return;
+  }
+
+  if (!d || d.ok === false) {
+    const linhas = [`⚠️ ${escapeMd(String((d && (d.erro || d.msg)) || 'Não consegui ligar seu Telegram.'))}`];
+    const nomes = d && Array.isArray(d.nomes) ? d.nomes : [];
+    if (nomes.length) linhas.push('', 'Nomes possíveis:', ...nomes.map(n => `• ${escapeMd(String(n))}`));
+    await sendTelegram(chatId, linhas.join('\n'));
+    return;
+  }
+
+  const quem = escapeMd(String(d.vendedor ?? d.nome ?? nome));
+  let texto = `✅ Pronto, ${quem}! Suas baixas agora contam para a sua comissão.`;
+  const passadas = Number(d.vendas_atribuidas) || 0;
+  if (passadas > 0) texto += `\n(${passadas} vendas que você já tinha registrado foram passadas para você)`;
+  await sendTelegram(chatId, texto);
 }
 
 // ---------------------------------------------------------------------------
@@ -1200,35 +1271,31 @@ function parseDataComando(text) {
   return `${ano}-${String(mes).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
 }
 
-async function handleRefazerFechamento(chatId, text, userId) {
-  if (!ehDono(userId)) { await sendTelegram(chatId, '⛔ Só o dono pode refazer o fechamento.'); return; }
+async function handleRefazerFechamento(chatId, text, from) {
   const data = parseDataComando(text);
   if (!data) {
     await sendTelegram(chatId, 'Uso: /refazerfechamento 30/09 (data de corte do ciclo)');
     return;
   }
 
-  let d = null;
-  try {
-    d = await callRpc('bot_comissao', { p_token: BOT_SYNC_TOKEN, p_mes: data });
-  } catch (err) {
-    console.error('refazerfechamento:', err.message);
-  }
-  if (!d || d.ok === false) {
+  const d = await dadosComissao(data, metaUsuario(from));
+  if (!d) {
     await sendTelegram(chatId, '⚠️ Não consegui recalcular o fechamento dessa data.');
     return;
   }
+  if (!ehSocio(d)) { await sendTelegram(chatId, SO_SOCIOS); return; }
 
   const [, mes, dia] = data.split('-');
-  const texto = montarFechamento(d, await dadosRegistrosRod(data), await dadosRegistrosRod(data, 'dinheiro'), {
-    titulo: `🔁 *FECHAMENTO CORRIGIDO — ${escapeMd(String(d.mes ?? ''))}*`,
+  const titulo = `🔁 *FECHAMENTO CORRIGIDO — ${escapeMd(String(d.mes ?? ''))}*`;
+  // O grupo de vendas recebe o mesmo formato do fechamento automático: só o
+  // time. O detalhe por vendedor e o acerto vão só pra quem pediu.
+  await sendTelegram(VENDAS_CHAT_ID, montarFechamentoTime(d, {
+    titulo,
     rodape: `_Novo corte: fim do dia ${dia}/${mes} (2h59 da madrugada seguinte). Substitui o fechamento anterior._`,
-    ref: data,
-  });
-
-  await sendTelegram(VENDAS_CHAT_ID, texto);
+  }));
   if (String(chatId) !== VENDAS_CHAT_ID) {
-    await sendTelegram(chatId, '✅ Correção publicada no grupo de vendas.');
+    const detalhe = montarFechamentoSocio(d, await dadosRegistrosRod(data), await dadosRegistrosRod(data, 'dinheiro'), { titulo });
+    await sendTelegram(chatId, `${detalhe}\n\n✅ Correção (só o time) publicada no grupo de vendas.`);
   }
 }
 
@@ -1271,6 +1338,45 @@ function nomeAutor(from) {
   return from.username ? `@${from.username}` : '';
 }
 
+// p_meta de quem mandou a mensagem — é por ele que o banco sabe de QUAL
+// vendedor é a baixa/ajuste/consulta. user_id SEMPRE texto: o banco compara
+// com o id guardado como texto, e número não casa.
+function metaUsuario(from) {
+  const f = from || {};
+  return {
+    user_id: f.id != null ? String(f.id) : null,
+    nome: [f.first_name, f.last_name].filter(Boolean).join(' ').trim() || null,
+    username: f.username || null,
+  };
+}
+
+// "/anular 2 Gabriel" -> "Gabriel"; null sem nome. O banco só aceita o nome
+// de OUTRA pessoa quando quem mandou é sócio — o bot não decide isso.
+function vendedorDoComando(text) {
+  const nome = (text || '').trim().split(/\s+/).slice(2).join(' ').trim();
+  return nome || null;
+}
+
+// Meta de um ajuste (/anular, /adicionar): quem mandou + o vendedor pedido.
+function metaAjuste(from, text) {
+  const meta = metaUsuario(from);
+  const vendedor = vendedorDoComando(text);
+  if (vendedor) meta.vendedor = vendedor;
+  return meta;
+}
+
+// " de Gabriel" — quem recebeu o ajuste, segundo o banco. Se pediram outro
+// nome e o banco lançou em quem mandou (não é sócio), diz isso.
+function trechoVendedorAjuste(data, text) {
+  const recebeu = data && data.vendedor;
+  if (!recebeu) return { de: '', nota: '' };
+  const pedido = vendedorDoComando(text);
+  const nota = pedido && pedido.toLowerCase() !== String(recebeu).toLowerCase()
+    ? `\n_Só sócio lança no nome de outro — o ajuste foi para ${escapeMd(String(recebeu))}._`
+    : '';
+  return { de: ` de ${escapeMd(String(recebeu))}`, nota };
+}
+
 // Erro de RPC que ainda não existe no banco (Run não aplicado). É o que separa
 // "falta rodar o SQL" de "o servidor caiu" — no primeiro caso dá pra cair no
 // fallback sem autor em vez de deixar o /anular quebrado.
@@ -1307,7 +1413,7 @@ async function handleAnular(chatId, text, from) {
     return;
   }
   const autor = nomeAutor(from);
-  const meta = { user_id: from && from.id != null ? String(from.id) : null, nome: autor };
+  const meta = metaAjuste(from, text);
 
   // Preferimos a versão que carimba o autor no ajuste. Se o Run dela ainda não
   // foi aplicado, a anulação AINDA ACONTECE pela RPC antiga — perder auditoria
@@ -1319,9 +1425,11 @@ async function handleAnular(chatId, text, from) {
   }
   if (!r.ok) { await sendTelegram(chatId, r.msg); return; }
 
-  // A RPC é um contador puro: devolve só { ok, unidades_anuladas }.
+  // A RPC devolve { ok, unidades_anuladas, vendedor } — vendedor = quem levou
+  // o desconto (a RPC antiga, sem autor, não manda).
   const porQuem = autor ? ` (por ${escapeMd(autor)})` : '';
-  await sendTelegram(chatId, `✂️ ${r.data.unidades_anuladas ?? 0} unidade(s) descontada(s) da comissão.${porQuem}`);
+  const { de, nota } = trechoVendedorAjuste(r.data, text);
+  await sendTelegram(chatId, `✂️ ${r.data.unidades_anuladas ?? 0} unidade(s) descontada(s) da comissão${de}.${porQuem}${nota}`);
 }
 
 // Só o dono: adicionar AUMENTA a comissão, mesma regra do /desanular.
@@ -1337,19 +1445,20 @@ async function handleAdicionar(chatId, text, from) {
     return;
   }
   const autor = nomeAutor(from);
-  const meta = { user_id: from && from.id != null ? String(from.id) : null, nome: autor };
+  const meta = metaAjuste(from, text);
 
   const r = await chamarRpcComissao('bot_adicionar_comissao', unidades, meta);
   if (!r.ok) { await sendTelegram(chatId, r.msg); return; }
 
   const porQuem = autor ? ` (por ${escapeMd(autor)})` : '';
+  const { de, nota } = trechoVendedorAjuste(r.data, text);
   const partes = [
-    `➕ ${r.data.unidades_adicionadas ?? unidades} unidade(s) adicionada(s) à comissão.${porQuem}`,
+    `➕ ${r.data.unidades_adicionadas ?? unidades} unidade(s) adicionada(s) à comissão${de}.${porQuem}${nota}`,
   ];
   // Extrato logo abaixo: é onde se vê a adição já refletida. Sai do mesmo
   // bot_comissao que alimenta o /comissao, então os dois não têm como divergir.
-  const d = await dadosComissao();
-  partes.push('', d ? formatComissao(d) : '⚠️ _Adição registrada, mas não consegui puxar o extrato agora._');
+  const d = await dadosComissao(null, metaUsuario(from));
+  partes.push('', d ? formatComissaoPorQuem(d) : '⚠️ _Adição registrada, mas não consegui puxar o extrato agora._');
   await sendTelegram(chatId, partes.join('\n'));
 }
 
@@ -4233,7 +4342,7 @@ async function handleConsignado(chatId, text) {
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Comissão do mês\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo (comissão + despesas + dinheiro + acerto)\n➕ */adicionar N* — Soma N na comissão do ciclo (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo por vendedor + acerto do Rod (só sócios)\n⏳ */fechamento* — Parcial do fechamento (só sócios)\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -4351,6 +4460,12 @@ app.post('/webhook', async (req, res) => {
     // configurar um grupo que o bot ainda não atende. Seguros por serem só do
     // dono — chat aleatório não faz o bot falar sem ele.
     if (cmd === '/chatid') { await handleChatId(chatId, msg); return; }
+    // /meuid vale em qualquer chat: é como se descobre o id de um sócio pra
+    // cadastrar, e ele pode ainda não estar em grupo nenhum do bot.
+    if (cmd === '/meuid') {
+      if (fromId != null) await sendTelegram(chatId, `Seu ID do Telegram: \`${fromId}\``);
+      return;
+    }
     if (cmd === '/setgrupopedidos') {
       if (ehDono(fromId)) { await handleSetGrupoPedidos(chatId, text, msg.from); return; }
       return;
@@ -4498,7 +4613,7 @@ app.post('/webhook', async (req, res) => {
 
       const permitidas = isVendas ? baixas : isReposicao ? entradas : [...baixas, ...entradas];
       if (permitidas.length) {
-        await handleMovimentos(chatId, permitidas, msg.message_id, controleAtacado, msgComprovante);
+        await handleMovimentos(chatId, permitidas, msg.message_id, controleAtacado, msgComprovante, msg.from);
       } else if (msgComprovante) {
         // Nenhuma linha passou (regra de grupo, formato), mas a foto está aqui:
         // o comprovante não pode ser descartado junto.
@@ -4537,7 +4652,7 @@ app.post('/webhook', async (req, res) => {
         .split('\n')
         .map(parseLinhaReposicaoSemPrefixo)
         .filter(Boolean);
-      if (sintetizadas.length) await handleMovimentos(chatId, sintetizadas, msg.message_id);
+      if (sintetizadas.length) await handleMovimentos(chatId, sintetizadas, msg.message_id, null, null, msg.from);
       return;
     }
 
@@ -4555,17 +4670,18 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/relatorio') { await handleRelatorio(chatId); return; }
     if (cmd === '/semana') { await handleRelatorioSemanal(chatId); return; }
     if (cmd === '/reposicao') { await handleReposicao(chatId); return; }
-    if (cmd === '/comissao') { await handleComissao(chatId); return; }
+    if (cmd === '/comissao') { await handleComissao(chatId, msg.from); return; }
+    if (cmd === '/sou') { await handleSou(chatId, text, msg.from); return; }
     if (cmd === '/despesas') { await handleListaRod(chatId, 'despesa'); return; }
     if (cmd === '/dinheiro') { await handleListaRod(chatId, 'dinheiro'); return; }
-    if (cmd === '/geral') { await handleGeral(chatId); return; }
-    if (cmd === '/fechamento') { await handleFechamentoParcial(chatId); return; }
+    if (cmd === '/geral') { await handleGeral(chatId, msg.from); return; }
+    if (cmd === '/fechamento') { await handleFechamentoParcial(chatId, msg.from); return; }
     // /anular é liberado (registra o autor); /desanular e /refazerfechamento
     // continuam só do dono — a checagem é feita dentro dos handlers.
     if (cmd === '/anular') { await handleAnular(chatId, text, msg.from); return; }
     if (cmd === '/desanular') { await handleDesanular(chatId, text, fromId); return; }
     if (cmd === '/adicionar') { await handleAdicionar(chatId, text, msg.from); return; }
-    if (cmd === '/refazerfechamento') { await handleRefazerFechamento(chatId, text, fromId); return; }
+    if (cmd === '/refazerfechamento') { await handleRefazerFechamento(chatId, text, msg.from); return; }
     if (cmd === '/atacado') { await handleAtacado(chatId, msg.from); return; }
     if (cmd === '/desatacado') { await handleDesatacado(chatId, msg.from); return; }
     if (cmd === '/traduzir') {
@@ -4692,7 +4808,8 @@ module.exports = {
   handleFornecedor,
   handleApelido,
   handlePedido,
-  montarFechamento,
+  montarFechamentoTime,
+  montarFechamentoSocio,
   linhaAcerto,
   linhasQuebraAtacado,
   extrairAtacado,
@@ -4738,10 +4855,8 @@ module.exports = {
   hojeISO,
   ontemISO,
   CRON_RESUMO_VENDAS,
-  fixoDoCiclo,
   periodoDoCiclo,
   handleFechamentoParcial,
-  FIXO_MENSAL,
   chatAtualizacoes,
   textoFixada,
   escHtml,

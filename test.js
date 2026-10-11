@@ -342,6 +342,209 @@ teste('regressão: baixa continua indo pra bot_movimentar_estoque', async (ctx) 
   assert.ok(resp.text.includes('Baixa registrada'), resp.text);
 });
 
+// ---------------------------------------------------------------------------
+// Dois vendedores: p_meta de quem mandou, /sou, /meuid, /comissao por pessoa
+// ---------------------------------------------------------------------------
+
+// Update com from completo (sobrenome e @), que o helper `update` não monta.
+function updateDe(text, from, { chat = GRUPO_VENDAS, tipo = 'group' } = {}) {
+  const u = update(text, { chat, tipo });
+  u.message.from = from;
+  return u;
+}
+const GABRIEL = { id: 777, first_name: 'Gabriel', last_name: 'Souza', username: 'gabs' };
+const META_GABRIEL = { user_id: '777', nome: 'Gabriel Souza', username: 'gabs' };
+const BAIXA_OK = {
+  status: 'ok', direction: 'baixa', model: 'Ignite 5500', flavor: 'Grape Ice', qty: 1, stock_after: 7,
+};
+
+teste('baixa manda p_meta de quem deu a baixa (user_id texto) e mostra o vendedor', async (ctx) => {
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [BAIXA_OK], vendedor: 'Gabriel' } };
+  const [resp] = await mandar(ctx.webhook, updateDe('-1 Ignite 5500 Grape Ice', GABRIEL));
+  const [rpc] = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
+  assert.strictEqual(rpc.body.p_meta.user_id, '777');
+  assert.strictEqual(typeof rpc.body.p_meta.user_id, 'string');
+  assert.strictEqual(rpc.body.p_meta.nome, 'Gabriel Souza');
+  assert.strictEqual(rpc.body.p_meta.username, 'gabs');
+  // O que já ia continua indo.
+  assert.strictEqual(rpc.body.p_meta.chat_id, GRUPO_VENDAS);
+  assert.ok(rpc.body.p_meta.message_id != null);
+  assert.ok(resp.text.includes('Baixa registrada'), resp.text);
+  assert.ok(resp.text.trim().endsWith('👤 Venda de: Gabriel'), resp.text);
+});
+
+teste('baixa com vendedor null avisa para mandar /sou', async (ctx) => {
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [BAIXA_OK], vendedor: null } };
+  const [resp] = await mandar(ctx.webhook, updateDe('-1 Ignite 5500 Grape Ice', GABRIEL));
+  assert.ok(resp.text.includes('⚠️ Essa venda ficou sem vendedor. Mande /sou SeuNome uma vez para ligar seu Telegram.'), resp.text);
+});
+
+teste('entrada (+) não ganha linha de vendedor, mas leva o p_meta', async (ctx) => {
+  respostas.bot_movimentar_estoque = {
+    status: 200, body: { resultados: [{ ...BAIXA_OK, direction: 'entrada', stock_after: 8 }], vendedor: null },
+  };
+  const [resp] = await mandar(ctx.webhook, updateDe('+1 Ignite 5500 Grape Ice', GABRIEL, { chat: GRUPO_REPOSICAO }));
+  const [rpc] = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
+  assert.deepStrictEqual(
+    { user_id: rpc.body.p_meta.user_id, nome: rpc.body.p_meta.nome, username: rpc.body.p_meta.username }, META_GABRIEL);
+  assert.ok(!resp.text.includes('vendedor') && !resp.text.includes('Venda de'), resp.text);
+});
+
+teste('/meuid responde o id de quem mandou, em qualquer chat', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, updateDe('/meuid', GABRIEL, { chat: -999999 }));
+  assert.strictEqual(resp.text, 'Seu ID do Telegram: `777`');
+  assert.strictEqual(chamadas.length, 0);
+});
+
+teste('/sou Gabriel liga o Telegram e conta as vendas passadas', async (ctx) => {
+  respostas.bot_vincular_vendedor = { status: 200, body: { ok: true, vendedor: 'Gabriel', vendas_atribuidas: 3 } };
+  const [resp] = await mandar(ctx.webhook, updateDe('/sou Gabriel', GABRIEL));
+  const [rpc] = chamadas.filter(c => c.fn === 'bot_vincular_vendedor');
+  assert.strictEqual(rpc.body.p_nome, 'Gabriel');
+  assert.deepStrictEqual(rpc.body.p_meta, META_GABRIEL);
+  assert.strictEqual(resp.text,
+    '✅ Pronto, Gabriel! Suas baixas agora contam para a sua comissão.\n' +
+    '(3 vendas que você já tinha registrado foram passadas para você)');
+});
+
+teste('/sou sem vendas passadas não fala de vendas', async (ctx) => {
+  respostas.bot_vincular_vendedor = { status: 200, body: { ok: true, vendedor: 'Gabriel', vendas_atribuidas: 0 } };
+  const [resp] = await mandar(ctx.webhook, updateDe('/sou gabriel', GABRIEL));
+  assert.strictEqual(resp.text, '✅ Pronto, Gabriel! Suas baixas agora contam para a sua comissão.');
+});
+
+teste('/sou com nome errado mostra o erro e os nomes possíveis', async (ctx) => {
+  respostas.bot_vincular_vendedor = {
+    status: 200, body: { ok: false, erro: 'Vendedor não encontrado.', nomes: ['Rodrigo', 'Gabriel'] },
+  };
+  const [resp] = await mandar(ctx.webhook, updateDe('/sou Gabi', GABRIEL));
+  assert.ok(resp.text.includes('Vendedor não encontrado.'), resp.text);
+  assert.ok(resp.text.includes('• Rodrigo') && resp.text.includes('• Gabriel'), resp.text);
+});
+
+teste('/sou sem nome mostra o uso e não chama o banco', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, updateDe('/sou', GABRIEL));
+  assert.ok(resp.text.startsWith('Uso:'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_vincular_vendedor').length, 0);
+});
+
+const COMISSAO_PESSOAL = {
+  ok: true, pessoal: true, vendedor: 'Gabriel', mes: '01/10 → 31/10',
+  unidades_mes: 42, unidades_hoje: 6, unidades_varejo: 40, unidades_atacado: 2,
+  taxa_atual: 3, comissao: 124, time_unidades_mes: 180, time_unidades_hoje: 15,
+  faltam_para_proxima: 20, proxima_taxa: 4, valor_atacado: 2, fecha_hoje: false,
+};
+
+teste('/comissao de vendedor ligado: formato pessoal, com p_meta', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: COMISSAO_PESSOAL };
+  const [resp] = await mandar(ctx.webhook, updateDe('/comissao', GABRIEL));
+  const [rpc] = chamadas.filter(c => c.fn === 'bot_comissao');
+  assert.deepStrictEqual(rpc.body.p_meta, META_GABRIEL);
+  for (const trecho of [
+    'Gabriel, sua comissão', '(01/10 → 31/10)', 'Seus pods no mês: *42* (hoje: 6)',
+    'varejo 40 · atacado 2', 'Faixa atual: R$ 3,00 por pod', 'Sua comissão: *R$ 124,00*',
+    '👥 Time: 180 pods no mês (hoje: 15)', 'Faltam 20 pods do time para R$ 4,00 por pod',
+  ]) assert.ok(resp.text.includes(trecho), `faltou "${trecho}":\n${resp.text}`);
+  assert.ok(!resp.text.includes('fecha hoje'), resp.text);
+  assert.ok(!/fixo/i.test(resp.text), resp.text);
+});
+
+teste('/comissao pessoal: faixa máxima e último dia do mês', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: { ...COMISSAO_PESSOAL, faltam_para_proxima: null, fecha_hoje: true } };
+  const [resp] = await mandar(ctx.webhook, updateDe('/comissao', GABRIEL));
+  assert.ok(resp.text.includes('Time na faixa máxima'), resp.text);
+  assert.ok(resp.text.includes('📅 O mês fecha hoje'), resp.text);
+});
+
+teste('/comissao de Telegram não ligado: formato restrito, só o time', async (ctx) => {
+  respostas.bot_comissao = {
+    status: 200, body: {
+      ok: true, restrito: true, aviso: 'Seu Telegram não está ligado a nenhum vendedor. Mande /sou SeuNome.',
+      mes: '01/10 → 31/10', time_unidades_mes: 180, time_unidades_hoje: 15, taxa_atual: 3,
+      faltam_para_proxima: 20, proxima_taxa: 4,
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, updateDe('/comissao', { id: 4242, first_name: 'Fulano' }));
+  const [rpc] = chamadas.filter(c => c.fn === 'bot_comissao');
+  assert.strictEqual(rpc.body.p_meta.user_id, '4242');
+  assert.ok(resp.text.includes('não está ligado a nenhum vendedor'), resp.text);
+  assert.ok(resp.text.includes('👥 Time: 180 pods no mês (hoje: 15)'), resp.text);
+  assert.ok(resp.text.includes('Faixa atual: R$ 3,00 por pod'), resp.text);
+  assert.ok(resp.text.includes('Faltam 20 pods do time'), resp.text);
+  assert.ok(!resp.text.includes('Sua comissão') && !resp.text.includes('R$ 124'), resp.text);
+});
+
+teste('/comissao de sócio: resumo do time e uma linha por vendedor', async (ctx) => {
+  respostas.bot_comissao = {
+    status: 200, body: {
+      ok: true, mes: '01/10 → 31/10', unidades_mes: 185, unidades_hoje: 15, taxa_atual: 3, comissao: 540,
+      faltam_para_proxima: 15, proxima_taxa: 4, sem_vendedor_unidades: 5,
+      vendedores: [
+        { nome: 'Rodrigo', unidades_mes: 140, comissao: 420 },
+        { nome: 'Gabriel', unidades_mes: 40, comissao: 120 },
+      ],
+    },
+  };
+  const [resp] = await mandar(ctx.webhook, update('/comissao', { nome: 'Lucas' }));
+  assert.ok(resp.text.includes('Pods no mês: *185*'), resp.text);
+  assert.ok(resp.text.includes('Comissão total: *R$ 540,00*'), resp.text);
+  assert.ok(resp.text.includes('• Rodrigo: 140 pods · R$ 420,00'), resp.text);
+  assert.ok(resp.text.includes('• Gabriel: 40 pods · R$ 120,00'), resp.text);
+  assert.ok(resp.text.includes('⚠️ 5 pods sem vendedor (definir no sistema)'), resp.text);
+});
+
+teste('/anular 2 Gabriel manda o vendedor no p_meta e mostra quem recebeu', async (ctx) => {
+  respostas.bot_anular_comissao_autor = { status: 200, body: { ok: true, unidades_anuladas: 2, vendedor: 'Gabriel' } };
+  const [resp] = await mandar(ctx.webhook, update('/anular 2 Gabriel', { nome: 'Lucas' }));
+  const [rpc] = chamadas.filter(c => c.fn === 'bot_anular_comissao_autor');
+  assert.deepStrictEqual(rpc.body.p_meta, { user_id: String(DONO), nome: 'Lucas', username: null, vendedor: 'Gabriel' });
+  assert.strictEqual(resp.text, '✂️ 2 unidade(s) descontada(s) da comissão de Gabriel. (por Lucas)');
+});
+
+teste('/anular com nome de outro, por quem não é sócio: diz para quem foi', async (ctx) => {
+  respostas.bot_anular_comissao_autor = { status: 200, body: { ok: true, unidades_anuladas: 1, vendedor: 'Gabriel Souza' } };
+  const [resp] = await mandar(ctx.webhook, updateDe('/anular 1 Rodrigo', GABRIEL));
+  assert.ok(resp.text.startsWith('✂️ 1 unidade(s) descontada(s) da comissão de Gabriel Souza.'), resp.text);
+  assert.ok(resp.text.includes('Só sócio lança no nome de outro'), resp.text);
+});
+
+teste('/adicionar 3 Rodrigo pelo dono manda o vendedor e o extrato vem com p_meta', async (ctx) => {
+  respostas.bot_adicionar_comissao = { status: 200, body: { ok: true, unidades_adicionadas: 3, vendedor: 'Rodrigo' } };
+  respostas.bot_comissao = { status: 200, body: COMISSAO_BASE };
+  const [resp] = await mandar(ctx.webhook, update('/adicionar 3 Rodrigo', { nome: 'Lucas' }));
+  const [rpc] = chamadas.filter(c => c.fn === 'bot_adicionar_comissao');
+  assert.strictEqual(rpc.body.p_meta.vendedor, 'Rodrigo');
+  const [com] = chamadas.filter(c => c.fn === 'bot_comissao');
+  assert.strictEqual(com.body.p_meta.user_id, String(DONO));
+  assert.ok(resp.text.includes('adicionada(s) à comissão de Rodrigo. (por Lucas)'), resp.text);
+});
+
+teste('p_meta.user_id vai como TEXTO nas 4 RPCs de comissão/estoque', async (ctx) => {
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [BAIXA_OK], vendedor: 'Lucas' } };
+  respostas.bot_comissao = { status: 200, body: COMISSAO_BASE };
+  respostas.bot_anular_comissao_autor = { status: 200, body: { ok: true, unidades_anuladas: 1 } };
+  respostas.bot_adicionar_comissao = { status: 200, body: { ok: true, unidades_adicionadas: 1 } };
+  for (const t of ['-1 Ignite 5500 Grape Ice', '/comissao', '/anular 1', '/adicionar 1']) {
+    await mandar(ctx.webhook, update(t, { nome: 'Lucas' }));
+  }
+  for (const fn of ['bot_movimentar_estoque', 'bot_comissao', 'bot_anular_comissao_autor', 'bot_adicionar_comissao']) {
+    const cs = chamadas.filter(c => c.fn === fn);
+    assert.ok(cs.length > 0, `não chamou ${fn}`);
+    for (const c of cs) {
+      assert.strictEqual(c.body.p_meta && c.body.p_meta.user_id, String(DONO), `${fn} sem user_id texto`);
+      assert.strictEqual(typeof c.body.p_meta.user_id, 'string', fn);
+    }
+  }
+});
+
+teste('relatório diário segue sem p_meta (resumo do time, formato antigo)', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: COMISSAO_BASE };
+  await ctx.mod.enviarResumoVendas('2026-10-10');
+  const [rpc] = chamadas.filter(c => c.fn === 'bot_comissao');
+  assert.strictEqual(rpc.body.p_meta, undefined);
+  assert.ok(enviadas.some(m => (m.text || '').includes('Acumulado: *39* produtos')));
+});
+
 teste('regressão: /comissao não passa por bot_anular_comissao', async (ctx) => {
   respostas.bot_comissao = {
     status: 200,
@@ -649,27 +852,63 @@ teste('/dinheiro lista só o ciclo de dinheiro em mãos', async (ctx) => {
   assert.ok(resp.text.includes('Total em mãos no ciclo: R$ 130'), resp.text);
 });
 
-teste('/geral mostra comissão, despesas, dinheiro e o acerto do ciclo', async (ctx) => {
-  respostas.bot_comissao = {
-    status: 200,
-    body: {
-      ok: true, mes: '21/08 → 20/09', unidades_hoje: 4, unidades_mes: 120,
-      taxa_atual: 2.5, comissao: 300,
-    },
-  };
+// Resposta de sócio (com p_meta): traz `vendedores`. Rod 300 + despesas 143
+// = 443 a pagar; dinheiro 500 -> Rod repassa 57.
+const COMISSAO_SOCIO = {
+  ok: true, mes: '01/10 → 31/10', fecha_hoje: false, unidades_mes: 180, unidades_hoje: 4,
+  taxa_atual: 2.5, comissao: 450, faltam_para_proxima: 20, proxima_taxa: 3, sem_vendedor_unidades: 0,
+  vendedores: [
+    { nome: 'Rodrigo', unidades_mes: 120, comissao: 300 },
+    { nome: 'Gabriel', unidades_mes: 60, comissao: 150 },
+  ],
+};
+function despesasRod() {
   respostas.bot_despesas_rod = (body) => body.p_tipo === 'dinheiro'
-    ? { status: 200, body: { ok: true, total: 500, itens: [{}, {}], ciclo: '21/08 → 20/09' } }
-    : { status: 200, body: { ok: true, total: 143, itens: [{}, {}, {}], ciclo: '21/08 → 20/09' } };
+    ? { status: 200, body: { ok: true, total: 500, itens: [{ valor: 500, descricao: 'DINHEIRO', data: '05/10' }] } }
+    : { status: 200, body: { ok: true, total: 143, itens: [
+      { valor: 25, descricao: 'ENTREGA centro', data: '02/10' },
+      { valor: 100, descricao: 'ENTREGA', data: '03/10' },
+      { valor: 18, descricao: 'UBER', data: '04/10' },
+    ] } };
+}
+// Nenhuma mensagem do bot mostra salário fixo: ele vive só na tela Equipe.
+function semFixo(t) {
+  assert.ok(!/Fixo:|Fixo proporcional|3\.200/.test(t), `apareceu fixo: ${t}`);
+}
 
+teste('/geral de sócio: time, uma linha por vendedor e o acerto do Rod sem fixo', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: COMISSAO_SOCIO };
+  despesasRod();
+  const [resp] = await mandar(ctx.webhook, update('/geral', { nome: 'Lucas' }));
+  const [rpc] = chamadas.filter(c => c.fn === 'bot_comissao');
+  assert.strictEqual(rpc.body.p_meta.user_id, String(DONO));
+  const t = resp.text;
+  assert.ok(t.includes('Geral — 01/10 → 31/10'), t);
+  assert.ok(t.includes('Unidades: *180*'), t);
+  assert.ok(t.includes('Comissão do time: *R$ 450,00*'), t);
+  assert.ok(t.includes('• Rodrigo: 120 pods · R$ 300,00'), t);
+  assert.ok(t.includes('• Gabriel: 60 pods · R$ 150,00'), t);
+  assert.ok(t.includes('🛵 Entregas/despesas Rod: R$ 143,00'), t);
+  assert.ok(t.includes('A pagar ao Rod: R$ 443,00'), t);
+  assert.ok(t.includes('💵 Dinheiro em mãos (Rod): R$ 500,00'), t);
+  assert.ok(t.includes('Rod repassa R$ 57,00'), t);
+  assert.ok(t.includes('📌 Fixo e folha: ver no sistema, tela Equipe'), t);
+  semFixo(t);
+});
+
+teste('/geral de quem não é sócio: recusa e não mostra número nenhum', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: { ok: true, pessoal: true, vendedor: 'Gabriel', comissao: 150 } };
+  despesasRod();
+  const [resp] = await mandar(ctx.webhook, update('/geral', { from: FUNCIONARIO, nome: 'Gabriel' }));
+  assert.strictEqual(resp.text, 'Esse comando é só para os sócios.');
+});
+
+teste('/geral sem o Rodrigo na lista não inventa o acerto', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: { ...COMISSAO_SOCIO, vendedores: [{ nome: 'Gabriel', unidades_mes: 60, comissao: 150 }] } };
+  despesasRod();
   const [resp] = await mandar(ctx.webhook, update('/geral'));
-  assert.ok(resp.text.includes('Geral — 21/08 → 20/09'), resp.text);
-  assert.ok(resp.text.includes('Unidades: *120*'), resp.text);
-  assert.ok(resp.text.includes('R$ 300,00'), resp.text);
-  assert.ok(resp.text.includes('3 lançamento(s) → *R$ 143,00*'), resp.text);
-  assert.ok(resp.text.includes('2 lançamento(s) → *R$ 500,00*'), resp.text);
-  // 500 − (300 + 143) = 57
-  assert.ok(resp.text.includes('A pagar: comissão + fixo + despesas = *R$ 3.643,00*'), resp.text);
-  assert.ok(resp.text.includes('Loja paga R$ 3.143,00 ao Rod'), resp.text);
+  assert.ok(resp.text.includes('Não achei o Rodrigo'), resp.text);
+  assert.ok(!resp.text.includes('A pagar') && !resp.text.includes('Acerto'), resp.text);
 });
 
 teste('/geral com sinal invertido diz que a loja paga o Rod', async (ctx) => {
@@ -682,7 +921,7 @@ teste('/geral avisa qual fonte falhou em vez de inventar o acerto', async (ctx) 
   respostas.bot_comissao = { status: 500, body: { message: 'boom' } };
   respostas.bot_despesas_rod = { status: 200, body: { ok: true, total: 10, itens: [] } };
   const [resp] = await mandar(ctx.webhook, update('/geral'));
-  assert.ok(resp.text.includes('não consegui consultar'), resp.text);
+  assert.ok(resp.text.includes('Erro ao consultar comissão'), resp.text);
   assert.ok(!resp.text.includes('Rod repassa'), 'sem comissão não pode anunciar acerto');
 });
 
@@ -709,72 +948,47 @@ teste('palavra nova no bot_despesa_palavras funciona sem deploy', async (ctx) =>
   assert.ok(resp.text.includes('Anotado: R$ 15 ALMOÇO'), resp.text);
 });
 
-// --- Fechamento soma comissão + despesas -----------------------------------
+// --- Fechamento: só o time no grupo; detalhe e acerto só pra sócio --------
 
-teste('fechamento inclui despesas, dinheiro em mãos e o acerto', async (ctx) => {
-  const texto = ctx.mod.montarFechamento(
-    { mes: '21/07 → 20/08', unidades_mes: 120, taxa_atual: 2.5, comissao: 300 },
-    { ok: true, total: 143 },
-    { ok: true, total: 500 },
-  );
-  assert.ok(texto.includes('FECHAMENTO DO PERÍODO 21/07 → 20/08'), texto);
-  assert.ok(texto.includes('💰 Comissão: *R$ 300,00*'), texto);
-  assert.ok(texto.includes('🛵 Entregas/despesas Rod: R$ 143,00'), texto);
-  assert.ok(texto.includes('Total a pagar: R$ 3.643,00'), texto);
-  assert.ok(texto.includes('💵 Dinheiro em mãos (Rod): R$ 500,00'), texto);
-  assert.ok(texto.includes('Loja paga R$ 3.143,00 ao Rod'), texto);
+teste('fechamento de sócio: vendedores, despesas, dinheiro e acerto sem fixo', async (ctx) => {
+  const texto = ctx.mod.montarFechamentoSocio(COMISSAO_SOCIO, { ok: true, total: 143 }, { ok: true, total: 500 });
+  assert.ok(texto.includes('FECHAMENTO DO PERÍODO 01/10 → 31/10'), texto);
+  assert.ok(texto.includes('💰 Comissão do time: *R$ 450,00*'), texto);
+  assert.ok(texto.includes('• Rodrigo: 120 pods · R$ 300,00'), texto);
+  assert.ok(texto.includes('A pagar ao Rod: R$ 443,00'), texto);
+  assert.ok(texto.includes('Rod repassa R$ 57,00'), texto);
+  assert.ok(texto.includes('Fixo e folha: ver no sistema, tela Equipe'), texto);
+  semFixo(texto);
 });
 
 teste('fechamento avisa quando não conseguiu somar as despesas (não paga a menos calado)', async (ctx) => {
-  const texto = ctx.mod.montarFechamento(
-    { mes: '21/07 → 20/08', unidades_mes: 120, taxa_atual: 2.5, comissao: 300 },
-    null,
-    { ok: true, total: 500 },
-  );
+  const texto = ctx.mod.montarFechamentoSocio(COMISSAO_SOCIO, null, { ok: true, total: 500 });
   assert.ok(texto.includes('Não consegui somar as entregas'), texto);
-  assert.ok(!texto.includes('Total a pagar'), 'sem despesas confiáveis não pode anunciar total');
+  assert.ok(!texto.includes('A pagar'), 'sem despesas confiáveis não pode anunciar total');
   assert.ok(!texto.includes('Acerto'), 'sem o total a pagar não dá pra fechar o acerto');
 });
 
 teste('fechamento avisa quando não conseguiu somar o dinheiro em mãos', async (ctx) => {
-  const texto = ctx.mod.montarFechamento(
-    { mes: '21/07 → 20/08', unidades_mes: 120, taxa_atual: 2.5, comissao: 300 },
-    { ok: true, total: 143 },
-    null,
-  );
-  assert.ok(texto.includes('Total a pagar: R$ 3.643,00'), texto);
+  const texto = ctx.mod.montarFechamentoSocio(COMISSAO_SOCIO, { ok: true, total: 143 }, null);
+  assert.ok(texto.includes('A pagar ao Rod: R$ 443,00'), texto);
   assert.ok(texto.includes('Não consegui somar o dinheiro'), texto);
   assert.ok(!texto.includes('Acerto'), texto);
 });
 
-teste('o fechamento do relatório diário puxa despesas E dinheiro do ciclo', async (ctx) => {
-  respostas.bot_comissao = {
-    status: 200,
-    body: {
-      ok: true, mes: '21/07 → 20/08', fecha_hoje: true, unidades_mes: 120,
-      unidades_hoje: 4, taxa_atual: 2.5, comissao: 300,
-    },
-  };
-  respostas.bot_despesas_rod = (body) => body.p_tipo === 'dinheiro'
-    ? { status: 200, body: { ok: true, total: 500, itens: [] } }
-    : { status: 200, body: { ok: true, total: 143, itens: [] } };
-
-  const texto = await ctx.mod.textoComissaoRelatorio();
-  assert.ok(texto.includes('Total a pagar: R$ 3.643,00'), texto);
-  assert.ok(texto.includes('Dinheiro em mãos (Rod): R$ 500,00'), texto);
-  assert.ok(texto.includes('Loja paga R$ 3.143,00 ao Rod'), texto);
-});
-
-// Ciclo de transição (21/09 → 30/09) e mês cheio: o fechamento segue o
-// fecha_hoje da RPC, sem dia fixo no bot.
-teste('fechamento do ciclo de transição sai quando fecha_hoje = true (30/09)', async (ctx) => {
+teste('fechamento automático: só o resumo do time, sem vendedor, despesas nem fixo', async (ctx) => {
   respostas.bot_comissao = { status: 200, body: {
     ok: true, mes: '21/09 → 30/09', fecha_hoje: true, unidades_mes: 80, unidades_hoje: 3, taxa_atual: 2, comissao: 160,
   } };
-  respostas.bot_despesas_rod = { status: 200, body: { ok: true, total: 0, itens: [] } };
-  const texto = await ctx.mod.textoComissaoRelatorio();
+  despesasRod();
+  const texto = await ctx.mod.textoComissaoRelatorio('2026-09-30');
   assert.ok(texto.startsWith('🔒 *FECHAMENTO DO PERÍODO 21/09 → 30/09*'), texto);
-  assert.ok(texto.includes('Comissão: *R$ 160,00*'), texto);
+  assert.ok(texto.includes('Total: *80* produtos'), texto);
+  assert.ok(texto.includes('Faixa final: R$ 2,00/produto'), texto);
+  assert.ok(texto.includes('Comissão do time: *R$ 160,00*'), texto);
+  assert.ok(!/Rod|Acerto|Dinheiro|despesas|•/.test(texto), texto);
+  semFixo(texto);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesas_rod').length, 0);
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_comissao').body.p_meta, undefined);
 });
 
 teste('dia 20 de outubro sem fecha_hoje não fecha nada', async (ctx) => {
@@ -787,143 +1001,89 @@ teste('dia 20 de outubro sem fecha_hoje não fecha nada', async (ctx) => {
   assert.ok(texto.startsWith('📊 *Comissão — 01/10 → 31/10*'), texto);
 });
 
-// --- Fixo mensal (R$ 3.200; proporcional fora do mês cheio) --------------
-
-teste('fixo: transição 21/09 → 30/09 paga 10 dias; mês cheio paga inteiro', async (ctx) => {
-  assert.deepStrictEqual(ctx.mod.fixoDoCiclo('21/09 → 30/09', '2026-09-30'), { valor: 1066.67, dias: 10, cheio: false });
-  assert.deepStrictEqual(ctx.mod.fixoDoCiclo('01/10 → 31/10', '2026-10-05'), { valor: 3200, dias: 31, cheio: true });
-  assert.deepStrictEqual(ctx.mod.fixoDoCiclo('01/11 → 30/11', '2026-11-05'), { valor: 3200, dias: 30, cheio: true });
-  assert.deepStrictEqual(ctx.mod.fixoDoCiclo('01/02 → 28/02', '2027-02-10'), { valor: 3200, dias: 28, cheio: true });
-  // Ciclo antigo 21 → 20 (31 dias) não passa do fixo inteiro.
-  assert.strictEqual(ctx.mod.fixoDoCiclo('21/07 → 20/08', '2026-08-20').valor, 3200);
-  assert.strictEqual(ctx.mod.fixoDoCiclo('sem período'), null);
-  assert.strictEqual(ctx.mod.FIXO_MENSAL, 3200);
-  // Datas separadas no retorno valem mais que o rótulo.
-  assert.deepStrictEqual(ctx.mod.fixoDoCiclo({ mes: 'Setembro (transição)', ciclo_inicio: '2026-09-21', ciclo_fim: '2026-09-30' }),
-    { valor: 1066.67, dias: 10, cheio: false });
-  assert.deepStrictEqual(ctx.mod.fixoDoCiclo({ mes: '01/10/2026 a 31/10/2026' }), { valor: 3200, dias: 31, cheio: true });
-});
-
-const COMISSAO_TRANSICAO = {
-  status: 200,
-  body: { ok: true, mes: '21/09 → 30/09', fecha_hoje: true, unidades_mes: 80, unidades_hoje: 3, taxa_atual: 2, comissao: 160 },
-};
-function despesasTransicao() {
-  respostas.bot_despesas_rod = (body) => body.p_tipo === 'dinheiro'
-    ? { status: 200, body: { ok: true, total: 500, itens: [{ valor: 500, descricao: 'DINHEIRO', data: '25/09' }] } }
-    : { status: 200, body: { ok: true, total: 100, itens: [
-      { valor: 25, descricao: 'ENTREGA centro', data: '22/09' },
-      { valor: 50, descricao: 'ENTREGA', data: '23/09' },
-      { valor: 25, descricao: 'UBER', data: '24/09' },
-    ] } };
-}
-
-teste('fechamento de 30/09 soma o fixo proporcional no total e no acerto', async (ctx) => {
-  respostas.bot_comissao = COMISSAO_TRANSICAO;
-  despesasTransicao();
-  const texto = await ctx.mod.textoComissaoRelatorio();
-  assert.ok(texto.includes('📌 Fixo proporcional (10 dias): R$ 1.066,67'), texto);
-  // 160 + 1066,67 + 100 = 1326,67; dinheiro 500 -> loja paga 826,67.
-  assert.ok(texto.includes('Total a pagar: R$ 1.326,67'), texto);
-  assert.ok(texto.includes('Loja paga R$ 826,67 ao Rod'), texto);
-});
-
-teste('fechamento de outubro soma o fixo cheio', async (ctx) => {
-  const texto = ctx.mod.montarFechamento(
-    { mes: '01/10 → 31/10', unidades_mes: 100, taxa_atual: 2, comissao: 200 },
-    { ok: true, total: 0 }, { ok: true, total: 0 }, { ref: '2026-10-31' },
-  );
-  assert.ok(texto.includes('📌 Fixo: R$ 3.200,00'), texto);
-  assert.ok(texto.includes('Total a pagar: R$ 3.400,00'), texto);
-});
-
-teste('período ilegível: avisa e não soma um total sem o fixo', async (ctx) => {
-  const texto = ctx.mod.montarFechamento(
-    { mes: '???', unidades_mes: 100, taxa_atual: 2, comissao: 200 }, { ok: true, total: 10 }, { ok: true, total: 0 });
-  assert.ok(texto.includes('calcular o fixo'), texto);
-  assert.ok(!texto.includes('Total a pagar'), texto);
-  assert.ok(!texto.includes('Acerto'), texto);
-});
-
-teste('/geral inclui o fixo proporcional no acerto', async (ctx) => {
-  respostas.bot_comissao = COMISSAO_TRANSICAO;
-  despesasTransicao();
-  const [resp] = await mandar(ctx.webhook, update('/geral'));
-  assert.ok(resp.text.includes('📌 Fixo proporcional (10 dias): R$ 1.066,67'), resp.text);
-  assert.ok(resp.text.includes('= *R$ 1.326,67*'), resp.text);
-  assert.ok(resp.text.includes('Loja paga R$ 826,67 ao Rod'), resp.text);
-});
-
-teste('/refazerfechamento 30/09 usa o fixo proporcional', async (ctx) => {
-  respostas.bot_comissao = COMISSAO_TRANSICAO;
-  despesasTransicao();
-  const resp = await mandar(ctx.webhook, update('/refazerfechamento 30/09/2026', { chat: DONO, tipo: 'private' }));
-  await new Promise(r => setTimeout(r, 100));
-  const pub = enviadas.find(m => String(m.chat_id) === String(GRUPO_VENDAS));
-  assert.ok(pub && pub.text.includes('Fixo proporcional (10 dias): R$ 1.066,67'), JSON.stringify(resp));
-  assert.ok(pub.text.includes('Total a pagar: R$ 1.326,67'), pub.text);
-});
-
-teste('/fechamento mostra a PARCIAL com fixo, despesas por tipo e total', async (ctx) => {
-  respostas.bot_comissao = { status: 200, body: { ...COMISSAO_TRANSICAO.body, fecha_hoje: false } };
-  despesasTransicao();
+teste('/fechamento de sócio: PARCIAL com vendedores, despesas por tipo e acerto sem fixo', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: COMISSAO_SOCIO };
+  despesasRod();
   const [resp] = await mandar(ctx.webhook, update('/fechamento'));
   const t = resp.text;
-  assert.ok(t.startsWith('⏳ *FECHAMENTO PARCIAL — 21/09 → 30/09*'), t);
-  assert.ok(/📅 Dia \d+ de 10 do ciclo/.test(t), t);
-  assert.ok(t.includes('Pods até agora: *80*'), t);
-  assert.ok(t.includes('Faixa atual: R$ 2,00/produto'), t);
-  assert.ok(t.includes('📌 Fixo proporcional (10 dias): R$ 1.066,67'), t);
-  assert.ok(t.includes('🛵 Despesas extras: R$ 100,00'), t);
-  assert.ok(t.includes('• ENTREGA: R$ 75,00'), t);
-  assert.ok(t.includes('• UBER: R$ 25,00'), t);
-  assert.ok(t.includes('Total a pagar até agora: R$ 1.326,67'), t);
-  assert.ok(t.includes('💵 Dinheiro com o Rod: R$ 500,00'), t);
-  assert.ok(t.includes('Loja paga R$ 826,67 ao Rod'), t);
+  const [rpc] = chamadas.filter(c => c.fn === 'bot_comissao');
+  assert.strictEqual(rpc.body.p_meta.user_id, String(DONO));
+  assert.ok(t.startsWith('⏳ *FECHAMENTO PARCIAL — 01/10 → 31/10*'), t);
+  assert.ok(/📅 Dia \d+ de 31 do ciclo/.test(t), t);
+  assert.ok(t.includes('Pods até agora: *180*'), t);
+  assert.ok(t.includes('Faixa atual: R$ 2,50/produto'), t);
+  assert.ok(t.includes('• Gabriel: 60 pods · R$ 150,00'), t);
+  assert.ok(t.includes('🛵 Entregas/despesas Rod: R$ 143,00'), t);
+  assert.ok(t.includes('• ENTREGA: R$ 125,00'), t);
+  assert.ok(t.includes('• UBER: R$ 18,00'), t);
+  assert.ok(t.includes('A pagar ao Rod até agora: R$ 443,00'), t);
+  assert.ok(t.includes('Rod repassa R$ 57,00'), t);
+  assert.ok(t.includes('Fixo e folha: ver no sistema, tela Equipe'), t);
+  semFixo(t);
   assert.ok(!t.includes('🔒'), 'parcial não pode parecer fechamento');
 });
 
+teste('/fechamento de quem não é sócio é recusado', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: { ok: true, restrito: true, aviso: 'x' } };
+  const [resp] = await mandar(ctx.webhook, update('/fechamento', { from: FUNCIONARIO }));
+  assert.strictEqual(resp.text, 'Esse comando é só para os sócios.');
+});
+
 teste('/fechamento é ignorado fora dos grupos atendidos (como o /geral)', async (ctx) => {
-  respostas.bot_comissao = COMISSAO_TRANSICAO;
+  respostas.bot_comissao = { status: 200, body: COMISSAO_SOCIO };
   await mandar(ctx.webhook, update('/fechamento', { chat: -999999 }), { esperaResposta: false });
   assert.strictEqual(enviadas.length, 0);
 });
 
 // --- /refazerfechamento (correção do corte 19 → 20) ------------------------
 
-teste('/refazerfechamento publica a correção no grupo de vendas', async (ctx) => {
-  respostas.bot_comissao = {
-    status: 200,
-    body: {
-      ok: true, mes: '20/07 → 20/08', fecha_hoje: true, unidades_mes: 130,
-      unidades_hoje: 6, taxa_atual: 2.5, comissao: 325,
-    },
-  };
-  respostas.bot_despesas_rod = { status: 200, body: { ok: true, total: 0, itens: [] } };
+teste('/refazerfechamento: grupo recebe só o time; o sócio recebe o detalhe', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: { ...COMISSAO_SOCIO, mes: '20/07 → 20/08', fecha_hoje: true } };
+  despesasRod();
 
-  // Mandado no privado do dono: a correção tem que sair no GRUPO, não só no DM.
   await mandar(ctx.webhook, update('/refazerfechamento 20/08/2026', { chat: DONO, tipo: 'private' }));
   await new Promise(r => setTimeout(r, 200));
 
   const rpc = chamadas.filter(c => c.fn === 'bot_comissao');
   assert.strictEqual(rpc.length, 1);
   assert.strictEqual(rpc[0].body.p_mes, '2026-08-20', 'data de corte errada');
+  assert.strictEqual(rpc[0].body.p_meta.user_id, String(DONO));
+  // p_ref é timestamptz: meio-dia de SP, pra não cair no dia anterior em UTC.
+  for (const c of chamadas.filter(x => x.fn === 'bot_despesas_rod')) {
+    assert.strictEqual(c.body.p_ref, '2026-08-20T12:00:00-03:00');
+  }
 
   const noGrupo = enviadas.find(e => String(e.chat_id) === String(GRUPO_VENDAS));
   assert.ok(noGrupo, `nada foi pro grupo: ${JSON.stringify(enviadas)}`);
   assert.ok(noGrupo.text.includes('FECHAMENTO CORRIGIDO — 20/07 → 20/08'), noGrupo.text);
   assert.ok(noGrupo.text.includes('Novo corte: fim do dia 20/08 (2h59 da madrugada seguinte)'), noGrupo.text);
   assert.ok(noGrupo.text.includes('Substitui o fechamento anterior'), noGrupo.text);
-  assert.ok(noGrupo.text.includes('*130* produtos'), noGrupo.text);
+  assert.ok(noGrupo.text.includes('*180* produtos'), noGrupo.text);
+  assert.ok(!/Rodrigo|Gabriel|Acerto|A pagar/.test(noGrupo.text), noGrupo.text);
+  semFixo(noGrupo.text);
 
   const noPrivado = enviadas.find(e => String(e.chat_id) === String(DONO));
   assert.ok(noPrivado && noPrivado.text.includes('publicada no grupo'), 'faltou confirmar pro dono');
+  assert.ok(noPrivado.text.includes('• Rodrigo: 120 pods · R$ 300,00'), noPrivado.text);
+  assert.ok(noPrivado.text.includes('Rod repassa R$ 57,00'), noPrivado.text);
+  semFixo(noPrivado.text);
 });
 
-teste('/refazerfechamento é recusado pro funcionário e não recalcula nada', async (ctx) => {
+teste('/refazerfechamento mandado no próprio grupo de vendas não expõe o detalhe', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: { ...COMISSAO_SOCIO, fecha_hoje: true } };
+  despesasRod();
+  await mandar(ctx.webhook, update('/refazerfechamento 31/10/2026'));
+  await new Promise(r => setTimeout(r, 100));
+  assert.strictEqual(enviadas.length, 1, JSON.stringify(enviadas));
+  assert.ok(!/Rodrigo|Gabriel|Acerto/.test(enviadas[0].text), enviadas[0].text);
+});
+
+teste('/refazerfechamento de quem não é sócio é recusado e nada vai pro grupo', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: { ok: true, pessoal: true, vendedor: 'Rodrigo' } };
   const [resp] = await mandar(ctx.webhook, update('/refazerfechamento 20/08', { from: FUNCIONARIO }));
-  assert.ok(resp.text.includes('Só o dono'), resp.text);
-  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comissao').length, 0);
+  assert.strictEqual(resp.text, 'Esse comando é só para os sócios.');
+  await new Promise(r => setTimeout(r, 100));
+  assert.strictEqual(enviadas.length, 1);
 });
 
 teste('/refazerfechamento sem data (ou com data inválida) mostra o uso', async (ctx) => {
@@ -951,7 +1111,7 @@ teste('/adicionar 3 pelo dono chama a RPC com autor e mostra o extrato', async (
   assert.strictEqual(rpc.length, 1, 'deveria chamar bot_adicionar_comissao uma vez');
   assert.strictEqual(rpc[0].body.p_unidades, 3);
   assert.strictEqual(rpc[0].body.p_token, 'token-de-teste');
-  assert.deepStrictEqual(rpc[0].body.p_meta, { user_id: String(DONO), nome: 'Lucas' });
+  assert.deepStrictEqual(rpc[0].body.p_meta, { user_id: String(DONO), nome: 'Lucas', username: null });
 
   assert.ok(resp.text.includes('➕ 3 unidade(s) adicionada(s) à comissão. (por Lucas)'), resp.text);
   assert.ok(resp.text.includes('Acumulado: *42* produtos'), resp.text);
@@ -2192,13 +2352,10 @@ teste('ciclo sem atacado mantém o extrato de sempre', async (ctx) => {
 });
 
 teste('fechamento mostra a quebra de atacado', async (ctx) => {
-  const texto = ctx.mod.montarFechamento(
-    COMISSAO_ATACADO, { ok: true, total: 143 }, { ok: true, total: 500 },
-  );
+  const texto = ctx.mod.montarFechamentoTime(COMISSAO_ATACADO);
   assert.ok(texto.includes('Unidades: *812* (780 varejo + 32 atacado)'), texto);
   assert.ok(texto.includes('Atacado: 32 × R$ 2,00 = R$ 64,00'), texto);
-  assert.ok(texto.includes('💰 Comissão: *R$ 2.131,00*'), texto);
-  assert.ok(texto.includes('Total a pagar: R$ 5.474,00'), texto);
+  assert.ok(texto.includes('💰 Comissão do time: *R$ 2.131,00*'), texto);
 });
 
 // --- Comprovantes de pagamento --------------------------------------------
@@ -2684,14 +2841,10 @@ teste('fechamento diário roda às 3h e pede os números do dia que acabou', asy
 
   assert.strictEqual(chamadas.find(c => c.fn === 'bot_comissao').body.p_mes, '2026-10-31');
   assert.strictEqual(chamadas.find(c => c.fn === 'bot_caixa_dia').body.p_data, '2026-10-31');
-  // p_ref é timestamptz: meio-dia de SP, pra não cair no dia anterior em UTC.
-  for (const c of chamadas.filter(x => x.fn === 'bot_despesas_rod')) {
-    assert.strictEqual(c.body.p_ref, '2026-10-31T12:00:00-03:00');
-  }
   const msg = enviadas.find(e => String(e.chat_id) === String(GRUPO_VENDAS));
   assert.ok(msg.text.includes('31/10/2026'), msg.text);
   assert.ok(msg.text.includes('🔒 *FECHAMENTO DO PERÍODO 01/10 → 31/10*'), msg.text);
-  assert.ok(msg.text.includes('📌 Fixo: R$ 3.200,00'), msg.text);
+  assert.ok(!/Fixo|3\.200/.test(msg.text), msg.text);
   assert.ok(msg.text.includes('o novo período já começou'), msg.text);
 });
 
