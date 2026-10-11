@@ -112,6 +112,12 @@ teste('sem TAREFAS_BOT_TOKEN o bot não liga (e não registra rota)', async () =
   assert.strictEqual(ligar(app, { TAREFAS_BOT_TOKEN: 'x:y' }, { agendar: false }), null, 'sem as outras variáveis também não');
 });
 
+teste('sem TAREFAS_GRUPOS o bot liga, mas só o /idgrupo responde', async () => {
+  const app = express();
+  const bot = ligar(app, { TAREFAS_BOT_TOKEN: '1:x', TAREFAS_SYNC_TOKEN: 's', SUPABASE_URL: 'http://127.0.0.1:9', SUPABASE_ANON_KEY: 'a' }, { agendar: false });
+  assert.ok(bot, 'devia ligar');
+});
+
 teste('webhook sem o segredo certo é recusado e nada é processado', async (ctx) => {
   const env = await mandar(ctx, msgDe('/tarefa invasão'), { segredo: 'errado', espera: false });
   assert.strictEqual(ctx.ultimoStatus, 401);

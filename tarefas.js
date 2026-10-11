@@ -12,6 +12,7 @@
 //   TAREFAS_BOT_TOKEN   token do BotFather (sem ela, desligado)
 //   TAREFAS_SYNC_TOKEN  segredo gerado pelo db/tarefas.sql
 //   TAREFAS_GRUPOS      ids dos grupos autorizados, separados por vírgula
+//                       (vazia = só o /idgrupo responde)
 //   SUPABASE_URL / SUPABASE_ANON_KEY  as mesmas das lojas
 
 const crypto = require('crypto');
@@ -485,13 +486,15 @@ function ligar(app, env = process.env, { agendar = true, agora } = {}) {
   try {
     const token = env.TAREFAS_BOT_TOKEN;
     if (!token) { console.log('bot de tarefas: TAREFAS_BOT_TOKEN não definida — desligado.'); return null; }
-    const faltam = ['TAREFAS_SYNC_TOKEN', 'TAREFAS_GRUPOS', 'SUPABASE_URL', 'SUPABASE_ANON_KEY'].filter(k => !env[k]);
+    // TAREFAS_GRUPOS pode ficar vazia no começo: aí só o /idgrupo responde,
+    // que é justamente como se descobre o id pra preencher ela.
+    const faltam = ['TAREFAS_SYNC_TOKEN', 'SUPABASE_URL', 'SUPABASE_ANON_KEY'].filter(k => !env[k]);
     if (faltam.length) { console.error(`bot de tarefas: faltam ${faltam.join(', ')} — desligado.`); return null; }
 
     const bot = criarBotTarefas({
       token,
       syncToken: env.TAREFAS_SYNC_TOKEN,
-      grupos: String(env.TAREFAS_GRUPOS).split(','),
+      grupos: String(env.TAREFAS_GRUPOS || '').split(','),
       supabaseUrl: env.SUPABASE_URL,
       anonKey: env.SUPABASE_ANON_KEY,
       telegramApi: env.TAREFAS_TELEGRAM_API_BASE || 'https://api.telegram.org',
@@ -519,7 +522,7 @@ function ligar(app, env = process.env, { agendar = true, agora } = {}) {
         console.log('bot de tarefas: sem RENDER_EXTERNAL_URL — registre o webhook à mão.');
       }
     }
-    console.log('bot de tarefas: ligado.');
+    console.log(`bot de tarefas: ligado (${env.TAREFAS_GRUPOS ? 'grupos ' + env.TAREFAS_GRUPOS : 'nenhum grupo autorizado ainda — só /idgrupo'}).`);
     return bot;
   } catch (err) {
     console.error('bot de tarefas: não ligou:', err);
