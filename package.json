@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node test.js"
+    "test": "node test.js && node tarefas.test.js"
   },
   "keywords": [],
   "author": "",
@@ -15,5 +15,8 @@
     "express": "^5.2.1",
     "node-cron": "^4.4.1",
     "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.2.17"
   }
 }

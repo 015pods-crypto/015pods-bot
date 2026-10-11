@@ -4844,6 +4844,9 @@ if (require.main === module) {
     console.error('ERRO: env var TELEGRAM_TOKEN não definida (Render > Environment). O bot não sobe sem ela.');
     process.exit(1);
   }
+  // Bot de TAREFAS (outro projeto, tarefas.js): só liga com TAREFAS_BOT_TOKEN.
+  // Qualquer falha dele fica nele — o bot das lojas sobe do mesmo jeito.
+  try { require('./tarefas').ligar(app); } catch (err) { console.error('bot de tarefas não ligou:', err); }
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`Bot rodando na porta ${PORT}`));
 }
