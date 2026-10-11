@@ -136,6 +136,13 @@ function update(text, { from = DONO, chat = GRUPO_VENDAS, tipo = 'group', nome }
   };
 }
 
+// Update no grupo de FATURAMENTO, já configurado — é onde valem /caixa,
+// /geral e /fechamento.
+function updateFat(text, opts = {}) {
+  configComFaturamento();
+  return update(text, { chat: GRUPO_FATURAMENTO, ...opts });
+}
+
 // Mensagem com foto (o Telegram manda várias resoluções; o bot pega a maior)
 // ou com documento.
 function updateArquivo({ chat = GRUPO_VENDAS, from = DONO, caption, doc, size = 1024 } = {}) {
@@ -879,7 +886,7 @@ function semFixo(t) {
 teste('/geral de sócio: time, uma linha por vendedor e o acerto do Rod sem fixo', async (ctx) => {
   respostas.bot_comissao = { status: 200, body: COMISSAO_SOCIO };
   despesasRod();
-  const [resp] = await mandar(ctx.webhook, update('/geral', { nome: 'Lucas' }));
+  const [resp] = await mandar(ctx.webhook, updateFat('/geral', { nome: 'Lucas' }));
   const [rpc] = chamadas.filter(c => c.fn === 'bot_comissao');
   assert.strictEqual(rpc.body.p_meta.user_id, String(DONO));
   const t = resp.text;
@@ -899,14 +906,14 @@ teste('/geral de sócio: time, uma linha por vendedor e o acerto do Rod sem fixo
 teste('/geral de quem não é sócio: recusa e não mostra número nenhum', async (ctx) => {
   respostas.bot_comissao = { status: 200, body: { ok: true, pessoal: true, vendedor: 'Gabriel', comissao: 150 } };
   despesasRod();
-  const [resp] = await mandar(ctx.webhook, update('/geral', { from: FUNCIONARIO, nome: 'Gabriel' }));
+  const [resp] = await mandar(ctx.webhook, updateFat('/geral', { from: FUNCIONARIO, nome: 'Gabriel' }));
   assert.strictEqual(resp.text, 'Esse comando é só para os sócios.');
 });
 
 teste('/geral sem o Rodrigo na lista não inventa o acerto', async (ctx) => {
   respostas.bot_comissao = { status: 200, body: { ...COMISSAO_SOCIO, vendedores: [{ nome: 'Gabriel', unidades_mes: 60, comissao: 150 }] } };
   despesasRod();
-  const [resp] = await mandar(ctx.webhook, update('/geral'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/geral'));
   assert.ok(resp.text.includes('Não achei o Rodrigo'), resp.text);
   assert.ok(!resp.text.includes('A pagar') && !resp.text.includes('Acerto'), resp.text);
 });
@@ -920,7 +927,7 @@ teste('/geral com sinal invertido diz que a loja paga o Rod', async (ctx) => {
 teste('/geral avisa qual fonte falhou em vez de inventar o acerto', async (ctx) => {
   respostas.bot_comissao = { status: 500, body: { message: 'boom' } };
   respostas.bot_despesas_rod = { status: 200, body: { ok: true, total: 10, itens: [] } };
-  const [resp] = await mandar(ctx.webhook, update('/geral'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/geral'));
   assert.ok(resp.text.includes('Erro ao consultar comissão'), resp.text);
   assert.ok(!resp.text.includes('Rod repassa'), 'sem comissão não pode anunciar acerto');
 });
@@ -1004,7 +1011,7 @@ teste('dia 20 de outubro sem fecha_hoje não fecha nada', async (ctx) => {
 teste('/fechamento de sócio: PARCIAL com vendedores, despesas por tipo e acerto sem fixo', async (ctx) => {
   respostas.bot_comissao = { status: 200, body: COMISSAO_SOCIO };
   despesasRod();
-  const [resp] = await mandar(ctx.webhook, update('/fechamento'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/fechamento'));
   const t = resp.text;
   const [rpc] = chamadas.filter(c => c.fn === 'bot_comissao');
   assert.strictEqual(rpc.body.p_meta.user_id, String(DONO));
@@ -1025,7 +1032,7 @@ teste('/fechamento de sócio: PARCIAL com vendedores, despesas por tipo e acerto
 
 teste('/fechamento de quem não é sócio é recusado', async (ctx) => {
   respostas.bot_comissao = { status: 200, body: { ok: true, restrito: true, aviso: 'x' } };
-  const [resp] = await mandar(ctx.webhook, update('/fechamento', { from: FUNCIONARIO }));
+  const [resp] = await mandar(ctx.webhook, updateFat('/fechamento', { from: FUNCIONARIO }));
   assert.strictEqual(resp.text, 'Esse comando é só para os sócios.');
 });
 
@@ -2359,13 +2366,32 @@ teste('fechamento mostra a quebra de atacado', async (ctx) => {
 });
 
 // --- Comprovantes de pagamento --------------------------------------------
+// Chegam no grupo de VENDAS, mas valor nenhum aparece lá: a leitura e o
+// faturamento do dia vão pro grupo de faturamento. Em vendas, só dois avisos
+// (repetido / não consegui ler) — e o de falha ao registrar.
 
 const REGISTRO_OK = {
   status: 200,
   body: { ok: true, duplicado: false, total_dia: 450, qtd_dia: 3 },
 };
+const AVISO_DUPLICADO = '⚠️ Esse comprovante já foi registrado antes. Não dei baixa de novo.';
+const AVISO_ILEGIVEL = '⚠️ Não consegui ler esse comprovante. Manda de novo, com a foto mais nítida.';
 
-teste('foto de comprovante é lida, registrada e somada no caixa do dia', async (ctx) => {
+const noChat = (id) => enviadas.filter(e => String(e.chat_id) === String(id));
+const noFaturamento = () => noChat(GRUPO_FATURAMENTO);
+const emVendas = () => noChat(GRUPO_VENDAS);
+// Nenhuma mensagem do grupo de vendas pode ter valor em dinheiro.
+function vendasSemValor() {
+  for (const m of emVendas()) assert.ok(!/R\$|total do dia|Faturamento de hoje/i.test(m.text), `valor vazou em vendas: ${m.text}`);
+}
+function updateArquivoDe(opts, from) {
+  const u = updateArquivo(opts);
+  u.message.from = from;
+  return u;
+}
+
+teste('foto de comprovante: lida e registrada; leitura e total do dia só no faturamento', async (ctx) => {
+  configComFaturamento();
   respostaGemini = {
     status: 200,
     body: geminiJson({
@@ -2375,7 +2401,7 @@ teste('foto de comprovante é lida, registrada e somada no caixa do dia', async 
   };
   respostas.bot_comprovante_registrar = REGISTRO_OK;
 
-  const [resp] = await mandar(ctx.webhook, updateArquivo());
+  const [resp] = await mandar(ctx.webhook, updateArquivoDe({}, GABRIEL));
 
   // Leu a foto MAIOR (a pequena borra o valor).
   assert.strictEqual(chamadasGemini.length, 1, 'deveria chamar o Gemini uma vez');
@@ -2393,41 +2419,69 @@ teste('foto de comprovante é lida, registrada e somada no caixa do dia', async 
   assert.strictEqual(rpc[0].body.p_arquivo_id, 'foto-grande');
   assert.strictEqual(rpc[0].body.p_bruto.codigo, 'E12345ABC', 'p_bruto tem que levar o JSON inteiro');
 
-  assert.strictEqual(resp.text,
-    '💰 Comprovante lido: *R$ 150,00* · total do dia: R$ 450,00 (3 comprovantes)');
+  assert.strictEqual(String(resp.chat_id), String(GRUPO_FATURAMENTO));
+  assert.strictEqual(emVendas().length, 0, 'nada no grupo de vendas');
+  assert.ok(resp.text.includes('💰 *Comprovante* · Gabriel Souza'), resp.text);
+  assert.ok(resp.text.includes('Valor: *R$ 150,00*'), resp.text);
+  assert.ok(resp.text.includes('Banco: Nubank · Pagador: Fulano'), resp.text);
+  assert.ok(resp.text.includes('📊 Faturamento de hoje: *R$ 450,00* (3 comprovantes)'), resp.text);
 });
 
-teste('comprovante reenviado (mesmo código) vira alerta de duplicado', async (ctx) => {
+teste('dois comprovantes seguidos: faturamento do dia sobe a cada um', async (ctx) => {
+  configComFaturamento();
+  respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 150, qtd_dia: 1 } };
+  const [um] = await mandar(ctx.webhook, updateArquivoDe({}, GABRIEL));
+  respostaGemini = { status: 200, body: geminiJson({ valor: 89.9, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 239.9, qtd_dia: 2 } };
+  const [dois] = await mandar(ctx.webhook, updateArquivoDe({}, GABRIEL));
+  assert.ok(um.text.includes('Faturamento de hoje: *R$ 150,00* (1 comprovantes)'), um.text);
+  assert.ok(dois.text.includes('Valor: *R$ 89,90*'), dois.text);
+  assert.ok(dois.text.includes('Faturamento de hoje: *R$ 239,90* (2 comprovantes)'), dois.text);
+  assert.strictEqual(noFaturamento().length, 2);
+  assert.strictEqual(emVendas().length, 0);
+});
+
+teste('comprovante reenviado (mesmo código): só o aviso em vendas, nada no faturamento', async (ctx) => {
+  configComFaturamento();
   respostaGemini = { status: 200, body: geminiJson({ valor: 150, codigo: 'E12345ABC', confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = {
     status: 200,
     body: { ok: true, duplicado: true, motivo: 'codigo', valor: 150, quando: '14/09 16:31' },
   };
   const [resp] = await mandar(ctx.webhook, updateArquivo());
-  assert.ok(resp.text.includes('COMPROVANTE JÁ ENVIADO'), resp.text);
-  assert.ok(resp.text.includes('14/09 16:31'), resp.text);
-  assert.ok(resp.text.includes('R$ 150,00'), resp.text);
-  assert.ok(resp.text.includes('antes de liberar o pedido'), resp.text);
+  await new Promise(r => setTimeout(r, 100));
+  assert.strictEqual(resp.text, AVISO_DUPLICADO);
+  assert.strictEqual(String(resp.chat_id), String(GRUPO_VENDAS));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0, 'não pode baixar nada');
+  assert.strictEqual(enviadas.length, 1);
 });
 
-teste('mesmo valor repetido vira aviso mais leve', async (ctx) => {
+teste('mesmo valor repetido: registra, vendas fica quieto, faturamento avisa', async (ctx) => {
+  configComFaturamento();
   respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = {
     status: 200,
     body: { ok: true, duplicado: true, motivo: 'valor_repetido', valor: 150, quando: '16:20' },
   };
+  respostas.bot_caixa_dia = { status: 200, body: { ok: true, comprovantes_total: 300, comprovantes_qtd: 2 } };
   const [resp] = await mandar(ctx.webhook, updateArquivo());
-  assert.ok(resp.text.includes('Já entrou um comprovante de R$ 150,00'), resp.text);
-  assert.ok(resp.text.includes('Se for outro pagamento, tudo bem'), resp.text);
-  assert.ok(!resp.text.includes('JÁ ENVIADO'), resp.text);
+  assert.strictEqual(String(resp.chat_id), String(GRUPO_FATURAMENTO));
+  assert.ok(resp.text.includes('Já entrou um comprovante de mesmo valor há pouco (16:20)'), resp.text);
+  // A RPC não mandou o total: o bot pergunta ao caixa do dia.
+  assert.ok(resp.text.includes('Faturamento de hoje: *R$ 300,00* (2 comprovantes)'), resp.text);
+  assert.strictEqual(emVendas().length, 0);
 });
 
-teste('confiança baixa NÃO registra e pede o valor', async (ctx) => {
+teste('confiança baixa NÃO registra e pede pra reenviar, sem valor', async (ctx) => {
+  configComFaturamento();
   respostaGemini = { status: 200, body: geminiJson({ valor: null, confianca: 'baixa' }) };
   const [resp] = await mandar(ctx.webhook, updateArquivo());
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0,
     'sem confiança não pode registrar');
-  assert.ok(resp.text.includes('Não consegui ler o valor'), resp.text);
+  assert.strictEqual(resp.text, AVISO_ILEGIVEL);
+  await new Promise(r => setTimeout(r, 100));
+  assert.strictEqual(noFaturamento().length, 0, 'foto ilegível não mexe no faturamento');
 });
 
 // Valor com confiança baixa é o modelo dizendo que chutou.
@@ -2435,10 +2489,11 @@ teste('valor lido com confiança baixa também é recusado', async (ctx) => {
   respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'baixa' }) };
   const [resp] = await mandar(ctx.webhook, updateArquivo());
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
-  assert.ok(resp.text.includes('Não consegui ler o valor'), resp.text);
+  assert.strictEqual(resp.text, AVISO_ILEGIVEL);
 });
 
 teste('confiança média é aceita', async (ctx) => {
+  configComFaturamento();
   respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'media' }) };
   respostas.bot_comprovante_registrar = REGISTRO_OK;
   await mandar(ctx.webhook, updateArquivo());
@@ -2446,28 +2501,32 @@ teste('confiança média é aceita', async (ctx) => {
 });
 
 // Foto que não é comprovante: o modelo não acha valor, e o bot só não registra.
-teste('imagem que não é comprovante não registra nada', async (ctx) => {
+teste('imagem que não é comprovante: só o aviso de "não consegui ler"', async (ctx) => {
+  configComFaturamento();
   respostaGemini = { status: 200, body: geminiJson({ valor: null, confianca: 'baixa' }) };
   const [resp] = await mandar(ctx.webhook, updateArquivo());
+  await new Promise(r => setTimeout(r, 100));
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
-  assert.ok(resp.text.includes('Confere e me diz o valor'), resp.text);
+  assert.strictEqual(resp.text, AVISO_ILEGIVEL);
+  assert.strictEqual(enviadas.length, 1);
 });
 
-teste('falha da API do Gemini não quebra o bot: pede o valor', async (ctx) => {
+teste('falha da API do Gemini não quebra o bot: pede pra reenviar', async (ctx) => {
+  configComFaturamento();
   respostaGemini = { status: 429, body: { error: { message: 'quota exceeded' } } };
   const [resp] = await mandar(ctx.webhook, updateArquivo());
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
-  assert.ok(resp.text.includes('Não consegui ler o valor'), resp.text);
-  assert.ok(!resp.text.includes('quota'), 'não vaza o erro cru da API');
+  assert.strictEqual(resp.text, AVISO_ILEGIVEL);
 
   // E o bot segue vivo depois.
   respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = REGISTRO_OK;
   const [depois] = await mandar(ctx.webhook, updateArquivo());
-  assert.ok(depois.text.includes('Comprovante lido'), depois.text);
+  assert.ok(depois.text.includes('Valor: *R$ 150,00*'), depois.text);
 });
 
 teste('resposta do modelo embrulhada em ```json ainda é lida', async (ctx) => {
+  configComFaturamento();
   respostaGemini = {
     status: 200,
     body: { candidates: [{ content: { parts: [{ text: '```json\n{"valor": 99.9, "confianca": "alta"}\n```' }] } }] },
@@ -2477,22 +2536,22 @@ teste('resposta do modelo embrulhada em ```json ainda é lida', async (ctx) => {
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar')[0].body.p_valor, 99.9);
 });
 
-teste('resposta do modelo que não é JSON pede o valor', async (ctx) => {
+teste('resposta do modelo que não é JSON pede pra reenviar', async (ctx) => {
   respostaGemini = {
     status: 200,
     body: { candidates: [{ content: { parts: [{ text: 'não consegui ver direito' }] } }] },
   };
   const [resp] = await mandar(ctx.webhook, updateArquivo());
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
-  assert.ok(resp.text.includes('Não consegui ler o valor'), resp.text);
+  assert.strictEqual(resp.text, AVISO_ILEGIVEL);
 });
 
-teste('valor fora da faixa registra, mas avisa', async (ctx) => {
+teste('valor fora da faixa registra, mas avisa (no faturamento)', async (ctx) => {
+  configComFaturamento();
   respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 2500, qtd_dia: 1 } };
 
   respostaGemini = { status: 200, body: geminiJson({ valor: 2500, confianca: 'alta' }) };
   const [alto] = await mandar(ctx.webhook, updateArquivo());
-  assert.ok(alto.text.includes('Comprovante lido'), alto.text);
   assert.ok(alto.text.includes('valor fora do padrão'), alto.text);
 
   respostaGemini = { status: 200, body: geminiJson({ valor: 10, confianca: 'alta' }) };
@@ -2503,21 +2562,24 @@ teste('valor fora da faixa registra, mas avisa', async (ctx) => {
   respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
   const [normal] = await mandar(ctx.webhook, updateArquivo());
   assert.ok(!normal.text.includes('fora do padrão'), normal.text);
+  assert.strictEqual(emVendas().length, 0);
 });
 
 // Valor alto entra DIRETO: não existe confirmação no meio do caminho.
 teste('valor alto é registrado na hora, sem perguntar nada', async (ctx) => {
+  configComFaturamento();
   respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 3500, qtd_dia: 1 } };
   respostaGemini = { status: 200, body: geminiJson({ valor: 3500, confianca: 'alta' }) };
 
   const [resp] = await mandar(ctx.webhook, updateArquivo());
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 1);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar')[0].body.p_valor, 3500);
-  assert.ok(resp.text.includes('Comprovante lido: *R$ 3.500,00*'), resp.text);
+  assert.ok(resp.text.includes('Valor: *R$ 3.500,00*'), resp.text);
   assert.ok(!resp.text.includes('Confirma'), resp.text);
 });
 
 teste('PDF é aceito; sticker e vídeo são ignorados', async (ctx) => {
+  configComFaturamento();
   respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = REGISTRO_OK;
 
@@ -2530,8 +2592,25 @@ teste('PDF é aceito; sticker e vídeo são ignorados', async (ctx) => {
   assert.strictEqual(enviadas.length, 0);
 });
 
+teste('sem o grupo de faturamento configurado: registra, só loga, nada volta pra vendas', async (ctx) => {
+  respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = REGISTRO_OK;
+  await mandar(ctx.webhook, updateArquivo(), { esperaResposta: false });
+  await esperar(() => chamadas.some(c => c.fn === 'bot_comprovante_registrar'));
+  await new Promise(r => setTimeout(r, 150));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 1);
+  assert.strictEqual(enviadas.length, 0, JSON.stringify(enviadas));
+});
+
+teste('link pra mensagem original: supergrupo e grupo com @ sim; grupo comum não', async (ctx) => {
+  assert.strictEqual(ctx.mod.linkMensagem({ message_id: 42, chat: { id: -1001234567890 } }), 'https://t.me/c/1234567890/42');
+  assert.strictEqual(ctx.mod.linkMensagem({ message_id: 42, chat: { id: -100, username: 'vendas015' } }), 'https://t.me/vendas015/42');
+  assert.strictEqual(ctx.mod.linkMensagem({ message_id: 42, chat: { id: -4938589018 } }), null);
+  assert.strictEqual(ctx.mod.linkMensagem({ message_id: 42, chat: { id: -100 } }), null);
+});
+
 // O caso mais comum do dia a dia: a foto do comprovante vem com a baixa
-// escrita na legenda. Tem que fazer as DUAS coisas, numa resposta só.
+// escrita na legenda. Vendas vê a baixa; faturamento vê a leitura com os itens.
 function baixaParaComprovante() {
   return {
     status: 200,
@@ -2544,29 +2623,33 @@ function baixaParaComprovante() {
   };
 }
 
-teste('foto COM legenda de baixa dá baixa E registra o comprovante', async (ctx) => {
+teste('foto COM legenda de baixa: baixa em vendas (sem valor), leitura com itens no faturamento', async (ctx) => {
+  configComFaturamento();
   respostas.bot_movimentar_estoque = baixaParaComprovante();
   respostaGemini = { status: 200, body: geminiJson({ valor: 165, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = {
     status: 200, body: { ok: true, duplicado: false, total_dia: 1250, qtd_dia: 9 },
   };
 
-  const respostasBot = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
-  await new Promise(r => setTimeout(r, 200));
+  await mandar(ctx.webhook, updateArquivoDe({ caption: '-1 ignite 40000 mix grape ice' }, GABRIEL));
+  await esperar(() => noFaturamento().length > 0);
 
-  // As duas coisas aconteceram...
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 1);
   assert.strictEqual(chamadasGemini.length, 1, 'a imagem tem que ser lida também');
 
-  // ...numa RESPOSTA SÓ.
-  assert.strictEqual(respostasBot.length, 1, `devia ser uma mensagem só: ${JSON.stringify(respostasBot)}`);
-  assert.strictEqual(enviadas.length, 1, 'nada de segunda mensagem solta');
-  const t = respostasBot[0].text;
+  assert.strictEqual(emVendas().length, 1, 'uma mensagem só no grupo de vendas');
+  const t = emVendas()[0].text;
   assert.ok(t.includes('Baixa registrada'), t);
   assert.ok(t.includes('Ignite 40000 Mix (V400Mix) – Grape Ice'), t);
   assert.ok(t.includes('Estoque baixo'), t);
-  assert.ok(t.includes('💰 Comprovante lido: *R$ 165,00* · total do dia: R$ 1.250,00 (9 comprovantes)'), t);
+  vendasSemValor();
+
+  const f = noFaturamento()[0].text;
+  assert.ok(f.includes('Gabriel Souza'), f);
+  assert.ok(f.includes('Valor: *R$ 165,00*'), f);
+  assert.ok(f.includes('Itens: 1x Ignite 40000 Mix (V400Mix) – Grape Ice'), f);
+  assert.ok(f.includes('Faturamento de hoje: *R$ 1.250,00* (9 comprovantes)'), f);
 });
 
 // Independência: a baixa é a parte que não pode falhar.
@@ -2581,11 +2664,12 @@ teste('falha ao ler a imagem NÃO impede a baixa', async (ctx) => {
     'a baixa tem que acontecer de qualquer jeito');
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
   assert.ok(resp.text.includes('Baixa registrada'), resp.text);
-  assert.ok(resp.text.includes('Não consegui ler o comprovante — a baixa foi feita normalmente'), resp.text);
+  assert.ok(resp.text.includes(AVISO_ILEGIVEL), resp.text);
 });
 
 // TRAVA: comprovante repetido com baixa na legenda não baixa NADA.
 teste('comprovante repetido com legenda de baixa: nenhuma baixa feita', async (ctx) => {
+  configComFaturamento();
   respostas.bot_movimentar_estoque = baixaParaComprovante();
   respostaGemini = { status: 200, body: geminiJson({ valor: 165, codigo: 'E1', confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = {
@@ -2596,32 +2680,35 @@ teste('comprovante repetido com legenda de baixa: nenhuma baixa feita', async (c
   const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
   await new Promise(r => setTimeout(r, 200));
 
-  assert.strictEqual(resp.text, '⚠️ Esse comprovante já foi registrado em 14/09 16:31. Nenhuma baixa feita.');
+  assert.strictEqual(resp.text, AVISO_DUPLICADO);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0, 'não pode baixar nada');
-  assert.strictEqual(enviadas.length, 1);
+  assert.strictEqual(enviadas.length, 1, 'nada no faturamento');
 });
 
-teste('repetido só por valor NÃO trava: baixa sai e o bot pede pra conferir', async (ctx) => {
+teste('repetido só por valor NÃO trava: baixa sai, vendas sem aviso, faturamento confere', async (ctx) => {
+  configComFaturamento();
   respostas.bot_movimentar_estoque = baixaParaComprovante();
   respostaGemini = { status: 200, body: geminiJson({ valor: 165, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = {
-    status: 200, body: { ok: true, duplicado: true, motivo: 'valor_repetido', valor: 165, anterior_em: '05/10 14:02' },
+    status: 200, body: { ok: true, duplicado: true, motivo: 'valor_repetido', valor: 165, anterior_em: '05/10 14:02', total_dia: 330, qtd_dia: 2 },
   };
-  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
+  await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
+  await esperar(() => noFaturamento().length > 0);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1, 'a baixa tem que sair');
-  assert.ok(resp.text.includes('Baixa registrada'), resp.text);
-  assert.ok(resp.text.includes('⚠️ Já entrou um comprovante de mesmo valor há pouco. Confira se não é repetido.'), resp.text);
-  assert.ok(!resp.text.includes('Nenhuma baixa feita'), resp.text);
+  const t = emVendas()[0].text;
+  assert.ok(t.includes('Baixa registrada') && !t.includes('⚠️'), t);
+  assert.ok(noFaturamento()[0].text.includes('mesmo valor há pouco (05/10 14:02)'), noFaturamento()[0].text);
 });
 
 teste('comprovante novo: registra ANTES e só então dá a baixa', async (ctx) => {
+  configComFaturamento();
   respostas.bot_movimentar_estoque = baixaParaComprovante();
   respostaGemini = { status: 200, body: geminiJson({ valor: 165, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 165, qtd_dia: 1 } };
-  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
+  await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
+  await esperar(() => noFaturamento().length > 0);
   const ordem = chamadas.map(c => c.fn).filter(f => f === 'bot_comprovante_registrar' || f === 'bot_movimentar_estoque');
   assert.deepStrictEqual(ordem, ['bot_comprovante_registrar', 'bot_movimentar_estoque']);
-  assert.ok(resp.text.includes('Baixa registrada') && resp.text.includes('Comprovante lido'), resp.text);
 });
 
 teste('baixa sem foto continua igual (nenhum comprovante envolvido)', async (ctx) => {
@@ -2636,17 +2723,20 @@ teste('baixa sem foto continua igual (nenhum comprovante envolvido)', async (ctx
 // --- ATACADO: legenda começando com /atacado também lê o comprovante -------
 
 teste('foto com "/atacado" + itens na legenda: baixa, marca E registra o comprovante', async (ctx) => {
+  configComFaturamento();
   respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [baixaOk()] } };
   respostas.bot_marcar_atacado = { status: 200, body: { ok: true, ja_marcada: false, sale_id: '77', unidades: 6 } };
   respostaGemini = { status: 200, body: geminiJson({ valor: 900, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 900, qtd_dia: 1 } };
 
-  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '/atacado\n-6 elfbar 30000 cherry' }));
+  await mandar(ctx.webhook, updateArquivo({ caption: '/atacado\n-6 elfbar 30000 cherry' }));
+  await esperar(() => noFaturamento().length > 0);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 1, 'o comprovante sumia aqui');
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar')[0].body.p_valor, 900);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 1);
-  assert.ok(resp.text.includes('Comprovante lido: *R$ 900,00*'), resp.text);
+  assert.ok(noFaturamento()[0].text.includes('Valor: *R$ 900,00*'), noFaturamento()[0].text);
+  vendasSemValor();
 });
 
 teste('foto com "/atacado" + itens e comprovante repetido: nada é baixado nem marcado', async (ctx) => {
@@ -2654,31 +2744,34 @@ teste('foto com "/atacado" + itens e comprovante repetido: nada é baixado nem m
   respostaGemini = { status: 200, body: geminiJson({ valor: 900, codigo: 'E9', confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: true, motivo: 'codigo', quando: '04/10 18:10' } };
   const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '/atacado\n-6 elfbar 30000 cherry' }));
-  assert.ok(resp.text.includes('Nenhuma baixa feita'), resp.text);
+  assert.strictEqual(resp.text, AVISO_DUPLICADO);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_marcar_atacado').length, 0);
 });
 
 teste('foto com "/atacado" sozinho: corrige a venda anterior E registra o comprovante', async (ctx) => {
+  configComFaturamento();
   respostaGemini = { status: 200, body: geminiJson({ valor: 900, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = { status: 200, body: { ok: true, duplicado: false, total_dia: 900, qtd_dia: 1 } };
   await mandar(ctx.webhook, updateArquivo({ caption: '/atacado' }));
-  await esperar(() => chamadas.some(c => c.fn === 'bot_comprovante_registrar'));
-  await new Promise(r => setTimeout(r, 100));
-  assert.ok(enviadas.some(e => String(e.text).includes('Comprovante lido: *R$ 900,00*')), JSON.stringify(enviadas));
+  await esperar(() => noFaturamento().length > 0);
+  assert.ok(noFaturamento()[0].text.includes('Valor: *R$ 900,00*'), JSON.stringify(enviadas));
+  vendasSemValor();
 });
 
-teste('valor fora da faixa com legenda de baixa registra e avisa', async (ctx) => {
+teste('valor fora da faixa com legenda de baixa: aviso só no faturamento', async (ctx) => {
+  configComFaturamento();
   respostas.bot_movimentar_estoque = baixaParaComprovante();
   respostaGemini = { status: 200, body: geminiJson({ valor: 2500, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = {
     status: 200, body: { ok: true, duplicado: false, total_dia: 2500, qtd_dia: 1 },
   };
 
-  const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
-  await new Promise(r => setTimeout(r, 200));
-  assert.ok(resp.text.includes('Baixa registrada'), resp.text);
-  assert.ok(resp.text.includes('valor fora do padrão'), resp.text);
+  await mandar(ctx.webhook, updateArquivo({ caption: '-1 ignite 40000 mix grape ice' }));
+  await esperar(() => noFaturamento().length > 0);
+  assert.ok(emVendas()[0].text.includes('Baixa registrada'), emVendas()[0].text);
+  assert.ok(noFaturamento()[0].text.includes('valor fora do padrão'), noFaturamento()[0].text);
+  vendasSemValor();
 });
 
 teste('texto de baixa SEM foto segue igual, sem tocar no Gemini', async (ctx) => {
@@ -2692,26 +2785,29 @@ teste('texto de baixa SEM foto segue igual, sem tocar no Gemini', async (ctx) =>
 
 // Legenda de COMANDO continua sendo comando puro: a foto é só anexo.
 teste('foto com legenda de comando não vira comprovante', async (ctx) => {
-  respostas.bot_caixa_dia = { status: 200, body: { ok: true, dia: '15/09', comprovantes_qtd: 0 } };
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [] } };
   const [resp] = await mandar(ctx.webhook, updateArquivo({ caption: '/caixa' }));
   assert.strictEqual(chamadasGemini.length, 0, 'comando não dispara leitura de imagem');
-  assert.ok(resp.text.includes('CAIXA DE'), resp.text);
+  // E o /caixa no grupo de vendas é recusado: caixa é do grupo de faturamento.
+  assert.ok(resp.text.includes('grupo de faturamento'), resp.text);
+  vendasSemValor();
 });
 
 // Linha barrada pela regra de grupo não pode levar a foto junto pro ralo.
 teste('legenda barrada pela regra de grupo ainda registra o comprovante', async (ctx) => {
+  configComFaturamento();
   respostaGemini = { status: 200, body: geminiJson({ valor: 165, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = {
     status: 200, body: { ok: true, duplicado: false, total_dia: 165, qtd_dia: 1 },
   };
   // "+" no grupo de VENDAS é barrado.
   await mandar(ctx.webhook, updateArquivo({ caption: '+1 ignite 40000 mix grape ice' }));
-  await new Promise(r => setTimeout(r, 250));
+  await esperar(() => noFaturamento().length > 0);
 
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 1,
     'a foto não podia ser descartada junto com a linha barrada');
-  const todos = enviadas.map(e => e.text).join('\n');
-  assert.ok(todos.includes('Comprovante lido'), todos);
+  assert.ok(noFaturamento()[0].text.includes('Valor: *R$ 165,00*'), noFaturamento()[0].text);
+  vendasSemValor();
 });
 
 teste('foto no grupo de reposição não é tratada como comprovante', async (ctx) => {
@@ -2720,12 +2816,30 @@ teste('foto no grupo de reposição não é tratada como comprovante', async (ct
   assert.strictEqual(enviadas.length, 0);
 });
 
-teste('RPC de comprovante ausente diz qual SQL falta', async (ctx) => {
+teste('falha ao registrar: vendas pede pra reenviar (sem valor), faturamento recebe o detalhe', async (ctx) => {
+  configComFaturamento();
   respostaGemini = { status: 200, body: geminiJson({ valor: 150, confianca: 'alta' }) };
   respostas.bot_comprovante_registrar = { status: 404, body: { message: 'Could not find the function' } };
-  const [resp] = await mandar(ctx.webhook, updateArquivo());
-  assert.ok(resp.text.includes('bot_comprovante_registrar'), resp.text);
-  assert.ok(resp.text.includes('falta rodar o SQL'), resp.text);
+  await mandar(ctx.webhook, updateArquivo());
+  await esperar(() => noFaturamento().length > 0);
+  assert.strictEqual(emVendas()[0].text, '⚠️ Não consegui registrar esse comprovante. Manda de novo em instantes.');
+  const f = noFaturamento()[0].text;
+  assert.ok(f.includes('bot_comprovante_registrar') && f.includes('falta rodar o SQL'), f);
+  assert.ok(f.includes('Não entrou no total do dia'), f);
+});
+
+teste('/idgrupo responde o id do chat, em qualquer chat', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/idgrupo', { from: FUNCIONARIO, chat: -1009998887776 }));
+  assert.strictEqual(resp.text, '🆔 ID deste chat: `-1009998887776`');
+});
+
+teste('/caixa, /geral e /fechamento no grupo de vendas são recusados, sem valor', async (ctx) => {
+  respostas.bot_caixa_dia = { status: 200, body: { ok: true, dia: '15/09', comprovantes_total: 450, comprovantes_qtd: 3 } };
+  for (const c of ['/caixa', '/caixa corrigir', '/geral', '/fechamento']) {
+    const [resp] = await mandar(ctx.webhook, update(c));
+    assert.strictEqual(resp.text, '💰 Esse comando é no grupo de faturamento (ou no privado do dono).', c);
+  }
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_dia' || c.fn === 'bot_comissao').length, 0);
 });
 
 // --- /caixa ----------------------------------------------------------------
@@ -2741,7 +2855,7 @@ const CAIXA_DIA = {
 
 teste('/caixa mostra o total recebido, o ticket médio e a lista', async (ctx) => {
   respostas.bot_caixa_dia = { status: 200, body: CAIXA_DIA };
-  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa'));
   assert.ok(resp.text.includes('CAIXA DE 15/09'), resp.text);
   assert.ok(resp.text.includes('Total recebido: *R$ 450,00*'), resp.text);
   assert.ok(resp.text.includes('3 comprovantes · ticket médio R$ 150,00'), resp.text);
@@ -2753,7 +2867,7 @@ teste('/caixa mostra o total recebido, o ticket médio e a lista', async (ctx) =
 // todo dia. A comparação não pode voltar por descuido.
 teste('/caixa NÃO compara com as vendas do sistema', async (ctx) => {
   respostas.bot_caixa_dia = { status: 200, body: CAIXA_DIA };
-  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa'));
   assert.ok(!/Diferen[çc]a/i.test(resp.text), resp.text);
   assert.ok(!/Vendas registradas/i.test(resp.text), resp.text);
   assert.ok(!/dadas baixa/i.test(resp.text), resp.text);
@@ -2766,7 +2880,7 @@ teste('/caixa com mais de 15 comprovantes mostra só o resumo', async (ctx) => {
     status: 200,
     body: { ok: true, dia: '15/09', comprovantes_total: 800, comprovantes_qtd: 16, ticket_medio: 50, itens },
   };
-  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa'));
   assert.ok(resp.text.includes('16 comprovantes · ticket médio R$ 50,00'), resp.text);
   assert.ok(!resp.text.includes('· R$ 50,00\n'), 'lista longa não pode virar parede de texto');
   assert.strictEqual(resp.text.split('\n').length, 3, resp.text);
@@ -2777,31 +2891,31 @@ teste('/caixa em dia sem comprovante diz isso, sem ticket médio zerado', async 
     status: 200,
     body: { ok: true, dia: '15/09', comprovantes_total: 0, comprovantes_qtd: 0, ticket_medio: 0, itens: [] },
   };
-  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa'));
   assert.ok(resp.text.includes('Nenhum comprovante registrado'), resp.text);
   assert.ok(!resp.text.includes('ticket médio'), resp.text);
 });
 
 teste('/caixa 15/09 consulta o dia pedido', async (ctx) => {
   respostas.bot_caixa_dia = { status: 200, body: { ok: true, dia: '15/09', comprovantes_qtd: 0 } };
-  await mandar(ctx.webhook, update('/caixa 15/09'));
+  await mandar(ctx.webhook, updateFat('/caixa 15/09'));
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_dia')[0].body.p_data, '2026-09-15');
 });
 
 teste('/caixa com data inválida mostra o uso', async (ctx) => {
-  const [resp] = await mandar(ctx.webhook, update('/caixa ontem'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa ontem'));
   assert.ok(resp.text.includes('Uso: /caixa'), resp.text);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_dia').length, 0);
 });
 
 teste('/caixa com a RPC fora do ar avisa em vez de calar', async (ctx) => {
   respostas.bot_caixa_dia = { status: 500, body: { message: 'boom' } };
-  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa'));
   assert.ok(resp.text.includes('Erro ao consultar o caixa'), resp.text);
   assert.ok(!resp.text.includes('boom'), resp.text);
 });
 
-teste('o resumo diário das 23:59 leva o caixa junto', async (ctx) => {
+teste('o resumo diário do grupo de vendas NÃO leva o caixa', async (ctx) => {
   respostas.bot_comissao = {
     status: 200,
     body: { ok: true, mes: '21/08 → 20/09', unidades_hoje: 4, unidades_mes: 120, taxa_atual: 1.5, comissao: 180 },
@@ -2809,12 +2923,9 @@ teste('o resumo diário das 23:59 leva o caixa junto', async (ctx) => {
   respostas.bot_caixa_dia = { status: 200, body: CAIXA_DIA };
   await ctx.mod.enviarResumoVendas();
   const noGrupo = enviadas.find(e => String(e.chat_id) === String(GRUPO_VENDAS));
-  assert.ok(noGrupo.text.includes('CAIXA DE 15/09'), noGrupo.text);
-  assert.ok(noGrupo.text.includes('Total recebido: *R$ 450,00*'), noGrupo.text);
-  // O resumo das 23:59 já é longo: entra só o total, sem a lista e sem
-  // comparação nenhuma com as vendas.
-  assert.ok(!noGrupo.text.includes('16:42 · R$ 150,00'), noGrupo.text);
-  assert.ok(!/Diferen[çc]a/i.test(noGrupo.text), noGrupo.text);
+  assert.ok(!noGrupo.text.includes('CAIXA'), noGrupo.text);
+  assert.ok(!noGrupo.text.includes('Total recebido'), noGrupo.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_dia').length, 0);
 });
 
 // --- Dia da loja (vira às 3h) ---------------------------------------------
@@ -2840,7 +2951,7 @@ teste('fechamento diário roda às 3h e pede os números do dia que acabou', asy
   await ctx.mod.enviarResumoVendas('2026-10-31');
 
   assert.strictEqual(chamadas.find(c => c.fn === 'bot_comissao').body.p_mes, '2026-10-31');
-  assert.strictEqual(chamadas.find(c => c.fn === 'bot_caixa_dia').body.p_data, '2026-10-31');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_caixa_dia').length, 0, 'caixa não vai pro grupo de vendas');
   const msg = enviadas.find(e => String(e.chat_id) === String(GRUPO_VENDAS));
   assert.ok(msg.text.includes('31/10/2026'), msg.text);
   assert.ok(msg.text.includes('🔒 *FECHAMENTO DO PERÍODO 01/10 → 31/10*'), msg.text);
@@ -3244,7 +3355,7 @@ const LISTA_HOJE = {
 
 teste('/caixa corrigir lista os comprovantes numerados', async (ctx) => {
   respostas.bot_comprovantes_dia = LISTA_HOJE;
-  const [resp] = await mandar(ctx.webhook, update('/caixa corrigir'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa corrigir'));
   assert.ok(resp.text.includes('COMPROVANTES DE HOJE'), resp.text);
   assert.ok(resp.text.includes('1 · 10:14 · R$ 175,00'), resp.text);
   assert.ok(resp.text.includes('2 · 11:32 · R$ 3.500,00'), resp.text);
@@ -3257,8 +3368,8 @@ teste('/caixa apagar 2 apaga PELO ID do item 2', async (ctx) => {
   respostas.bot_comprovantes_dia = LISTA_HOJE;
   respostas.bot_comprovante_apagar = { status: 200, body: { ok: true } };
 
-  await mandar(ctx.webhook, update('/caixa corrigir'));
-  const [resp] = await mandar(ctx.webhook, update('/caixa apagar 2'));
+  await mandar(ctx.webhook, updateFat('/caixa corrigir'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa apagar 2'));
 
   const rpc = chamadas.filter(c => c.fn === 'bot_comprovante_apagar');
   assert.strictEqual(rpc.length, 1);
@@ -3271,8 +3382,8 @@ teste('/caixa valor 2 235 corrige pelo id e mostra o novo total', async (ctx) =>
   respostas.bot_comprovantes_dia = LISTA_HOJE;
   respostas.bot_comprovante_valor = { status: 200, body: { ok: true, valor_anterior: 3500 } };
 
-  await mandar(ctx.webhook, update('/caixa corrigir'));
-  const [resp] = await mandar(ctx.webhook, update('/caixa valor 2 235'));
+  await mandar(ctx.webhook, updateFat('/caixa corrigir'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa valor 2 235'));
 
   const rpc = chamadas.filter(c => c.fn === 'bot_comprovante_valor');
   assert.strictEqual(rpc[0].body.p_id, 'c-2');
@@ -3284,21 +3395,21 @@ teste('/caixa valor 2 235 corrige pelo id e mostra o novo total', async (ctx) =>
 teste('/caixa valor aceita vírgula e centavos', async (ctx) => {
   respostas.bot_comprovantes_dia = LISTA_HOJE;
   respostas.bot_comprovante_valor = { status: 200, body: { ok: true } };
-  await mandar(ctx.webhook, update('/caixa corrigir'));
-  await mandar(ctx.webhook, update('/caixa valor 1 235,50'));
+  await mandar(ctx.webhook, updateFat('/caixa corrigir'));
+  await mandar(ctx.webhook, updateFat('/caixa valor 1 235,50'));
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_valor')[0].body.p_valor, 235.5);
 });
 
 teste('/caixa apagar sem a lista aberta manda abrir primeiro', async (ctx) => {
-  const [resp] = await mandar(ctx.webhook, update('/caixa apagar 2'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa apagar 2'));
   assert.ok(resp.text.includes('/caixa corrigir'), resp.text);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_apagar').length, 0);
 });
 
 teste('/caixa apagar com número fora da lista avisa', async (ctx) => {
   respostas.bot_comprovantes_dia = LISTA_HOJE;
-  await mandar(ctx.webhook, update('/caixa corrigir'));
-  const [resp] = await mandar(ctx.webhook, update('/caixa apagar 9'));
+  await mandar(ctx.webhook, updateFat('/caixa corrigir'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa apagar 9'));
   assert.ok(resp.text.includes('Não existe o número 9'), resp.text);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_apagar').length, 0);
 });
@@ -3308,11 +3419,11 @@ teste('/caixa apagar com número fora da lista avisa', async (ctx) => {
 teste('depois de apagar, a lista velha é descartada', async (ctx) => {
   respostas.bot_comprovantes_dia = LISTA_HOJE;
   respostas.bot_comprovante_apagar = { status: 200, body: { ok: true } };
-  await mandar(ctx.webhook, update('/caixa corrigir'));
-  await mandar(ctx.webhook, update('/caixa apagar 1'));
+  await mandar(ctx.webhook, updateFat('/caixa corrigir'));
+  await mandar(ctx.webhook, updateFat('/caixa apagar 1'));
 
   chamadas.length = 0;
-  const [resp] = await mandar(ctx.webhook, update('/caixa apagar 1'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa apagar 1'));
   assert.ok(resp.text.includes('/caixa corrigir'), resp.text);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_apagar').length, 0);
 });
@@ -3320,10 +3431,10 @@ teste('depois de apagar, a lista velha é descartada', async (ctx) => {
 teste('/caixa corrigir 15/09 mexe em outro dia', async (ctx) => {
   respostas.bot_comprovantes_dia = LISTA_HOJE;
   respostas.bot_comprovante_apagar = { status: 200, body: { ok: true } };
-  await mandar(ctx.webhook, update('/caixa corrigir 15/09'));
+  await mandar(ctx.webhook, updateFat('/caixa corrigir 15/09'));
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovantes_dia')[0].body.p_data, '2026-09-15');
 
-  await mandar(ctx.webhook, update('/caixa apagar 1'));
+  await mandar(ctx.webhook, updateFat('/caixa apagar 1'));
   // O total conferido depois tem que ser o do MESMO dia, não o de hoje.
   const consultas = chamadas.filter(c => c.fn === 'bot_comprovantes_dia');
   assert.strictEqual(consultas[consultas.length - 1].body.p_data, '2026-09-15');
@@ -3331,24 +3442,24 @@ teste('/caixa corrigir 15/09 mexe em outro dia', async (ctx) => {
 
 teste('/caixa apagar do funcionário é recusado', async (ctx) => {
   respostas.bot_comprovantes_dia = LISTA_HOJE;
-  await mandar(ctx.webhook, update('/caixa corrigir'));
-  const [resp] = await mandar(ctx.webhook, update('/caixa apagar 1', { from: FUNCIONARIO }));
+  await mandar(ctx.webhook, updateFat('/caixa corrigir'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa apagar 1', { from: FUNCIONARIO }));
   assert.ok(resp.text.includes('Só o dono e o Rodrigo'), resp.text);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_apagar').length, 0);
 });
 
 teste('/caixa corrigir em dia sem comprovante não abre lista', async (ctx) => {
   respostas.bot_comprovantes_dia = { status: 200, body: { ok: true, dia: 'hoje', itens: [] } };
-  const [resp] = await mandar(ctx.webhook, update('/caixa corrigir'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa corrigir'));
   assert.ok(resp.text.includes('Nenhum comprovante registrado'), resp.text);
 
-  const [depois] = await mandar(ctx.webhook, update('/caixa apagar 1'));
+  const [depois] = await mandar(ctx.webhook, updateFat('/caixa apagar 1'));
   assert.ok(depois.text.includes('/caixa corrigir'), depois.text);
 });
 
 teste('/caixa sem argumento continua sendo o resumo do dia', async (ctx) => {
   respostas.bot_caixa_dia = { status: 200, body: CAIXA_DIA };
-  const [resp] = await mandar(ctx.webhook, update('/caixa'));
+  const [resp] = await mandar(ctx.webhook, updateFat('/caixa'));
   assert.ok(resp.text.includes('Total recebido'), resp.text);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovantes_dia').length, 0);
 });

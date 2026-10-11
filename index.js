@@ -42,7 +42,7 @@ const COMANDOS = [
   '/setgrupofaturamento', '/faturamento', '/lembrete-teste',
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
-  '/apagar', '/instrucoes', '/fechamento', '/consignado', '/sou', '/meuid',
+  '/apagar', '/instrucoes', '/fechamento', '/consignado', '/sou', '/meuid', '/idgrupo',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -433,14 +433,16 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
   // ANTES da baixa. Se o banco disser que o MESMO CÓDIGO de transação já
   // entrou, nada é baixado — é o golpe de reenviar o comprovante de ontem pra
   // levar pedido novo. Repetido só por VALOR (outro código, ou sem código) não
-  // trava: duas vendas de R$ 100 em poucos minutos são normais. A baixa sai e
-  // o bot pede pra conferir. Isso custa
+  // trava: duas vendas de R$ 100 em poucos minutos são normais. Isso custa
   // a latência do Gemini na frente da baixa, e é de propósito: baixar primeiro
   // e descobrir o repetido depois deixaria o estoque já mexido.
   // Foto que não deu pra ler não trava nada: a baixa sai e o bot avisa.
-  let textoComprovanteFinal = null;
+  // VALOR NENHUM aqui: a leitura e o total do dia vão pro grupo de
+  // faturamento (publicarComprovante, depois da baixa). O grupo de vendas só
+  // vê os avisos sem número.
+  let comp = null;
+  let avisoComp = null;
   if (msgComprovante) {
-    let comp = null;
     try {
       comp = await registrarComprovante(chatId, msgComprovante);
     } catch (err) {
@@ -448,17 +450,10 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
       console.error('comprovante junto da baixa:', err.message);
     }
     if (comp && comp.duplicado && comp.motivo === 'codigo') {
-      const quando = comp.quando ? ` em ${escapeMd(comp.quando)}` : '';
-      await sendTelegram(chatId, `⚠️ Esse comprovante já foi registrado${quando}. Nenhuma baixa feita.`);
+      await sendTelegram(chatId, AVISO_COMPROVANTE_DUPLICADO);
       return;
     }
-    if (comp && comp.duplicado) {
-      textoComprovanteFinal = '⚠️ Já entrou um comprovante de mesmo valor há pouco. Confira se não é repetido.';
-    } else {
-      textoComprovanteFinal = comp && comp.lido
-        ? comp.texto
-        : '🤔 Não consegui ler o comprovante — a baixa foi feita normalmente. Confere o valor.';
-    }
+    avisoComp = comp ? avisoComprovanteVendas(comp) : AVISO_COMPROVANTE_ILEGIVEL;
   }
 
   // Linhas que o parser entendeu viram itens { produto, qty } para a RPC; qty
@@ -527,9 +522,15 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
       : '⚠️ Essa venda ficou sem vendedor. Mande /sou SeuNome uma vez para ligar seu Telegram.');
   }
 
-  if (textoComprovanteFinal) linhasMsg.push('', textoComprovanteFinal);
+  if (avisoComp) linhasMsg.push('', avisoComp);
 
   await sendTelegram(chatId, linhasMsg.join('\n'));
+
+  // A leitura vai pro faturamento com os itens que de fato saíram.
+  if (comp) {
+    const itens = results.filter(r => r.ok && r.op === 'baixa').map(r => `${r.qtd}x ${r.modelo} – ${r.sabor}`);
+    await publicarComprovante(comp, msgComprovante, itens);
+  }
 }
 
 // Marca cada venda pelo SEU id — uma chamada por baixa, porque cada baixa cria
@@ -2718,8 +2719,6 @@ const COMPROVANTE_MAX = 2000;
 
 const MIMES_COMPROVANTE = ['image/jpeg', 'image/png', 'application/pdf'];
 
-const PEDE_VALOR = '🤔 Não consegui ler o valor desse comprovante. Confere e me diz o valor?';
-
 // Foto ou documento que vale a pena tentar ler. Sticker, vídeo e áudio ficam de
 // fora. Da foto pegamos o MAIOR tamanho: o Telegram manda várias resoluções e
 // as menores borram o valor.
@@ -2829,27 +2828,20 @@ function valorConfiavel(lido) {
   return valor;
 }
 
-// Lê, registra e DEVOLVE o texto da resposta em vez de enviar. É o que permite
-// a baixa e o comprovante saírem numa mensagem só quando a foto vem com a
-// legenda do movimento.
-// Nunca lança: qualquer erro vira texto pedindo o valor. Isso é o que garante
-// que a leitura do comprovante não encoste na baixa.
-async function lerERegistrarComprovante(chatId, msg) {
-  const r = await registrarComprovante(chatId, msg);
-  return r ? r.texto : null;
-}
-
-// O mesmo, devolvendo o que aconteceu — é o que a trava de comprovante
-// repetido precisa saber ANTES de dar baixa:
-//   { texto, lido: false }                  -> não leu o valor (nada gravado)
-//   { texto, lido: true, duplicado, quando } -> leu e mandou registrar
+// Lê e registra o comprovante. NÃO manda nada: quem chama decide o que vai
+// pro grupo de vendas (só aviso sem valor) e o que vai pro de faturamento.
+//   null                                    -> não é arquivo de comprovante
+//   { lido: false }                         -> não leu o valor (nada gravado)
+//   { lido: true, erro: true, texto }       -> leu, mas o registro falhou
+//   { lido: true, duplicado, motivo, ... }  -> leu e o banco registrou/recusou
 // Nunca lança.
 async function registrarComprovante(chatId, msg) {
   const arquivo = arquivoComprovante(msg);
   if (!arquivo) return null;
 
   if (arquivo.size > COMPROVANTE_MAX_BYTES) {
-    return { texto: `📎 Esse arquivo é grande demais pra eu ler. ${PEDE_VALOR}`, lido: false };
+    console.log('comprovante: arquivo grande demais pra ler');
+    return { lido: false };
   }
 
   let lido = null;
@@ -2863,7 +2855,7 @@ async function registrarComprovante(chatId, msg) {
   const valor = valorConfiavel(lido);
   if (valor == null) {
     // Inclui imagem que nem é comprovante: sem valor, não registra nada.
-    return { texto: PEDE_VALOR, lido: false };
+    return { lido: false };
   }
 
   let r = null;
@@ -2883,15 +2875,15 @@ async function registrarComprovante(chatId, msg) {
   } catch (err) {
     console.error('bot_comprovante_registrar:', err.message);
     return {
-      lido: true,
+      lido: true, erro: true, valor, leitura: lido,
       texto: rpcAusente(err.message)
         ? '⚠️ A RPC `bot_comprovante_registrar` não existe no banco — falta rodar o SQL do comprovante.'
-        : `⚠️ Li R$ ${fmtBR(valor)}, mas não consegui registrar. Tente reenviar em instantes.`,
+        : `⚠️ Li R$ ${fmtBR(valor)}, mas não consegui registrar.`,
     };
   }
   if (!r || r.ok === false) {
     const detalhe = r && (r.erro || r.msg);
-    return { lido: true, texto: `⚠️ ${detalhe || `Li R$ ${fmtBR(valor)}, mas não consegui registrar.`}` };
+    return { lido: true, erro: true, valor, leitura: lido, texto: `⚠️ ${detalhe || `Li R$ ${fmtBR(valor)}, mas não consegui registrar.`}` };
   }
 
   return {
@@ -2899,34 +2891,98 @@ async function registrarComprovante(chatId, msg) {
     duplicado: !!r.duplicado,
     motivo: String(r.motivo ?? ''),
     quando: String(r.quando ?? r.anterior_em ?? ''),
-    texto: textoComprovante(r, valor),
+    valor,
+    leitura: lido,
+    registro: r,
   };
 }
 
-// Foto sozinha: a resposta é só o comprovante.
-async function handleComprovante(chatId, msg) {
-  const texto = await lerERegistrarComprovante(chatId, msg);
-  if (texto) await sendTelegram(chatId, texto);
+// O grupo de VENDAS (onde chegam os comprovantes) nunca vê valor: o vendedor
+// novo não acompanha faturamento. Só estes avisos, e só quando pedem ação.
+const AVISO_COMPROVANTE_DUPLICADO = '⚠️ Esse comprovante já foi registrado antes. Não dei baixa de novo.';
+const AVISO_COMPROVANTE_ILEGIVEL = '⚠️ Não consegui ler esse comprovante. Manda de novo, com a foto mais nítida.';
+const AVISO_COMPROVANTE_FALHOU = '⚠️ Não consegui registrar esse comprovante. Manda de novo em instantes.';
+
+// null = nada a dizer no grupo de vendas (comprovante registrado).
+function avisoComprovanteVendas(comp) {
+  if (!comp) return null;
+  if (!comp.lido) return AVISO_COMPROVANTE_ILEGIVEL;
+  if (comp.erro) return AVISO_COMPROVANTE_FALHOU;
+  if (comp.duplicado && comp.motivo === 'codigo') return AVISO_COMPROVANTE_DUPLICADO;
+  return null;
 }
 
-// Monta a resposta do grupo a partir do retorno da RPC.
-function textoComprovante(r, valor) {
-  const quando = escapeMd(String(r.quando ?? r.anterior_em ?? ''));
-  const valorDup = fmtBR(r.valor ?? valor);
+// Foto sozinha no grupo de vendas.
+async function handleComprovante(chatId, msg) {
+  const comp = await registrarComprovante(chatId, msg);
+  const aviso = avisoComprovanteVendas(comp);
+  if (aviso) await sendTelegram(chatId, aviso);
+  await publicarComprovante(comp, msg);
+}
 
-  if (r.duplicado) {
-    return r.motivo === 'codigo'
-      ? `⚠️ *COMPROVANTE JÁ ENVIADO* — esse mesmo código de transação apareceu em ${quando}, no valor de R$ ${valorDup}. Confira antes de liberar o pedido.`
-      : `⚠️ Já entrou um comprovante de R$ ${valorDup} há pouco (${quando}). Se for outro pagamento, tudo bem; se não, confira.`;
-  }
+// Link pra mensagem original. Só supergrupo (-100…) ou grupo com @ tem link;
+// grupo comum não tem como, e aí a linha simplesmente não sai.
+function linkMensagem(msg) {
+  const chat = (msg && msg.chat) || {};
+  if (!msg || msg.message_id == null) return null;
+  if (chat.username) return `https://t.me/${chat.username}/${msg.message_id}`;
+  const id = String(chat.id ?? '');
+  const m = id.match(/^-100(\d+)$/);
+  if (m) return `https://t.me/c/${m[1]}/${msg.message_id}`;
+  return null;
+}
 
-  const linhas = [
-    `💰 Comprovante lido: *R$ ${fmtBR(valor)}* · total do dia: R$ ${fmtBR(r.total_dia)} (${r.qtd_dia ?? 0} comprovantes)`,
-  ];
-  if (valor > COMPROVANTE_MAX || valor < COMPROVANTE_MIN) {
-    linhas.push('⚠️ _valor fora do padrão, confere aí_');
+// Faturamento do dia já com este comprovante. O total vem da própria RPC de
+// registro (mesma transação); se ela não mandar, pergunta ao caixa do dia.
+// O dia é o da loja (vira às 3h) — quem decide é o banco.
+async function linhaFaturamentoDia(r) {
+  let total = r && r.total_dia;
+  let qtd = r && r.qtd_dia;
+  if (total == null) {
+    try {
+      const d = await callRpc('bot_caixa_dia', { p_token: BOT_SYNC_TOKEN });
+      if (d && d.ok !== false) { total = d.comprovantes_total; qtd = d.comprovantes_qtd; }
+    } catch (err) {
+      console.error('bot_caixa_dia:', err.message);
+    }
   }
+  if (total == null) return '⚠️ _Não consegui puxar o faturamento do dia._';
+  return `📊 Faturamento de hoje: *R$ ${fmtBR(total)}* (${qtd ?? 0} comprovantes)`;
+}
+
+// Texto do grupo de faturamento: quem mandou, a leitura, os itens da baixa
+// (quando vieram na legenda), o total do dia e o link.
+async function textoComprovanteFaturamento(comp, msg, itens = []) {
+  const quem = nomeAutor(msg && msg.from);
+  const linhas = [`💰 *Comprovante*${quem ? ` · ${escapeMd(quem)}` : ''}`];
+  if (comp.erro) {
+    linhas.push(comp.texto, '_Não entrou no total do dia. Pedi pro vendedor reenviar._');
+  } else {
+    const l = comp.leitura || {};
+    linhas.push(`Valor: *R$ ${fmtBR(comp.valor)}*`);
+    const detalhes = [l.banco && `Banco: ${escapeMd(String(l.banco))}`, l.pagador && `Pagador: ${escapeMd(String(l.pagador))}`]
+      .filter(Boolean);
+    if (detalhes.length) linhas.push(detalhes.join(' · '));
+    if (itens.length) linhas.push(`Itens: ${itens.map(i => escapeMd(i)).join(', ')}`);
+    if (comp.valor > COMPROVANTE_MAX || comp.valor < COMPROVANTE_MIN) linhas.push('⚠️ _valor fora do padrão, confere aí_');
+    if (comp.duplicado) {
+      const quando = comp.quando ? ` (${escapeMd(comp.quando)})` : '';
+      linhas.push(`⚠️ _Já entrou um comprovante de mesmo valor há pouco${quando}. Confira se não é repetido._`);
+    }
+    linhas.push(await linhaFaturamentoDia(comp.registro));
+  }
+  const link = linkMensagem(msg);
+  if (link) linhas.push(`🔗 [Ver mensagem](${link})`);
   return linhas.join('\n');
+}
+
+// Manda pro grupo de faturamento tudo que é comprovante registrado (ou que
+// falhou ao registrar). Repetido pelo código e foto ilegível não vão: não
+// entraram no total.
+async function publicarComprovante(comp, msg, itens) {
+  if (!comp || !comp.lido) return;
+  if (comp.duplicado && comp.motivo === 'codigo') return;
+  await enviarFaturamento(await textoComprovanteFaturamento(comp, msg, itens));
 }
 
 // ---------------------------------------------------------------------------
@@ -3021,8 +3077,8 @@ async function handleCaixa(chatId, text, from) {
 // ---------------------------------------------------------------------------
 // Grupo de FATURAMENTO (números do dinheiro, círculo pequeno)
 //
-// Os comprovantes continuam chegando no grupo de VENDAS — aqui só entram os
-// TOTAIS. É a razão de ser do grupo: quem vê faturamento não precisa ver (nem
+// Os comprovantes continuam chegando no grupo de VENDAS, mas a leitura de cada
+// um (com o faturamento do dia) e todos os totais saem SÓ aqui. É a razão de ser do grupo: quem vê faturamento não precisa ver (nem
 // deve ver) o fluxo de foto e baixa do dia.
 //
 // Mesmo mecanismo do grupo de pedidos: o id mora em integration_config
@@ -3035,11 +3091,25 @@ async function chatFaturamento() {
   return (await lerConfig(CONFIG_GRUPO_FATURAMENTO)).trim();
 }
 
+// Tudo que é valor da loja passa por aqui. Sem o grupo configurado o texto NÃO
+// vai pra lugar nenhum — só pro log. Nunca cai de volta no grupo de vendas.
+async function enviarFaturamento(texto) {
+  const grupo = await chatFaturamento();
+  if (!grupo) {
+    console.log(`[faturamento] grupo não configurado — não enviado: ${texto.replace(/\n/g, ' | ')}`);
+    return false;
+  }
+  await sendTelegram(grupo, texto);
+  return true;
+}
+
 // Onde /faturamento e /relatorio mes valem: grupo de faturamento e privado do
 // dono. Sem a chave configurada, SÓ o privado do dono — ao contrário dos
 // pedidos, que valem em qualquer lugar enquanto não são configurados. Aqui o
 // vazamento é o risco: faturamento caindo no grupo de vendas é exatamente o
 // que este grupo existe pra evitar.
+const AVISO_SO_FATURAMENTO = '💰 Esse comando é no grupo de faturamento (ou no privado do dono).';
+
 function podeFaturamento(chatKey, isPrivadoLucas, faturamentoId) {
   if (isPrivadoLucas) return true;
   return !!faturamentoId && String(chatKey) === String(faturamentoId);
@@ -4342,7 +4412,7 @@ async function handleConsignado(chatId, text) {
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n📋 */geral* — Painel do ciclo por vendedor + acerto do Rod (só sócios)\n⏳ */fechamento* — Parcial do fechamento (só sócios)\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n💵 */caixa* — o que entrou de dinheiro hoje (ou `/caixa 15/09`)\n🛠️ */caixa corrigir* — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas que eu leio o valor\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/relatorio mes` — dia a dia do mês';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -4372,10 +4442,10 @@ async function enviarResumoVendas(dia = ontemISO()) {
     }
     linhas.push('', `Total: *${total}* unidades saíram hoje`);
   }
-  // Bloco final: comissão (com cabeçalho de FECHAMENTO no último dia do período)
-  // e o caixa do dia — é o fechamento de dinheiro ao lado do de unidades.
+  // Bloco final: comissão (com cabeçalho de FECHAMENTO no último dia do período).
+  // O caixa do dia NÃO vem aqui: dinheiro da loja é do grupo de faturamento,
+  // que recebe o resumo dele no mesmo horário (enviarFaturamentoDiario).
   linhas.push('', await textoComissaoRelatorio(dia));
-  linhas.push('', await textoCaixa(dia, { compacto: true }));
   await sendTelegram(VENDAS_CHAT_ID, linhas.join('\n'));
 }
 
@@ -4462,6 +4532,8 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/chatid') { await handleChatId(chatId, msg); return; }
     // /meuid vale em qualquer chat: é como se descobre o id de um sócio pra
     // cadastrar, e ele pode ainda não estar em grupo nenhum do bot.
+    // /idgrupo também: é como se confirma o id do grupo de faturamento.
+    if (cmd === '/idgrupo') { await sendTelegram(chatId, `🆔 ID deste chat: \`${chatId}\``); return; }
     if (cmd === '/meuid') {
       if (fromId != null) await sendTelegram(chatId, `Seu ID do Telegram: \`${fromId}\``);
       return;
@@ -4663,7 +4735,7 @@ app.post('/webhook', async (req, res) => {
     // "/relatorio mes" é faturamento, não estoque — e por isso respeita o
     // grupo restrito em vez de responder onde o /relatorio normal responde.
     if (cmd === '/relatorio' && /^mes|^mês/i.test((text.split(/\s+/)[1] || ''))) {
-      if (!faturamentoAqui) { await sendTelegram(chatId, '💰 Esse comando é no grupo de faturamento (ou no privado do dono).'); return; }
+      if (!faturamentoAqui) { await sendTelegram(chatId, AVISO_SO_FATURAMENTO); return; }
       for (const parte of await textosFaturamentoDetalhe(null)) await sendTelegram(chatId, parte);
       return;
     }
@@ -4674,8 +4746,15 @@ app.post('/webhook', async (req, res) => {
     if (cmd === '/sou') { await handleSou(chatId, text, msg.from); return; }
     if (cmd === '/despesas') { await handleListaRod(chatId, 'despesa'); return; }
     if (cmd === '/dinheiro') { await handleListaRod(chatId, 'dinheiro'); return; }
-    if (cmd === '/geral') { await handleGeral(chatId, msg.from); return; }
-    if (cmd === '/fechamento') { await handleFechamentoParcial(chatId, msg.from); return; }
+    // Valores da loja (painel, parcial, caixa): só no grupo de faturamento ou
+    // no privado do dono — nunca no de vendas.
+    if (cmd === '/geral' || cmd === '/fechamento' || cmd === '/caixa') {
+      if (!faturamentoAqui) { await sendTelegram(chatId, AVISO_SO_FATURAMENTO); return; }
+      if (cmd === '/geral') await handleGeral(chatId, msg.from);
+      else if (cmd === '/fechamento') await handleFechamentoParcial(chatId, msg.from);
+      else await handleCaixa(chatId, text, msg.from);
+      return;
+    }
     // /anular é liberado (registra o autor); /desanular e /refazerfechamento
     // continuam só do dono — a checagem é feita dentro dos handlers.
     if (cmd === '/anular') { await handleAnular(chatId, text, msg.from); return; }
@@ -4692,7 +4771,6 @@ app.post('/webhook', async (req, res) => {
       await handleTraduzir(chatId, text.replace(/^\/traduzir(@\S+)?[ \t]*/i, ''));
       return;
     }
-    if (cmd === '/caixa') { await handleCaixa(chatId, text, msg.from); return; }
     if (cmd === '/consignado') {
       if (!isVendas && !isReposicao) {
         await sendTelegram(chatId, '📦 O /consignado é no grupo de VENDAS ou de REPOSIÇÃO.');
@@ -4702,7 +4780,7 @@ app.post('/webhook', async (req, res) => {
       return;
     }
     if (cmd === '/faturamento') {
-      if (!faturamentoAqui) { await sendTelegram(chatId, '💰 Esse comando é no grupo de faturamento (ou no privado do dono).'); return; }
+      if (!faturamentoAqui) { await sendTelegram(chatId, AVISO_SO_FATURAMENTO); return; }
       await handleFaturamento(chatId, text);
       return;
     }
@@ -4823,9 +4901,10 @@ module.exports = {
   legendaEhComando,
   parseJsonModelo,
   valorConfiavel,
-  textoComprovante,
+  textoComprovanteFaturamento,
+  linkMensagem,
+  enviarFaturamento,
   handleComprovante,
-  lerERegistrarComprovante,
   textoCaixa,
   handleCaixa,
   chatFaturamento,
