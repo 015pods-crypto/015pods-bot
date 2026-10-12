@@ -20,13 +20,16 @@ const cron = require('node-cron');
 
 const TZ = 'America/Sao_Paulo';
 const CAMINHO_WEBHOOK = '/tarefas/webhook';
-// O resumo sai às 9h. Se o servidor estava dormindo às 9h, sai no primeiro
-// minuto acordado até as 22h — uma vez por dia, quem garante é o banco.
-const HORA_RESUMO = 9;
-const CRON_RESUMO = '*/10 9-22 * * *';
-// O bot das lojas mantém o servidor acordado das 10h às 3h50. Sem isto, às 9h
-// ele está dormindo e o cron do resumo não roda.
-const CRON_ACORDAR = '*/10 4-9 * * *';
+// O resumo sai às 10h30 — o servidor já está acordado (o keepalive das lojas
+// começa às 10h). Se ele estiver fora do ar nessa hora, sai no primeiro tick
+// até as 22h; uma vez por dia, quem garante é o banco.
+const HORA_RESUMO = 10;
+const MINUTO_RESUMO = 30;
+const CRON_RESUMO = '*/10 10-22 * * *';
+// Quantas tarefas um /feito ou /reabrir mexe de uma vez.
+const MAX_LOTE = 50;
+// "feito", "feito!", "feito 2 4", "feita 1-3" — respondendo a uma mensagem.
+const RE_FEITO_RESPOSTA = /^(feito|feita)(?=$|[\s.!✅\d#])[\s\d,;#\-–]*[.!✅\s]*$/iu;
 const TEXTO_CURTO = 60;
 const MAX_MSG = 3800;
 
@@ -36,14 +39,14 @@ const AJUDA = [
   '/tarefa texto — registra uma tarefa (também foto com legenda /tarefa, ou respondendo a uma mensagem)',
   '/pendentes — tarefas abertas, das mais antigas para as novas',
   '/minhas — tarefas com você e as que você pediu',
-  '/feito 12 — marca como feita (ou responda à tarefa com "feito")',
-  '/reabrir 12 — volta para aberta',
+  '/feito 12 — marca como feita; vale vários: <code>/feito 1 2 3</code>, <code>/feito 1-5</code> (ou responda à tarefa com "feito")',
+  '/reabrir 12 — volta para aberta (também vários de uma vez)',
   '/pra 12 Nome — define o responsável',
   '/prazo 12 25/10 — define o prazo (<code>/prazo 12 sem</code> tira)',
   '/ver 12 — tarefa completa, com foto e histórico',
   '/idgrupo — ID deste chat',
   '',
-  '☀️ Todo dia às 9h: resumo das abertas, com as atrasadas em destaque.',
+  '☀️ Todo dia às 10h30: resumo das abertas, com as atrasadas em destaque.',
 ].join('\n');
 
 // --- utilidades puras --------------------------------------------------------
@@ -83,7 +86,27 @@ function textoCurto(texto) {
 
 function idadeTexto(dias) {
   if (dias <= 0) return 'hoje';
-  return dias === 1 ? '1 dia' : `${dias} dias`;
+  return dias === 1 ? 'há 1 dia' : `há ${dias} dias`;
+}
+
+// "1 2 3", "1,2,3", "#4", "1-5", "1 - 5" -> [1, 2, 3, ...] sem repetidos, na
+// ordem digitada. null se aparecer algo que não é número ou passar do limite.
+function parseNumeros(s) {
+  const tokens = String(s || '').replace(/\s*[-–]\s*/g, '-').split(/[\s,;]+/).filter(Boolean);
+  if (!tokens.length) return null;
+  const nums = [];
+  for (const tk of tokens) {
+    let m = tk.match(/^#?(\d+)$/);
+    if (m) { nums.push(+m[1]); continue; }
+    m = tk.match(/^#?(\d+)-#?(\d+)$/);
+    if (!m) return null;
+    let [a, b] = [+m[1], +m[2]];
+    if (a > b) [a, b] = [b, a];
+    if (b - a >= MAX_LOTE) return null;
+    for (let i = a; i <= b; i++) nums.push(i);
+  }
+  const unicos = [...new Set(nums)].filter(n => n > 0);
+  return unicos.length && unicos.length <= MAX_LOTE ? unicos : null;
 }
 
 function nomeDe(from) {
@@ -204,14 +227,48 @@ function criarBotTarefas(cfg) {
       : '⚠️ Erro ao falar com o banco. Tente de novo em instantes.';
   }
 
-  // Uma linha da lista: "⚠️ #2 · texto · Ana → Bruno · 3 dias · prazo 10/10"
-  function linhaTarefa(t, hojeISO) {
-    const vencida = t.prazo && t.prazo < hojeISO;
-    const partes = [`#${t.numero}`, esc(textoCurto(t.texto))];
-    const quem = esc(t.pedido_por_nome || '?') + (t.responsavel ? ` → ${esc(t.responsavel)}` : '');
-    partes.push(quem, idadeTexto(diasEntre(partesSP(new Date(t.criada_em)).iso, hojeISO)));
-    if (t.prazo) partes.push(vencida ? `<b>prazo ${dataBR(t.prazo)} (vencida)</b>` : t.prazo === hojeISO ? 'prazo hoje' : `prazo ${dataBR(t.prazo)}`);
-    return `${vencida ? '⚠️ ' : ''}${partes.join(' · ')}`;
+  // --- formatação ------------------------------------------------------------
+  // HTML do Telegram: o texto das tarefas passa sempre por esc(), então
+  // <, > e & digitados pelo pessoal não quebram a mensagem.
+
+  // "#12 · <b>Texto</b>"
+  function linhaTitulo(t, { curto = true } = {}) {
+    return `#${t.numero} · <b>${esc(curto ? textoCurto(t.texto) : t.texto)}</b>`;
+  }
+
+  // Segunda linha, em itálico: 👤 responsável · 📅 prazo · há X dias · pedida por
+  function linhaDetalhe(t, hojeISO, { prazoComAno = false } = {}) {
+    const p = [];
+    if (t.responsavel) p.push(`👤 ${esc(t.responsavel)}`);
+    if (t.prazo) {
+      const aberta = t.status !== 'feita';
+      const data = dataBR(t.prazo, prazoComAno);
+      p.push(aberta && t.prazo < hojeISO ? `📅 ${data} (vencida)` : aberta && t.prazo === hojeISO ? '📅 hoje' : `📅 ${data}`);
+    }
+    p.push(idadeTexto(diasEntre(partesSP(new Date(t.criada_em)).iso, hojeISO)));
+    p.push(`pedida por ${esc(t.pedido_por_nome || '?')}`);
+    return `<i>${p.join(' · ')}</i>`;
+  }
+
+  const bloco = (t, h) => `${linhaTitulo(t)}\n${linhaDetalhe(t, h)}`;
+
+  // Seção com título e as tarefas separadas por linha em branco. '' se vazia.
+  function secao(titulo, itens, h) {
+    if (!itens.length) return '';
+    return `${titulo} (${itens.length})</b>\n\n${itens.map(t => bloco(t, h)).join('\n\n')}`;
+  }
+
+  // Atrasadas primeiro, depois as abertas com responsável, sem responsável no
+  // fim. Dentro de cada grupo, da mais antiga pra mais nova (ordem do banco).
+  function textoLista(cabecalho, itens, h) {
+    const atrasadas = itens.filter(t => t.prazo && t.prazo < h);
+    const resto = itens.filter(t => !atrasadas.includes(t));
+    return [
+      cabecalho,
+      secao('⚠️ <b>Atrasadas', atrasadas, h),
+      secao('📌 <b>Abertas', resto.filter(t => t.responsavel), h),
+      secao('<b>Sem responsável', resto.filter(t => !t.responsavel), h),
+    ].filter(Boolean).join('\n\n');
   }
 
   async function abertas(chatId) {
@@ -265,14 +322,13 @@ function criarBotTarefas(cfg) {
       p_chat_id: String(msg.chat.id), p_texto: texto, p_foto: foto, p_origem_msg_id: origem, p_autor: autorDe(msg.from),
     });
     if (!d || d.ok === false) { await responder(msg, `⚠️ Não registrei: ${esc((d && d.erro) || 'erro')}`); return; }
-    await responder(msg, `📌 #${d.numero} registrada: ${esc(texto)}`);
+    await responder(msg, `📌 <b>#${d.numero} registrada</b>\n<b>${esc(texto)}</b>`);
   }
 
   async function cmdPendentes(msg) {
     const itens = await abertas(msg.chat.id);
     if (!itens.length) { await responder(msg, '🎉 Nenhuma tarefa aberta.'); return; }
-    const h = hoje();
-    await responder(msg, [`📋 <b>Pendentes</b> (${itens.length})`, ...itens.map(t => linhaTarefa(t, h))].join('\n'));
+    await responder(msg, textoLista(`📋 <b>Pendentes (${itens.length})</b>`, itens, hoje()));
   }
 
   async function cmdMinhas(msg) {
@@ -284,18 +340,19 @@ function criarBotTarefas(cfg) {
       await responder(msg, '🙋 Nenhuma tarefa aberta com você nem pedida por você.');
       return;
     }
-    const linhas = ['🙋 <b>Suas tarefas</b>'];
-    if (comVoce.length) linhas.push('', `<b>Com você</b> (${comVoce.length})`, ...comVoce.map(t => linhaTarefa(t, h)));
-    if (pedidas.length) linhas.push('', `<b>Pedidas por você</b> (${pedidas.length})`, ...pedidas.map(t => linhaTarefa(t, h)));
-    await responder(msg, linhas.join('\n'));
+    await responder(msg, [
+      `🙋 <b>Suas tarefas (${comVoce.length + pedidas.length})</b>`,
+      secao('👤 <b>Com você', comVoce, h),
+      secao('📝 <b>Pedidas por você', pedidas, h),
+    ].filter(Boolean).join('\n\n'));
   }
 
-  // Resolve o número: argumento, ou a mensagem respondida. Responde o uso e
+  // Resolve UM número: argumento, ou a mensagem respondida. Responde o uso e
   // devolve null quando não dá.
   async function numeroOuUso(msg, text, uso) {
     const n = numeroDoArg(text) ?? await numeroDaResposta(msg);
     if (n && n.varias) {
-      await responder(msg, 'Essa mensagem tem mais de uma tarefa. Use o número: <code>/feito 12</code>.');
+      await responder(msg, 'Essa mensagem tem mais de uma tarefa. Use o número: <code>/ver 12</code>.');
       return null;
     }
     if (!n) { await responder(msg, `Uso: ${uso}`); return null; }
@@ -313,30 +370,73 @@ function criarBotTarefas(cfg) {
     return d;
   }
 
-  async function cmdFeito(msg, text) {
-    const n = await numeroOuUso(msg, text, '<code>/feito 12</code> (ou responda à tarefa com "feito")');
-    if (!n) return;
-    const d = await atualizar(msg, n, 'feito');
-    if (!d) return;
-    if (d.ok === false && d.erro === 'ja_feita') {
-      const t = d.tarefa || {};
-      const quem = t.feita_por_nome ? ` por ${esc(t.feita_por_nome)}` : '';
-      const quando = t.feita_em ? ` em ${dataHoraBR(t.feita_em)}` : '';
-      await responder(msg, `ℹ️ #${n} já estava feita${quem}${quando}.`);
-      return;
-    }
-    if (!d.ok) { await responder(msg, `⚠️ ${esc(d.erro || 'erro')}`); return; }
-    await responder(msg, `✅ #${n} feita por ${esc(nomeDe(msg.from) || '?')}`);
-  }
+  const LOTE = {
+    feito: {
+      uso: '<code>/feito 12</code> · <code>/feito 1 2 3</code> · <code>/feito 1-5</code> (ou responda à tarefa com "feito")',
+      um: (n) => `✅ <b>#${n} feita</b>`, varios: (q) => `✅ <b>${q} tarefas feitas</b>`,
+      jaUm: 'já estava feita', jaVarios: 'Já estavam feitas', erroJa: 'ja_feita',
+    },
+    reabrir: {
+      uso: '<code>/reabrir 12</code> · <code>/reabrir 1 2 3</code> · <code>/reabrir 1-5</code>',
+      um: (n) => `🔄 <b>#${n} reaberta</b>`, varios: (q) => `🔄 <b>${q} tarefas reabertas</b>`,
+      jaUm: 'já está aberta', jaVarios: 'Já estavam abertas', erroJa: 'ja_aberta',
+    },
+  };
 
-  async function cmdReabrir(msg, text) {
-    const n = await numeroOuUso(msg, text, '<code>/reabrir 12</code>');
-    if (!n) return;
-    const d = await atualizar(msg, n, 'reabrir');
-    if (!d) return;
-    if (d.ok === false && d.erro === 'ja_aberta') { await responder(msg, `ℹ️ #${n} já está aberta.`); return; }
-    if (!d.ok) { await responder(msg, `⚠️ ${esc(d.erro || 'erro')}`); return; }
-    await responder(msg, `🔄 #${n} reaberta.`);
+  // /feito e /reabrir, com um ou vários números ("1 2 3", "1,2,3", "1-5").
+  // Cada número é independente: um que não existe ou já estava no estado
+  // pedido só vira aviso, sem travar os outros. Resposta única no fim.
+  async function cmdLote(msg, text, acao) {
+    const L = LOTE[acao];
+    const resto = text.replace(/^\/?(feito|feita|reabrir)(@\S+)?/i, '').replace(/[.!✅\s]+$/u, '').trim();
+    let nums;
+    if (resto) {
+      nums = parseNumeros(resto);
+      if (!nums) { await responder(msg, `Uso: ${L.uso} (até ${MAX_LOTE} de uma vez)`); return; }
+    } else {
+      const n = await numeroDaResposta(msg);
+      if (n && n.varias) {
+        await responder(msg, `Essa mensagem tem mais de uma tarefa. Diga quais: <code>${acao === 'feito' ? 'feito' : '/reabrir'} 2 4</code>.`);
+        return;
+      }
+      if (!n) { await responder(msg, `Uso: ${L.uso}`); return; }
+      nums = [n];
+    }
+
+    const ok = [];
+    const naoExiste = [];
+    const jaEstavam = [];
+    const falharam = [];
+    for (const n of nums) {
+      const d = await rpc('tarefas_atualizar', {
+        p_chat_id: String(msg.chat.id), p_numero: n, p_acao: acao, p_valor: null, p_autor: autorDe(msg.from),
+      });
+      if (d && d.ok) ok.push(d.tarefa);
+      else if (d && d.erro === 'nao_existe') naoExiste.push(n);
+      else if (d && d.erro === L.erroJa) jaEstavam.push(d.tarefa || { numero: n });
+      else falharam.push(n);
+    }
+
+    const linhas = [];
+    const quem = acao === 'feito' ? ` por ${esc(nomeDe(msg.from) || '?')}` : '';
+    if (ok.length === 1) {
+      linhas.push(`${L.um(ok[0].numero)}${quem}`, `<b>${esc(textoCurto(ok[0].texto))}</b>`);
+    } else if (ok.length > 1) {
+      linhas.push(`${L.varios(ok.length)}${quem}`, '', ...ok.map(t => linhaTitulo(t)));
+    }
+    const avisos = [];
+    if (naoExiste.length) avisos.push(`❓ Não achei: ${naoExiste.map(n => `#${n}`).join(', ')}`);
+    if (jaEstavam.length === 1) {
+      const t = jaEstavam[0];
+      const por = acao === 'feito' && t.feita_por_nome ? ` por ${esc(t.feita_por_nome)}` : '';
+      const em = acao === 'feito' && t.feita_em ? ` em ${dataHoraBR(t.feita_em)}` : '';
+      avisos.push(`ℹ️ #${t.numero} ${L.jaUm}${por}${em}.`);
+    } else if (jaEstavam.length > 1) {
+      avisos.push(`ℹ️ ${L.jaVarios}: ${jaEstavam.map(t => `#${t.numero}`).join(', ')}`);
+    }
+    if (falharam.length) avisos.push(`⚠️ Não consegui mexer em: ${falharam.map(n => `#${n}`).join(', ')}`);
+    if (linhas.length && avisos.length) linhas.push('');
+    await responder(msg, [...linhas, ...avisos].join('\n'));
   }
 
   async function cmdPra(msg, text) {
@@ -347,7 +447,7 @@ function criarBotTarefas(cfg) {
     const d = await atualizar(msg, n, 'responsavel', nome);
     if (!d) return;
     if (!d.ok) { await responder(msg, `⚠️ ${esc(d.erro || 'erro')}`); return; }
-    await responder(msg, `👤 #${n} → ${esc(nome)}`);
+    await responder(msg, `👤 <b>#${n}</b> → ${esc(nome)}\n<b>${esc(textoCurto(d.tarefa.texto))}</b>`);
   }
 
   async function cmdPrazo(msg, text) {
@@ -362,7 +462,8 @@ function criarBotTarefas(cfg) {
     const d = await atualizar(msg, n, 'prazo', iso);
     if (!d) return;
     if (!d.ok) { await responder(msg, `⚠️ ${esc(d.erro || 'erro')}`); return; }
-    await responder(msg, tirar ? `📅 #${n} sem prazo.` : `📅 #${n} prazo ${dataBR(iso, true)}`);
+    const cab = tirar ? `📅 <b>#${n}</b> sem prazo` : `📅 <b>#${n}</b> prazo ${dataBR(iso, true)}`;
+    await responder(msg, `${cab}\n<b>${esc(textoCurto(d.tarefa.texto))}</b>`);
   }
 
   const ROTULO_ACAO = { criada: 'criada', feito: 'feita', reabrir: 'reaberta', responsavel: 'responsável', prazo: 'prazo' };
@@ -373,16 +474,14 @@ function criarBotTarefas(cfg) {
     const d = await rpc('tarefas_ver', { p_chat_id: String(msg.chat.id), p_numero: n });
     if (!d || d.ok === false) { await responder(msg, `❓ Não achei a tarefa #${n}.`); return; }
     const t = d.tarefa;
-    const h = hoje();
     const linhas = [
-      `📌 <b>#${t.numero}</b> — ${t.status === 'feita' ? '✅ feita' : 'aberta'}`,
-      esc(t.texto),
+      `📌 <b>Tarefa #${t.numero}</b> · ${t.status === 'feita' ? '✅ feita' : 'aberta'}`,
       '',
-      `Pedida por ${esc(t.pedido_por_nome || '?')} em ${dataHoraBR(t.criada_em)}`,
+      linhaTitulo(t, { curto: false }),
+      linhaDetalhe(t, hoje(), { prazoComAno: true }),
+      `<i>🕐 criada em ${dataHoraBR(t.criada_em)}</i>`,
     ];
-    if (t.responsavel) linhas.push(`Responsável: ${esc(t.responsavel)}`);
-    if (t.prazo) linhas.push(`Prazo: ${dataBR(t.prazo, true)}${t.status === 'aberta' && t.prazo < h ? ' ⚠️ vencida' : ''}`);
-    if (t.status === 'feita') linhas.push(`Feita por ${esc(t.feita_por_nome || '?')} em ${dataHoraBR(t.feita_em)}`);
+    if (t.status === 'feita') linhas.push(`✅ Feita por ${esc(t.feita_por_nome || '?')} em ${dataHoraBR(t.feita_em)}`);
     const hist = d.historico || [];
     if (hist.length) {
       linhas.push('', '<b>Histórico</b>');
@@ -426,12 +525,14 @@ function criarBotTarefas(cfg) {
         else if (cmd === '/tarefa') await cmdTarefa(msg, text);
         else if (cmd === '/pendentes') await cmdPendentes(msg);
         else if (cmd === '/minhas') await cmdMinhas(msg);
-        else if (cmd === '/feito') await cmdFeito(msg, text);
-        else if (cmd === '/reabrir') await cmdReabrir(msg, text);
+        else if (cmd === '/feito') await cmdLote(msg, text, 'feito');
+        else if (cmd === '/reabrir') await cmdLote(msg, text, 'reabrir');
         else if (cmd === '/pra') await cmdPra(msg, text);
         else if (cmd === '/prazo') await cmdPrazo(msg, text);
         else if (cmd === '/ver') await cmdVer(msg, text);
-        else if (!cmd && msg.reply_to_message && /^(feito|feita)[\s.!✅]*$/i.test(text)) await cmdFeito(msg, '');
+        // "feito" ou "feito 2 4" respondendo a uma mensagem. Sem resposta é
+        // conversa, e o bot fica quieto.
+        else if (!cmd && msg.reply_to_message && RE_FEITO_RESPOSTA.test(text)) await cmdLote(msg, text, 'feito');
       } catch (err) {
         await responder(msg, erroBanco(err));
       }
@@ -441,19 +542,14 @@ function criarBotTarefas(cfg) {
   }
 
   function textoResumo(itens, hojeISO) {
-    const atrasadas = itens.filter(t => t.prazo && t.prazo < hojeISO);
-    const demais = itens.filter(t => !atrasadas.includes(t));
-    const linhas = [`☀️ <b>Tarefas abertas — ${dataBR(hojeISO)}</b> (${itens.length})`];
-    if (atrasadas.length) linhas.push('', `⚠️ <b>Atrasadas (${atrasadas.length})</b>`, ...atrasadas.map(t => linhaTarefa(t, hojeISO)));
-    if (demais.length) linhas.push('', atrasadas.length ? `<b>Demais (${demais.length})</b>` : '<b>Abertas</b>', ...demais.map(t => linhaTarefa(t, hojeISO)));
-    return linhas.join('\n');
+    return textoLista(`☀️ <b>Tarefas abertas — ${dataBR(hojeISO)} (${itens.length})</b>`, itens, hojeISO);
   }
 
   // Resumo diário. Marca o dia no banco ANTES de mandar: reinício ou dois
   // ticks não repetem o resumo. Sem tarefas abertas, não manda nada.
   async function rodarResumo() {
     const p = partesSP(agora());
-    if (p.hora < HORA_RESUMO) return;
+    if (p.hora * 60 + p.minuto < HORA_RESUMO * 60 + MINUTO_RESUMO) return;
     for (const chat of autorizados) {
       try {
         const m = await rpc('tarefas_resumo_marcar', { p_chat_id: chat, p_dia: p.iso });
@@ -514,9 +610,6 @@ function ligar(app, env = process.env, { agendar = true, agora } = {}) {
       }, { timezone: TZ });
       const base = env.RENDER_EXTERNAL_URL;
       if (base) {
-        cron.schedule(CRON_ACORDAR, () => {
-          fetch(`${base.replace(/\/$/, '')}/ping`).catch(err => console.error('tarefas: keepalive:', err.message));
-        }, { timezone: TZ });
         bot.registrarWebhook(base).catch(err => console.error('tarefas: setWebhook:', err.message));
       } else {
         console.log('bot de tarefas: sem RENDER_EXTERNAL_URL — registre o webhook à mão.');
@@ -531,5 +624,5 @@ function ligar(app, env = process.env, { agendar = true, agora } = {}) {
 }
 
 module.exports = {
-  ligar, criarBotTarefas, segredoWebhook, parsePrazo, partesSP, ehDaPessoa, textoCurto, CAMINHO_WEBHOOK,
+  ligar, criarBotTarefas, segredoWebhook, parsePrazo, parseNumeros, partesSP, ehDaPessoa, textoCurto, CAMINHO_WEBHOOK,
 };
