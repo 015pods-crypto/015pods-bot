@@ -4583,6 +4583,81 @@ teste('/instrucoes explica o /nova de várias linhas', async (ctx) => {
     '/nova <texto> → anota uma tarefa. Ex: /nova trocar foto do V500 no site\nVárias de uma vez: uma por linha, no mesmo /nova\nResponder uma mensagem'), resp.text);
 });
 
+// --- /troca --------------------------------------------------------------
+
+function trocaOk(model, flavor, qty, before, id) {
+  return { input: `${model} ${flavor}`, status: 'ok', direction: 'troca', qty,
+    model, flavor, stock_before: before, stock_after: before - qty, troca_id: id };
+}
+
+teste('parseTroca: motivo na primeira linha, no item, "outro" com detalhe e jeito antigo', async (ctx) => {
+  const p = ctx.mod.parseTroca;
+  assert.deepStrictEqual(p('/troca defeito\n1 Ignite V50 Grape'),
+    { motivo: 'defeito', detalhe: null, itens: [{ produto: 'Ignite V50 Grape', qty: 1 }], invalidas: [] });
+  assert.deepStrictEqual(p('/troca 1 Ignite V50 Grape com defeito').itens, [{ produto: 'Ignite V50 Grape', qty: 1 }]);
+  assert.strictEqual(p('/troca 1 Ignite V50 Grape com defeito').motivo, 'defeito');
+  const o = p('/troca outro: cliente não gostou do sabor\n2 Elfbar 40000 Ice King Miami Mint');
+  assert.strictEqual(o.motivo, 'outro');
+  assert.strictEqual(o.detalhe, 'cliente não gostou do sabor');
+  assert.deepStrictEqual(o.itens, [{ produto: 'Elfbar 40000 Ice King Miami Mint', qty: 2 }]);
+  const antigo = p('/consignado troca\n1 Ignite V50 Grape');
+  assert.strictEqual(antigo.motivo, null);
+  assert.deepStrictEqual(antigo.itens, [{ produto: 'Ignite V50 Grape', qty: 1 }]);
+  assert.deepStrictEqual(p('/consignado 1 Ignite V50 Grape troca').itens, [{ produto: 'Ignite V50 Grape', qty: 1 }]);
+});
+
+teste('/troca defeito: chama bot_troca com o motivo e não faz baixa de venda', async (ctx) => {
+  respostas.bot_troca = { status: 200, body: { resultados: [trocaOk('Ignite V50', 'Grape', 1, 5, 7)], ids: [7] } };
+  const [resp] = await mandar(ctx.webhook, update('/troca defeito\n1 Ignite V50 Grape'));
+  mostrar('TROCA DEFEITO', resp.text);
+  const rpc = chamadas.filter(c => c.fn === 'bot_troca');
+  assert.strictEqual(rpc.length, 1);
+  assert.deepStrictEqual(rpc[0].body.p_items, [{ produto: 'Ignite V50 Grape', qty: 1 }]);
+  assert.strictEqual(rpc[0].body.p_motivo, 'defeito');
+  assert.strictEqual(rpc[0].body.p_origem, 'troca');
+  assert.strictEqual(resp.text, '↩️ *Troca* (defeito)\n• 1x Ignite V50 – Grape (estoque 5 → 4)\n_Não conta como venda nem comissão._');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque' || c.fn === 'bot_consignado').length, 0);
+});
+
+teste('/troca sem motivo: pergunta, e a resposta à pergunta grava o motivo', async (ctx) => {
+  respostas.bot_troca = { status: 200, body: { resultados: [trocaOk('Ignite V50', 'Grape', 1, 5, 9)], ids: [9] } };
+  respostas.bot_troca_motivo = { status: 200, body: { ok: true, atualizadas: 1, motivo: 'outro' } };
+  const [resp] = await mandar(ctx.webhook, update('/troca\n1 Ignite V50 Grape'));
+  mostrar('TROCA SEM MOTIVO', resp.text);
+  assert.ok(resp.text.includes('Qual foi o motivo?'), resp.text);
+  const pergunta = chamadasTelegram.filter(c => c.metodo === 'sendMessage').pop();
+  assert.ok(pergunta.body.text.includes('Qual foi o motivo?'));
+  const idPergunta = ultimoMsgIdTelegram;
+  const upd = update('outro: cliente quis outro sabor');
+  upd.message.reply_to_message = { message_id: idPergunta };
+  const [ok] = await mandar(ctx.webhook, upd);
+  mostrar('MOTIVO SALVO', ok.text);
+  const m = chamadas.find(c => c.fn === 'bot_troca_motivo').body;
+  assert.deepStrictEqual(m.p_ids, [9]);
+  assert.strictEqual(m.p_motivo, 'outro');
+  assert.strictEqual(m.p_detalhe, 'cliente quis outro sabor');
+  assert.ok(ok.text.startsWith('✅ Motivo da troca salvo: *outro*'), ok.text);
+});
+
+teste('/consignado com a palavra troca vira troca (origem consignado); sem a palavra continua consignado', async (ctx) => {
+  respostas.bot_troca = { status: 200, body: { resultados: [trocaOk('Ignite V50', 'Grape', 1, 5, 11)], ids: [11] } };
+  await mandar(ctx.webhook, update('/consignado troca defeito\n1 Ignite V50 Grape'));
+  const t = chamadas.filter(c => c.fn === 'bot_troca');
+  assert.strictEqual(t.length, 1);
+  assert.strictEqual(t[0].body.p_origem, 'consignado');
+  assert.strictEqual(t[0].body.p_motivo, 'defeito');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_consignado').length, 0);
+  respostas.bot_consignado = { status: 200, body: { resultados: [consignadoOk('Ignite V50', 'Grape', 2, 5)] } };
+  await mandar(ctx.webhook, update('/consignado 2 Ignite V50 Grape'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_consignado').length, 1);
+});
+
+teste('/troca fora dos grupos de vendas e reposição é recusado', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, updateFat('/troca defeito\n1 Ignite V50 Grape'));
+  assert.ok(resp.text.includes('O /troca é no grupo de VENDAS ou de REPOSIÇÃO'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_troca').length, 0);
+});
+
 // --- /consignado ---------------------------------------------------------
 
 function consignadoOk(model, flavor, qty, before) {

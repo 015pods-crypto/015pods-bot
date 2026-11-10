@@ -42,7 +42,7 @@ const COMANDOS = [
   '/setgrupofaturamento', '/faturamento', '/lembrete-teste',
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
-  '/apagar', '/instrucoes', '/fechamento', '/consignado', '/sou', '/meuid', '/idgrupo',
+  '/apagar', '/instrucoes', '/fechamento', '/consignado', '/troca', '/sou', '/meuid', '/idgrupo',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -4412,7 +4412,144 @@ async function handleConsignado(chatId, text) {
   await sendTelegram(chatId, linhas.join('\n'));
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
+// ---------------------------------------------------------------------------
+// /troca — o cliente devolveu um pod e levou outro: tira do estoque, NÃO é
+// venda e NÃO conta comissão. Guarda o motivo (defeito ou outro) para o
+// sistema mostrar a taxa de defeito por modelo e sabor (tela Estoque > Trocas).
+//
+//   /troca defeito
+//   1 Ignite V50 Grape
+//
+//   /troca 1 Ignite V50 Grape defeito
+//   /troca outro: cliente não gostou do sabor
+//   1 Ignite V50 Grape
+//
+// Sem motivo, o bot pergunta: responder a mensagem dele com "defeito" ou
+// "outro ..." grava o motivo. O jeito antigo continua: /consignado com a
+// palavra "troca" vira troca (vai para a mesma RPC, origem 'consignado').
+// ---------------------------------------------------------------------------
+
+const USO_TROCA =
+  'Uso: `/troca defeito` e os itens embaixo, um por linha (`1 Ignite V50 Grape`).\nOutro motivo: `/troca outro: cliente não gostou` e os itens embaixo.';
+
+// { motivo: 'defeito'|'outro'|null, detalhe, itens: [{ produto, qty }], invalidas: [linha] }
+function parseTroca(texto) {
+  const linhas = String(texto || '').split('\n');
+  let primeira = linhas[0].replace(/^\/(troca|consignado)(@\S+)?/i, '').trim();
+  const resto = linhas.slice(1).map(l => l.trim()).filter(Boolean);
+  let motivo = null;
+  let detalhe = null;
+
+  // "outro" só vale na primeira linha (tudo depois dele é o detalhe)
+  const mOutro = primeira.match(/(?:^|\s)(?:motivo\s*:?\s*)?outro(?:\s+motivo)?\s*[:\-–]?\s*(.*)$/i);
+  if (mOutro) {
+    motivo = 'outro';
+    detalhe = mOutro[1].trim() || null;
+    primeira = primeira.slice(0, mOutro.index).trim();
+  }
+  const limpar = (l) => {
+    let t = l.replace(/\btrocas?\b/gi, ' ');
+    if (/\b(com\s+)?defeito\b/i.test(t)) {
+      if (!motivo) motivo = 'defeito';
+      t = t.replace(/\b(motivo\s*:?\s*)?(com\s+)?defeito\b/gi, ' ');
+    }
+    return t.replace(/\s+/g, ' ').replace(/^[\s:\-–]+|[\s:\-–]+$/g, '').trim();
+  };
+
+  const candidatas = [];
+  const p = limpar(primeira);
+  const mPessoa = p.match(RE_CONSIGNADO_PESSOA);
+  if (mPessoa) detalhe = [detalhe, `para ${mPessoa[1].trim()}`].filter(Boolean).join(' · ');
+  else if (p) candidatas.push(p);
+  for (const l of resto) { const t = limpar(l); if (t) candidatas.push(t); }
+
+  const itens = [];
+  const invalidas = [];
+  for (const l of candidatas) {
+    const m = l.match(RE_CONSIGNADO_ITEM);
+    const qty = m ? parseInt(m[1], 10) : 0;
+    if (m && qty > 0) itens.push({ produto: m[2].trim(), qty });
+    else invalidas.push(l);
+  }
+  return { motivo, detalhe, itens, invalidas };
+}
+
+// pergunta do motivo -> ids das trocas (chave: chat:mensagem do bot). Some ao reiniciar
+// o servidor; aí a troca fica "sem motivo" no sistema.
+const trocasSemMotivo = new Map();
+
+async function handleTroca(chatId, text, msg, origem = 'troca') {
+  const { motivo, detalhe, itens, invalidas } = parseTroca(text);
+  if (!itens.length) {
+    const ruins = invalidas.length ? `Não entendi: ${invalidas.map(l => `\`${escapeMd(l)}\``).join(', ')}\n\n` : '';
+    await sendTelegram(chatId, `${ruins}${USO_TROCA}`);
+    return;
+  }
+
+  let data = null;
+  try {
+    data = await callRpc('bot_troca', {
+      p_token: BOT_SYNC_TOKEN, p_items: itens, p_motivo: motivo, p_detalhe: detalhe,
+      p_meta: { chat_id: chatId, message_id: msg && msg.message_id, ...metaUsuario(msg && msg.from) },
+      p_origem: origem,
+    });
+  } catch (err) {
+    console.error('bot_troca:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC `bot_troca` não existe no banco — falta rodar o SQL das trocas.'
+      : '⚠️ Erro ao registrar a troca. Nada foi tirado do estoque.');
+    return;
+  }
+
+  const resultados = (data && data.resultados) || [];
+  const rotulo = motivo === 'defeito' ? ' (defeito)' : motivo === 'outro' ? ` (outro motivo${detalhe ? `: ${escapeMd(detalhe)}` : ''})` : '';
+  const linhas = [`↩️ *Troca*${rotulo}`];
+  let saiu = 0;
+  itens.forEach((it, i) => {
+    const r = resultados[i];
+    if (r && r.status === 'ok') {
+      saiu++;
+      const nome = [r.model, r.flavor].filter(Boolean).join(' – ') || it.produto;
+      const antes = r.stock_before != null ? r.stock_before : Number(r.stock_after) + Number(r.qty);
+      linhas.push(`• ${r.qty}x ${escapeMd(nome)} (estoque ${antes} → ${r.stock_after})`);
+    } else {
+      const m = mapResultado(r || { status: 'erro', input: it.produto }, 'baixa');
+      linhas.push(`❌ ${escapeMd(m.msg)}`);
+    }
+  });
+  for (const l of invalidas) linhas.push(`❌ Formato inválido: \`${escapeMd(l)}\` — use \`1 Ignite V50 Grape\``);
+  linhas.push(saiu ? '_Não conta como venda nem comissão._' : '_Nada foi tirado do estoque._');
+
+  const ids = (data && data.ids) || [];
+  if (!saiu || motivo || !ids.length) {
+    await sendTelegram(chatId, linhas.join('\n'));
+    return;
+  }
+  linhas.push('', '❓ *Qual foi o motivo?* Responda ESTA mensagem com *defeito* ou *outro* (pode contar o que houve).');
+  const env = await telegramApi('sendMessage', { chat_id: chatId, text: linhas.join('\n'), parse_mode: 'Markdown' });
+  const idMsg = env && env.ok && env.result && env.result.message_id;
+  if (!idMsg) { await sendTelegram(chatId, linhas.join('\n')); return; }
+  trocasSemMotivo.set(`${chatId}:${idMsg}`, ids);
+  if (trocasSemMotivo.size > 200) trocasSemMotivo.delete(trocasSemMotivo.keys().next().value);
+}
+
+// resposta à pergunta do motivo
+async function handleMotivoTroca(chatId, text, ids, chave) {
+  const t = String(text || '').trim();
+  const motivo = /\bdefeito\b/i.test(t) ? 'defeito' : 'outro';
+  const detalhe = motivo === 'outro' ? (t.replace(/^\s*outro(\s+motivo)?\s*[:\-–]?\s*/i, '').trim() || null) : null;
+  try {
+    await callRpc('bot_troca_motivo', { p_token: BOT_SYNC_TOKEN, p_ids: ids, p_motivo: motivo, p_detalhe: detalhe });
+  } catch (err) {
+    console.error('bot_troca_motivo:', err.message);
+    await sendTelegram(chatId, '⚠️ Não consegui salvar o motivo. Responda de novo daqui a pouco.');
+    return;
+  }
+  trocasSemMotivo.delete(chave);
+  await sendTelegram(chatId, `✅ Motivo da troca salvo: *${motivo === 'defeito' ? 'defeito' : 'outro'}*${detalhe ? ` (${escapeMd(detalhe)})` : ''}.`);
+}
+
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -4579,6 +4716,13 @@ app.post('/webhook', async (req, res) => {
     const isFaturamento = !!faturamentoId && chatKey === String(faturamentoId);
     const isTraducao = !!traducaoId && chatKey === String(traducaoId);
     if (!isVendas && !isReposicao && !isPrivadoLucas && !isPedidos && !isFaturamento && !isTraducao) return;
+
+    // resposta à pergunta "Qual foi o motivo?" de uma troca
+    if (body.message && msg.reply_to_message && text && !cmd.startsWith('/')) {
+      const chaveTroca = `${chatId}:${msg.reply_to_message.message_id}`;
+      const idsTroca = trocasSemMotivo.get(chaveTroca);
+      if (idsTroca) { await handleMotivoTroca(chatId, text, idsTroca, chaveTroca); return; }
+    }
 
     // Comprovante: foto/PDF no grupo de VENDAS.
     //   sem legenda          -> só o comprovante
@@ -4771,9 +4915,22 @@ app.post('/webhook', async (req, res) => {
       await handleTraduzir(chatId, text.replace(/^\/traduzir(@\S+)?[ \t]*/i, ''));
       return;
     }
+    if (cmd === '/troca') {
+      if (!isVendas && !isReposicao) {
+        await sendTelegram(chatId, '↩️ O /troca é no grupo de VENDAS ou de REPOSIÇÃO.');
+        return;
+      }
+      if (body.message) await handleTroca(chatId, text, msg, 'troca');
+      return;
+    }
     if (cmd === '/consignado') {
       if (!isVendas && !isReposicao) {
         await sendTelegram(chatId, '📦 O /consignado é no grupo de VENDAS ou de REPOSIÇÃO.');
+        return;
+      }
+      // jeito antigo: /consignado com a palavra "troca" é troca
+      if (/\btrocas?\b/i.test(text)) {
+        if (body.message) await handleTroca(chatId, text, msg, 'consignado');
         return;
       }
       await handleConsignado(chatId, text);
@@ -4933,6 +5090,9 @@ module.exports = {
   parseValorArg,
   parseConsignado,
   handleConsignado,
+  parseTroca,
+  handleTroca,
+  trocasSemMotivo,
   diaLojaISO,
   hojeISO,
   ontemISO,
