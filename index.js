@@ -38,7 +38,7 @@ const COMANDOS = [
   '/semana', '/reposicao', '/comissao', '/despesas', '/dinheiro', '/geral',
   '/anular', '/desanular', '/adicionar', '/refazerfechamento', '/versao',
   '/chatid', '/setgrupopedidos', '/fornecedor', '/apelido', '/pedido',
-  '/atacado', '/desatacado', '/caixa', '/correção', '/troca', '/consignado',
+  '/atacado', '/desatacado', '/caixa', '/correção',
   '/setgrupofaturamento', '/faturamento', '/lembrete-teste',
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
@@ -503,7 +503,7 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
     }
     const mapped = mapResultado(resultados[p.itemIndex], p.op);
     if (p.atacado) mapped.atacado = true;
-    // Mantém o resumo diário de vendas (cron 23:50) funcionando: cada baixa ok
+    // Contador reserva do resumo diário (cron 3h; a fonte é o banco): cada baixa ok
     // é registrada por modelo, como era feito na lógica antiga da planilha.
     if (mapped.ok && mapped.op === 'baixa') registrarVenda(mapped.modelo, mapped.qtd);
     results.push(mapped);
@@ -514,7 +514,7 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
   // A marca só faz sentido nas baixas que de fato entraram: numa baixa que
   // falhou, marcar acertaria a venda ANTERIOR.
   const aMarcar = results.filter(r => r.ok && r.op === 'baixa' && r.atacado);
-  if (aMarcar.length) linhasMsg.push(...(await marcarVendasAtacado(chatId, aMarcar)));
+  if (aMarcar.length) linhasMsg.push(...(await marcarVendasAtacado(chatId, aMarcar, from)));
 
   // De quem é a venda: só quando alguma baixa entrou (entrada não é venda).
   if (results.some(r => r.ok && r.op === 'baixa') && vendedor !== undefined) {
@@ -537,7 +537,7 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
 // Marca cada venda pelo SEU id — uma chamada por baixa, porque cada baixa cria
 // uma venda própria. Uma falha isolada não derruba as outras nem desfaz venda
 // nenhuma: o estoque já saiu, e o que fica pendente é só a marca, item a item.
-async function marcarVendasAtacado(chatId, baixas) {
+async function marcarVendasAtacado(chatId, baixas, from) {
   const marcadas = [];
   const idsMarcados = [];
   const jaEstavam = [];
@@ -553,7 +553,7 @@ async function marcarVendasAtacado(chatId, baixas) {
 
   const out = [];
   if (marcadas.length) {
-    lembrarMarcacao(chatId, idsMarcados, marcadas.join(', '));
+    lembrarMarcacao(chatId, idsMarcados, marcadas.join(', '), from && from.id);
     out.push(`🏷️ *ATACADO:* ${marcadas.map(escapeMd).join(', ')}`);
     out.push(`_${AVISO_DESFAZER}_`);
   }
@@ -894,9 +894,13 @@ function formatComissaoPorQuem(d) {
 }
 
 // Texto do /comissao: a resposta é a de QUEM pergunta (`from`).
-async function textoComissao(from) {
+async function textoComissao(from, chatId) {
   const d = await dadosComissao(null, metaUsuario(from));
-  return d ? formatComissaoPorQuem(d) : '⚠️ Erro ao consultar comissão.';
+  if (!d) return '⚠️ Erro ao consultar comissão.';
+  // Grupo de VENDAS é lido por todos: valor por vendedor não sai lá (mesma
+  // regra do fechamento). O detalhe fica pro privado/faturamento.
+  if (String(chatId) === VENDAS_CHAT_ID && !d.pessoal && Array.isArray(d.vendedores)) return formatComissao(d);
+  return formatComissaoPorQuem(d);
 }
 
 // Bloco do resumo diário: no último dia do período (fecha_hoje=true) vira
@@ -1215,7 +1219,7 @@ async function handleFechamentoParcial(chatId, from) {
 }
 
 async function handleComissao(chatId, from) {
-  await sendTelegram(chatId, await textoComissao(from));
+  await sendTelegram(chatId, await textoComissao(from, chatId));
 }
 
 // /sou Nome — liga o Telegram de quem mandou ao vendedor com esse nome. Daí
@@ -1459,8 +1463,7 @@ async function handleAdicionar(chatId, text, from) {
   ];
   // Extrato logo abaixo: é onde se vê a adição já refletida. Sai do mesmo
   // bot_comissao que alimenta o /comissao, então os dois não têm como divergir.
-  const d = await dadosComissao(null, metaUsuario(from));
-  partes.push('', d ? formatComissaoPorQuem(d) : '⚠️ _Adição registrada, mas não consegui puxar o extrato agora._');
+  partes.push('', await textoComissao(from, chatId).then(t => t.startsWith('⚠️') ? '⚠️ _Adição registrada, mas não consegui puxar o extrato agora._' : t));
   await sendTelegram(chatId, partes.join('\n'));
 }
 
@@ -1572,10 +1575,10 @@ function separarControleAtacado(texto) {
 // Guarda os IDs, não "a última venda" — desfazer também precisa de alvo fixo.
 const ultimaMarcacao = new Map(); // chatKey -> { saleIds, texto, at }
 
-function lembrarMarcacao(chatId, saleIds, texto) {
+function lembrarMarcacao(chatId, saleIds, texto, autorId) {
   const ids = (saleIds || []).filter(Boolean).map(String);
   if (!ids.length) return;
-  ultimaMarcacao.set(String(chatId), { saleIds: ids, texto, at: Date.now() });
+  ultimaMarcacao.set(String(chatId), { saleIds: ids, texto, at: Date.now(), autor: autorId != null ? String(autorId) : null });
 }
 
 const AVISO_DESFAZER = 'Se não era essa, responda `/desatacado`.';
@@ -1615,11 +1618,13 @@ async function handleAtacado(chatId, from) {
 // /desatacado — tira a marca da última venda (ou vendas) que ESTE chat marcou.
 async function handleDesatacado(chatId, from) {
   const userId = from && from.id;
-  if (!podeMarcarAtacado(userId)) {
-    await sendTelegram(chatId, '⛔ Só o dono e o Rodrigo podem desfazer a marca de atacado.');
+  const m = ultimaMarcacao.get(String(chatId));
+  // Quem marcou (escreveu "atacado" na baixa) pode desfazer a própria marca.
+  const autorDaMarca = m && m.autor && userId != null && m.autor === String(userId);
+  if (!podeMarcarAtacado(userId) && !autorDaMarca) {
+    await sendTelegram(chatId, '⛔ Só quem marcou, o dono e o Rodrigo podem desfazer a marca de atacado.');
     return;
   }
-  const m = ultimaMarcacao.get(String(chatId));
   if (!m) {
     await sendTelegram(chatId, '🤷 Não tenho marcação recente pra desfazer neste chat.');
     return;
@@ -4641,7 +4646,7 @@ async function handleCorrecao(chatId, text, from) {
     `_${Number(r.unidades) === 1 ? '1 item voltou' : `${Number(r.unidades) || 'Os'} itens voltaram`} pro estoque e saíram da comissão._`);
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n🛠️ */correção* — lista suas vendas de hoje; `/correção N` desfaz a venda N (volta pro estoque e sai da comissão)\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n↩️ */desanular N* — Desfaz um /anular (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado` (quem marcou, o dono ou o Rodrigo)\n🛠️ */correção* — lista suas vendas de hoje; `/correção N` desfaz a venda N (volta pro estoque e sai da comissão)\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -4656,9 +4661,23 @@ function resetVendasDoDia() {
 }
 
 // `dia` (ISO) é o dia da loja que está fechando. Às 3h é o de ontem.
+async function vendasDoDiaBanco(dia) {
+  try {
+    const d = await callRpc('bot_vendas_dia', { p_token: BOT_SYNC_TOKEN, p_dia: dia });
+    if (!d || d.ok === false || !Array.isArray(d.modelos)) return null;
+    return d.modelos.map(m => [m.modelo, Number(m.qtd) || 0]);
+  } catch (err) {
+    console.error('bot_vendas_dia:', err.message);
+    return null;
+  }
+}
+
 async function enviarResumoVendas(dia = ontemISO()) {
   const data = dia.split('-').reverse().join('/');
-  const entries = Object.entries(vendasDoDia).sort((a, b) => b[1] - a[1]);
+  // O banco é a fonte (sobrevive a reinício e já tira o que foi desfeito pelo
+  // /correção). Sem a RPC, cai no contador da memória, como era antes.
+  const doBanco = await vendasDoDiaBanco(dia);
+  const entries = (doBanco || Object.entries(vendasDoDia)).sort((a, b) => b[1] - a[1]);
   const linhas = ['📊 *RESUMO DE VENDAS – 015 PODS*', data, ''];
   if (!entries.length) {
     linhas.push('Nenhuma venda registrada hoje.');
@@ -4745,6 +4764,18 @@ app.post('/webhook', async (req, res) => {
     if (processedIds.has(updateId)) return;
     processedIds.add(updateId);
     if (processedIds.size > 1000) processedIds.clear();
+
+    // Mensagem EDITADA não roda de novo: o Telegram manda a edição com outro
+    // update_id, e refazer a baixa/consignado/anular/+DINHEIRO dobrava venda,
+    // estoque e comissão. Só avisa, nos grupos de movimento, o jeito certo.
+    if (!body.message) {
+      const t = (msg.text || msg.caption || '').trim();
+      const k = String(msg.chat && msg.chat.id);
+      if ((k === VENDAS_CHAT_ID || k === REPOSICAO_CHAT_ID) && /^[-+/]/.test(t)) {
+        await sendTelegram(msg.chat.id, '✏️ Editar a mensagem não muda nada no sistema. Se lançou errado, use `/correção` e lance de novo numa mensagem nova.');
+      }
+      return;
+    }
 
     const chatId = msg.chat.id;
     const text = (msg.text || msg.caption || '').trim();
@@ -4880,15 +4911,20 @@ app.post('/webhook', async (req, res) => {
     // mexer na venda ANTERIOR — pedido não debitado e comissão marcada errada.
     const { controle: controleAtacado, linhas: linhasSemControle } = separarControleAtacado(text);
     const temItem = linhasSemControle.some(l => l.charAt(0) === '-' || l.charAt(0) === '+');
+    // "Venda balcão\n-1 Ignite Grape": a 1ª linha é texto, mas tem item embaixo.
+    // Antes a mensagem inteira sumia calada. Linhas sem sinal são ignoradas.
+    const itemNoMeio = !isReposicao && !cmd.startsWith('/') && linhasSemControle.some(l => /^[-+]\s*\d/.test(l));
 
     // Movimentos com prefixo: cada grupo aceita só o seu sinal.
     //   VENDAS: só baixa (-). REPOSIÇÃO: só entrada (+). Privado: os dois.
-    if (text.charAt(0) === '-' || text.charAt(0) === '+' || (controleAtacado && temItem)) {
+    if (text.charAt(0) === '-' || text.charAt(0) === '+' || (controleAtacado && temItem) || itemNoMeio) {
       // Antes de qualquer parsing: nesses grupos nada de movimento é aceito —
       // nem baixa, nem entrada, nem despesa/dinheiro (que também usam "+").
       if (soComandos) { await sendTelegram(chatId, recusaSoComandos); return; }
 
-      const todas = linhasSemControle;
+      const todas = itemNoMeio && text.charAt(0) !== '-' && text.charAt(0) !== '+'
+        ? linhasSemControle.filter(l => l.charAt(0) === '-' || l.charAt(0) === '+')
+        : linhasSemControle;
 
       // Despesa ("+25 ENTREGA"), dinheiro ("+100 DINHEIRO") e os estornos dos
       // dois ("-25 ENTREGA", "-50 DINHEIRO") saem da fila ANTES do estoque: as
@@ -4950,6 +4986,13 @@ app.post('/webhook', async (req, res) => {
         'Pra lançar: `/atacado` e as linhas de baixa embaixo (`-2 Elfbar 30000 Cherry`).\n' +
         'Pra corrigir a última venda: mande `/atacado` sozinho.');
       if (msgComprovante) await handleComprovante(chatId, msgComprovante);
+      return;
+    }
+
+    // Foto/PDF com legenda livre ("pix do João") no grupo de vendas: é
+    // comprovante. Antes caía em nenhum caminho e o dinheiro sumia do caixa.
+    if (msgComprovante && !cmd.startsWith('/')) {
+      await handleComprovante(chatId, msgComprovante);
       return;
     }
 

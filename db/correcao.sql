@@ -92,3 +92,25 @@ revoke all on function public.bot_correcao_lista(text, jsonb) from public, anon,
 revoke all on function public.bot_correcao_desfazer(text, uuid, jsonb) from public, anon, authenticated;
 grant execute on function public.bot_correcao_lista(text, jsonb) to anon, service_role;
 grant execute on function public.bot_correcao_desfazer(text, uuid, jsonb) to anon, service_role;
+
+-- Resumo das 3h pelo banco (antes era um contador na memória do bot, que zerava a cada
+-- reinício). Mesma conta: toda baixa do bot no dia da loja, sem as desfeitas.
+create or replace function public.bot_vendas_dia(p_token text, p_dia date default null)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_tok text; v_dia date;
+begin
+  select value into v_tok from integration_config where key = 'bot_sync_token';
+  if v_tok is null or p_token is distinct from v_tok then
+    return jsonb_build_object('ok', false, 'erro', 'token inválido');
+  end if;
+  v_dia := coalesce(p_dia, public.dia_loja(now()));
+  return jsonb_build_object('ok', true, 'dia', v_dia,
+    'modelos', coalesce((select jsonb_agg(jsonb_build_object('modelo', modelo, 'qtd', q) order by q desc, modelo)
+      from (select m.name modelo, sum(si.qty)::int q
+              from sales s join sale_items si on si.sale_id = s.id
+              join flavors f on f.id = si.flavor_id join models m on m.id = f.model_id
+             where s.notes ilike 'bot telegram%' and s.status <> 'cancelada' and public.dia_loja(s.sold_at) = v_dia
+             group by m.name) x), '[]'::jsonb));
+end $$;
+revoke all on function public.bot_vendas_dia(text, date) from public, anon, authenticated;
+grant execute on function public.bot_vendas_dia(text, date) to anon, service_role;

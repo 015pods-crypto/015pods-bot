@@ -492,7 +492,12 @@ teste('/comissao de sócio: resumo do time e uma linha por vendedor', async (ctx
       ],
     },
   };
-  const [resp] = await mandar(ctx.webhook, update('/comissao', { nome: 'Lucas' }));
+  // No grupo de VENDAS (lido por todos) sai só o time, sem valor por vendedor.
+  const [grupo] = await mandar(ctx.webhook, update('/comissao', { nome: 'Lucas' }));
+  assert.ok(!grupo.text.includes('Rodrigo') && !grupo.text.includes('R$ 420,00'), grupo.text);
+  assert.ok(grupo.text.includes('R$ 540,00'), grupo.text);
+  // No privado, o detalhe por vendedor.
+  const [resp] = await mandar(ctx.webhook, update('/comissao', { nome: 'Lucas', chat: DONO, tipo: 'private' }));
   assert.ok(resp.text.includes('Pods no mês: *185*'), resp.text);
   assert.ok(resp.text.includes('Comissão total: *R$ 540,00*'), resp.text);
   assert.ok(resp.text.includes('• Rodrigo: 140 pods · R$ 420,00'), resp.text);
@@ -4710,6 +4715,47 @@ teste('/correção fora do grupo de vendas é recusado', async (ctx) => {
   const [resp] = await mandar(ctx.webhook, updateFat('/correção'));
   assert.ok(resp.text.includes('O /correção é no grupo de VENDAS'), resp.text);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_correcao_lista').length, 0);
+});
+
+// --- revisão do grupo de vendas (nov/2026) ----------------------------------
+
+teste('mensagem EDITADA não refaz a baixa (só avisa)', async (ctx) => {
+  const u = update('-1 Ignite 5500 Grape Ice');
+  u.edited_message = u.message; delete u.message;
+  const antes = enviadas.length;
+  await mandar(ctx.webhook, u, { esperaResposta: false });
+  const resp = enviadas.slice(antes).pop();
+  assert.ok(resp && resp.text.includes('Editar a mensagem não muda nada'), resp && resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('1ª linha de texto e baixa embaixo: a baixa entra (texto ignorado)', async (ctx) => {
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [{
+    status: 'ok', direction: 'baixa', model: 'Ignite 5500', flavor: 'Grape Ice', qty: 1, stock_after: 7 }] } };
+  await mandar(ctx.webhook, update('Venda balcão\n-1 Ignite 5500 Grape Ice'));
+  const rpc = chamadas.filter(c => c.fn === 'bot_movimentar_estoque');
+  assert.strictEqual(rpc.length, 1);
+  assert.deepStrictEqual(rpc[0].body.p_items, [{ produto: 'Ignite 5500 Grape Ice', qty: -1 }]);
+});
+
+teste('foto com legenda livre ("pix do João") é lida como comprovante', async (ctx) => {
+  configComFaturamento();
+  respostaGemini = { status: 200, body: geminiJson({ valor: 80, codigo: 'E999', pago_em: '2026-09-15T16:42:00', pagador: 'João', banco: 'Nubank', confianca: 'alta' }) };
+  respostas.bot_comprovante_registrar = REGISTRO_OK;
+  await mandar(ctx.webhook, updateArquivoDe({ caption: 'pix do João' }, GABRIEL));
+  assert.strictEqual(chamadasGemini.length, 1);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 1);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('resumo das 3h usa as vendas do banco (sobrevive a reinício)', async (ctx) => {
+  respostas.bot_vendas_dia = { status: 200, body: { ok: true, modelos: [{ modelo: 'Ignite V55', qtd: 4 }, { modelo: 'Elfbar 30000', qtd: 1 }] } };
+  respostas.bot_comissao = { status: 200, body: { ok: true, mes: '01/11 → 30/11', unidades_hoje: 5, unidades_mes: 50, taxa_atual: 2.5, comissao: 125 } };
+  await ctx.mod.enviarResumoVendas('2026-11-09');
+  const r = enviadas.find(e => String(e.chat_id) === String(GRUPO_VENDAS));
+  assert.ok(r.text.includes('Ignite V55 — 4 un'), r.text);
+  assert.ok(r.text.includes('Total: *5*'), r.text);
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_vendas_dia').body.p_dia, '2026-11-09');
 });
 
 // --- /consignado ---------------------------------------------------------
