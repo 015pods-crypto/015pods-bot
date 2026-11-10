@@ -43,6 +43,7 @@ const COMANDOS = [
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
   '/apagar', '/instrucoes', '/fechamento', '/consignado', '/troca', '/sou', '/meuid', '/idgrupo',
+  '/poddomes', '/poddomes_desfazer',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -799,7 +800,7 @@ function linhasQuebraAtacado(d) {
   ];
 }
 
-function formatComissao(d) {
+function formatComissao(d, refISO, pods = []) {
   const quebra = linhasQuebraAtacado(d);
   const linhas = [
     `📊 *Comissão — ${escapeMd(String(d.mes ?? ''))}*`,
@@ -815,7 +816,50 @@ function formatComissao(d) {
   } else {
     linhas.push(`🎯 Faltam *${d.faltam_para_proxima}* p/ faixa de R$ ${fmtBR(d.proxima_taxa)}`);
   }
+  linhas.push(...blocoPods(pods), ...blocoRitmo(d, refISO));
   return linhas.join('\n');
+}
+
+// Bloco "📈 Ritmo do mês" no fim da mensagem de comissão. Só LÊ os números da
+// bot_comissao: os pods já vêm só com o que conta para a comissão, então
+// tabacaria, consignado e pod do mês ficam de fora sem filtro nenhum aqui. A
+// faixa também é a do banco: pods da equipe + faltam_para_proxima.
+// Sem bloco fora do período (ex.: consulta de um mês passado): "dia X de Y" só
+// faz sentido dentro do mês que a resposta descreve.
+function blocoRitmo(d, refISO = hojeISO()) {
+  const periodo = periodoDoCiclo(d, refISO);
+  if (!periodo) return [];
+  const hoje = new Date(`${refISO}T00:00:00Z`);
+  if (hoje < periodo.inicio || hoje > periodo.fim) return [];
+
+  const totalDias = diasEntre(periodo.inicio, periodo.fim);
+  const diaAtual = diasEntre(periodo.inicio, hoje);
+  const media = pods => fmtBR((Number(pods) || 0) / diaAtual, 1);
+
+  // Pessoal e restrito trazem a equipe em time_*; nos demais, unidades_mes já é
+  // da equipe.
+  const podsEquipe = Number((d.pessoal || d.restrito) ? d.time_unidades_mes : d.unidades_mes) || 0;
+
+  const linhas = ['', `📈 *Ritmo do mês* (dia ${diaAtual} de ${totalDias})`];
+  if (d.pessoal) {
+    linhas.push(`${escapeMd(String(d.vendedor ?? ''))}: ${media(d.unidades_mes)} pods/dia`);
+  } else if (Array.isArray(d.vendedores)) {
+    for (const v of d.vendedores) {
+      linhas.push(`${escapeMd(String(v.nome ?? '?'))}: ${media(v.unidades_mes)} pods/dia`);
+    }
+  }
+  linhas.push(`Equipe: ${media(podsEquipe)} pods/dia`);
+  linhas.push(`No ritmo atual, a equipe fecha o mês com ~${Math.round(podsEquipe / diaAtual * totalDias)} pods`);
+
+  if (d.faltam_para_proxima == null) {
+    linhas.push('🔥 Equipe na faixa máxima');
+  } else {
+    const faltam = Number(d.faltam_para_proxima) || 0;
+    const diasRestantes = totalDias - diaAtual + 1; // contando hoje
+    linhas.push(
+      `🎯 Para a próxima faixa (${podsEquipe + faltam} pods): faltam ${faltam}, ou ${fmtBR(faltam / diasRestantes, 1)} pods/dia até o fim do mês`);
+  }
+  return linhas;
 }
 
 // Linha de "quanto falta" — é sempre do TIME: a faixa sai do total de pods
@@ -849,7 +893,7 @@ function linhasVendedores(d) {
 //   restrito   -> Telegram não ligado: aviso + só os números do time
 //   vendedores -> sócio: resumo do time + uma linha por vendedor
 // Sem nenhum dos três (resposta sem p_meta), cai no formato antigo.
-function formatComissaoPorQuem(d) {
+function formatComissaoPorQuem(d, pods = []) {
   const mes = d.mes ? escapeMd(String(d.mes)) : '';
   if (d.pessoal) {
     const linhas = [
@@ -863,6 +907,8 @@ function formatComissaoPorQuem(d) {
       linhaFaltamTime(d),
     ];
     if (d.fecha_hoje) linhas.push('📅 O mês fecha hoje');
+    // Como o resto desta resposta: só o que é do próprio vendedor.
+    linhas.push(...blocoPods(pods.filter(p => p.vendedor === d.vendedor)), ...blocoRitmo(d));
     return linhas.join('\n');
   }
   if (d.restrito) {
@@ -875,6 +921,7 @@ function formatComissaoPorQuem(d) {
       linhaFaltamTime(d),
     ];
     if (d.fecha_hoje) linhas.push('📅 O mês fecha hoje');
+    linhas.push(...blocoRitmo(d));
     return linhas.join('\n');
   }
   if (Array.isArray(d.vendedores)) {
@@ -888,19 +935,21 @@ function formatComissaoPorQuem(d) {
     ];
     linhas.push(...linhasVendedores(d));
     if (d.fecha_hoje) linhas.push('', '📅 O mês fecha hoje');
+    linhas.push(...blocoPods(pods), ...blocoRitmo(d));
     return linhas.join('\n');
   }
-  return formatComissao(d);
+  return formatComissao(d, undefined, pods);
 }
 
 // Texto do /comissao: a resposta é a de QUEM pergunta (`from`).
 async function textoComissao(from, chatId) {
   const d = await dadosComissao(null, metaUsuario(from));
   if (!d) return '⚠️ Erro ao consultar comissão.';
+  const pods = d.restrito ? [] : await dadosPodDoMes();
   // Grupo de VENDAS é lido por todos: valor por vendedor não sai lá (mesma
   // regra do fechamento). O detalhe fica pro privado/faturamento.
-  if (String(chatId) === VENDAS_CHAT_ID && !d.pessoal && Array.isArray(d.vendedores)) return formatComissao(d);
-  return formatComissaoPorQuem(d);
+  if (String(chatId) === VENDAS_CHAT_ID && !d.pessoal && Array.isArray(d.vendedores)) return formatComissao(d, undefined, pods);
+  return formatComissaoPorQuem(d, pods);
 }
 
 // Bloco do resumo diário: no último dia do período (fecha_hoje=true) vira
@@ -911,8 +960,10 @@ async function textoComissao(from, chatId) {
 async function textoComissaoRelatorio(dia) {
   const d = await dadosComissao(dia);
   if (!d) return '⚠️ Erro ao consultar comissão.';
-  if (d.fecha_hoje) return montarFechamentoTime(d);
-  return formatComissao(d);
+  const pods = await dadosPodDoMes(dia);
+  // No fechamento, os pods do mês todo; no resumo de um dia, só os daquele dia.
+  if (d.fecha_hoje) return montarFechamentoTime(d, { pods });
+  return formatComissao(d, dia, pods.filter(p => p.dia === dia));
 }
 
 // Acerto do ciclo: dinheiro em mãos do Rod − (comissão do Rod + despesas).
@@ -1030,6 +1081,7 @@ function montarFechamentoTime(d, opts = {}) {
   return [
     opts.titulo || `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`,
     ...linhasComissaoTime(d),
+    ...linhasPods(opts.pods),
     opts.rodape || '_(o novo período já começou)_',
   ].join('\n');
 }
@@ -1041,6 +1093,7 @@ function montarFechamentoSocio(d, desp, dinh, opts = {}) {
     opts.titulo || `🔒 *FECHAMENTO DO PERÍODO ${escapeMd(String(d.mes ?? ''))}*`,
     ...linhasComissaoTime(d),
     ...linhasVendedores(d),
+    ...linhasPods(opts.pods),
     '',
     ...linhasAcertoRod(d, desp, dinh),
   ];
@@ -1212,6 +1265,7 @@ async function handleFechamentoParcial(chatId, from) {
   linhas.push('');
   linhas.push(...linhasComissaoTime(com, { rotuloTotal: 'Pods até agora', rotuloFaixa: 'Faixa atual' }));
   linhas.push(...linhasVendedores(com));
+  linhas.push(...linhasPods(await dadosPodDoMes()));
   linhas.push('');
   linhas.push(...linhasAcertoRod(com, desp, dinh, { detalharDespesas: true, ateAgora: true }));
   linhas.push('', '_Parcial: os números ainda mudam até o fechamento das 3h depois do último dia._');
@@ -1293,14 +1347,16 @@ async function handleRefazerFechamento(chatId, text, from) {
 
   const [, mes, dia] = data.split('-');
   const titulo = `🔁 *FECHAMENTO CORRIGIDO — ${escapeMd(String(d.mes ?? ''))}*`;
+  const pods = await dadosPodDoMes(data);
   // O grupo de vendas recebe o mesmo formato do fechamento automático: só o
   // time. O detalhe por vendedor e o acerto vão só pra quem pediu.
   await sendTelegram(VENDAS_CHAT_ID, montarFechamentoTime(d, {
     titulo,
+    pods,
     rodape: `_Novo corte: fim do dia ${dia}/${mes} (2h59 da madrugada seguinte). Substitui o fechamento anterior._`,
   }));
   if (String(chatId) !== VENDAS_CHAT_ID) {
-    const detalhe = montarFechamentoSocio(d, await dadosRegistrosRod(data), await dadosRegistrosRod(data, 'dinheiro'), { titulo });
+    const detalhe = montarFechamentoSocio(d, await dadosRegistrosRod(data), await dadosRegistrosRod(data, 'dinheiro'), { titulo, pods });
     await sendTelegram(chatId, `${detalhe}\n\n✅ Correção (só o time) publicada no grupo de vendas.`);
   }
 }
@@ -4333,6 +4389,144 @@ async function enviarLembreteTarefas() {
 }
 
 // ---------------------------------------------------------------------------
+// /poddomes — 1 pod por mês, de graça, para cada vendedor
+//
+// Só uma saída de estoque: não passa por `sales`, então não entra em
+// faturamento, comissão nem meta. Quem decide tudo é o banco, na mesma
+// transação da baixa (db/pod-do-mes.sql): dono, limite do mês e se é pod. Aqui
+// fica só o que é da mensagem: a quantidade digitada e os textos.
+// ---------------------------------------------------------------------------
+
+const NOMES_MESES = ['janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho', 'julho',
+  'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'];
+const nomeMes = iso => NOMES_MESES[parseInt(String(iso).slice(5, 7), 10) - 1] || '';
+const diaMesBR = iso => `${String(iso).slice(8, 10)}/${String(iso).slice(5, 7)}`;
+
+const AVISO_POD_UMA_UNIDADE = '🎁 O pod do mês é sempre 1 unidade. Mande só um produto, sem quantidade: `/poddomes Ignite V55 Grape Ice`';
+const AVISO_POD_SO_VENDEDOR = '⛔ O pod do mês é só para vendedor cadastrado. Se você é vendedor, mande /sou SeuNome uma vez.';
+
+// { produto } ou { invalida: true }. Quantidade na frente ("2 ignite", "2x
+// ignite", "-1 ignite") ou no fim ("ignite x2"); só 1 passa. Só até 2 dígitos,
+// para não confundir com um número que faça parte do nome do produto.
+function parsePodDoMes(texto) {
+  const linhas = String(texto || '').replace(/^\/poddomes(@\S+)?/i, '').split('\n')
+    .map(l => l.trim()).filter(Boolean);
+  if (linhas.length > 1) return { invalida: true };
+  let produto = linhas[0] || '';
+  const frente = produto.match(/^[-+]?\s*(\d{1,2})\s*x?\s+(\S.*)$/i);
+  if (frente) {
+    if (parseInt(frente[1], 10) !== 1) return { invalida: true };
+    produto = frente[2].trim();
+  }
+  const fim = produto.match(/\s(?:x\s*(\d{1,2})|(\d{1,2})\s*x)$/i);
+  if (fim) {
+    if (parseInt(fim[1] || fim[2], 10) !== 1) return { invalida: true };
+    produto = produto.slice(0, fim.index).trim();
+  }
+  return { produto };
+}
+
+function textoPodJaUsado(d) {
+  return `Você já pegou seu pod do mês de ${nomeMes(d.mes)}: ${escapeMd(String(d.produto))}, no dia ${diaMesBR(d.dia)}. O próximo libera dia ${diaMesBR(d.proximo)}.`;
+}
+
+// Nunca lança: sem a lista, a mensagem de comissão sai igual, só sem a linha 🎁.
+async function dadosPodDoMes(ref) {
+  try {
+    const body = { p_token: BOT_SYNC_TOKEN };
+    if (ref) body.p_ref = ref;
+    const d = await callRpc('bot_pod_do_mes_lista', body);
+    return d && Array.isArray(d.itens) ? d.itens : [];
+  } catch (err) {
+    console.error('bot_pod_do_mes_lista:', err.message);
+    return [];
+  }
+}
+
+function linhasPods(pods) {
+  return (pods || []).map(p =>
+    `🎁 Pod do mês: ${escapeMd(String(p.vendedor ?? '?'))} (${escapeMd(String(p.produto ?? ''))})`);
+}
+
+function blocoPods(pods) {
+  const linhas = linhasPods(pods);
+  return linhas.length ? ['', ...linhas] : [];
+}
+
+async function handlePodDoMes(chatId, text, from) {
+  const { produto, invalida } = parsePodDoMes(text);
+  if (invalida) { await sendTelegram(chatId, AVISO_POD_UMA_UNIDADE); return; }
+
+  let d = null;
+  try {
+    d = produto
+      ? await callRpc('bot_pod_do_mes', { p_token: BOT_SYNC_TOKEN, p_produto: produto, p_meta: metaUsuario(from) })
+      : await callRpc('bot_pod_do_mes_status', { p_token: BOT_SYNC_TOKEN, p_meta: metaUsuario(from) });
+  } catch (err) {
+    console.error('bot_pod_do_mes:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC do pod do mês não existe no banco — falta rodar o SQL (db/pod-do-mes.sql).'
+      : '⚠️ Erro ao registrar o pod do mês. Nada foi tirado do estoque.');
+    return;
+  }
+  const status = d && d.status;
+
+  if (status === 'nao_vendedor') { await sendTelegram(chatId, AVISO_POD_SO_VENDEDOR); return; }
+  if (status === 'ja_usou' || status === 'usado') { await sendTelegram(chatId, textoPodJaUsado(d)); return; }
+  if (status === 'disponivel') {
+    await sendTelegram(chatId, `Seu pod do mês de ${nomeMes(d.mes)} ainda está disponível 🎁`);
+    return;
+  }
+  if (status === 'nao_pod') {
+    await sendTelegram(chatId, `🎁 O pod do mês é só para pod. ${escapeMd(`${d.model} ${d.flavor}`)} não é pod. Nada foi tirado do estoque.`);
+    return;
+  }
+  if (status === 'ok') {
+    const texto = `🎁 Pod do mês do ${escapeMd(String(d.vendedor))} registrado: ${escapeMd(String(d.produto))}. Saiu 1 do estoque, sem comissão. Próximo só em ${nomeMes(d.proximo)}.`;
+    await sendTelegram(chatId, texto);
+    // O pod já saiu: uma falha neste aviso não pode virar "erro ao registrar".
+    try { await enviarFaturamento(texto); }
+    catch (err) { console.error('aviso do pod do mês no faturamento:', err.message); }
+    return;
+  }
+  // Não encontrado, ambíguo e sem estoque: as mesmas mensagens da baixa.
+  await sendTelegram(chatId, `❌ ${escapeMd(mapResultado(d, 'baixa').msg)}`);
+}
+
+async function handlePodDoMesDesfazer(chatId, text, from) {
+  const nome = String(text || '').replace(/^\/poddomes_desfazer(@\S+)?/i, '').trim();
+  if (!nome) { await sendTelegram(chatId, 'Uso: `/poddomes_desfazer Rodrigo`'); return; }
+
+  let d = null;
+  try {
+    d = await callRpc('bot_pod_do_mes_desfazer', { p_token: BOT_SYNC_TOKEN, p_vendedor: nome, p_meta: metaUsuario(from) });
+  } catch (err) {
+    console.error('bot_pod_do_mes_desfazer:', err.message);
+    await sendTelegram(chatId, rpcAusente(err.message)
+      ? '⚠️ A RPC do pod do mês não existe no banco — falta rodar o SQL (db/pod-do-mes.sql).'
+      : '⚠️ Erro ao desfazer o pod do mês. O estoque não foi alterado.');
+    return;
+  }
+  const status = d && d.status;
+  if (status === 'nao_socio') { await sendTelegram(chatId, SO_SOCIOS); return; }
+  if (status === 'vendedor_nao_encontrado') {
+    const nomes = Array.isArray(d.nomes) ? d.nomes : [];
+    await sendTelegram(chatId, [`⚠️ Não achei o vendedor "${escapeMd(nome)}".`, ...(nomes.length
+      ? ['', 'Nomes possíveis:', ...nomes.map(n => `• ${escapeMd(String(n))}`)] : [])].join('\n'));
+    return;
+  }
+  if (status === 'nao_usou') {
+    await sendTelegram(chatId, `${escapeMd(String(d.vendedor))} não tem pod do mês de ${nomeMes(d.mes)} para desfazer.`);
+    return;
+  }
+  if (status === 'ok') {
+    await sendTelegram(chatId, `↩️ Pod do mês do ${escapeMd(String(d.vendedor))} desfeito: ${escapeMd(String(d.produto))}. Voltou 1 ao estoque e o pod de ${nomeMes(d.mes)} está liberado de novo.`);
+    return;
+  }
+  await sendTelegram(chatId, '⚠️ Erro ao desfazer o pod do mês.');
+}
+
+// ---------------------------------------------------------------------------
 // /consignado — tira do estoque SEM virar venda
 //
 // Produto que sai em consignação (fica com alguém, volta ou é acertado depois)
@@ -4646,7 +4840,7 @@ async function handleCorrecao(chatId, text, from) {
     `_${Number(r.unidades) === 1 ? '1 item voltou' : `${Number(r.unidades) || 'Os'} itens voltaram`} pro estoque e saíram da comissão._`);
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n↩️ */desanular N* — Desfaz um /anular (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado` (quem marcou, o dono ou o Rodrigo)\n🛠️ */correção* — lista suas vendas de hoje; `/correção N` desfaz a venda N (volta pro estoque e sai da comissão)\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n↩️ */desanular N* — Desfaz um /anular (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado` (quem marcou, o dono ou o Rodrigo)\n🛠️ */correção* — lista suas vendas de hoje; `/correção N` desfaz a venda N (volta pro estoque e sai da comissão)\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n🎁 */poddomes* `Ignite V55 Grape Ice` — seu pod grátis do mês (1 por mês, sem comissão). Sem produto: mostra se já usou\n↩️ */poddomes\\_desfazer* `Rodrigo` — desfaz o pod do mês (só sócios)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -5050,6 +5244,22 @@ app.post('/webhook', async (req, res) => {
       await handleTraduzir(chatId, text.replace(/^\/traduzir(@\S+)?[ \t]*/i, ''));
       return;
     }
+    if (cmd === '/poddomes') {
+      if (!isVendas && !isPrivadoLucas) {
+        await sendTelegram(chatId, '🎁 O /poddomes é no grupo de VENDAS.');
+        return;
+      }
+      if (body.message) await handlePodDoMes(chatId, text, msg.from); // editar não conta como novo pedido
+      return;
+    }
+    if (cmd === '/poddomes_desfazer') {
+      if (!isVendas && !isPrivadoLucas && !isFaturamento) {
+        await sendTelegram(chatId, '🎁 O /poddomes\\_desfazer é no grupo de VENDAS ou de FATURAMENTO.');
+        return;
+      }
+      if (body.message) await handlePodDoMesDesfazer(chatId, text, msg.from);
+      return;
+    }
     if (ehComandoCorrecao(cmd)) {
       if (!isVendas && !isPrivadoLucas) {
         await sendTelegram(chatId, '🛠️ O /correção é no grupo de VENDAS.');
@@ -5236,6 +5446,9 @@ module.exports = {
   parseTroca,
   handleTroca,
   trocasSemMotivo,
+  parsePodDoMes,
+  handlePodDoMes,
+  handlePodDoMesDesfazer,
   diaLojaISO,
   hojeISO,
   ontemISO,
@@ -5262,6 +5475,9 @@ module.exports = {
   parseUnidadesComando,
   textoComissao,
   textoComissaoRelatorio,
+  blocoRitmo,
+  formatComissao,
+  formatComissaoPorQuem,
   handleMovimentos,
   parseMovimentoLine,
   parseLinhaReposicaoSemPrefixo,

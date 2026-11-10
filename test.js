@@ -4843,6 +4843,87 @@ teste('/consignado sem a função no banco diz qual SQL falta', async (ctx) => {
 
 // --- Runner ----------------------------------------------------------------
 
+// --- Ritmo do mês (média de pods/dia na mensagem de comissão) ---------------
+const RITMO_NOV = {
+  ok: true, pessoal: true, vendedor: 'Rodrigo', mes: '01/11 → 30/11',
+  unidades_mes: 30, unidades_hoje: 5, unidades_varejo: 30, unidades_atacado: 0,
+  taxa_atual: 2, comissao: 60, time_unidades_mes: 48, time_unidades_hoje: 8,
+  faltam_para_proxima: 352, proxima_taxa: 2.5, fecha_hoje: false,
+};
+
+teste('ritmo: meio do mês, com o vendedor, a equipe, a projeção e a faixa', async (ctx) => {
+  assert.deepStrictEqual(ctx.mod.blocoRitmo(RITMO_NOV, '2026-11-04'), [
+    '',
+    '📈 *Ritmo do mês* (dia 4 de 30)',
+    'Rodrigo: 7,5 pods/dia',
+    'Equipe: 12,0 pods/dia',
+    'No ritmo atual, a equipe fecha o mês com ~360 pods',
+    // 352 pods em 27 dias (do dia 4 ao 30, contando hoje).
+    '🎯 Para a próxima faixa (400 pods): faltam 352, ou 13,0 pods/dia até o fim do mês',
+  ]);
+});
+
+teste('ritmo: no dia 1 a média é o próprio dia', async (ctx) => {
+  const b = ctx.mod.blocoRitmo({ ...RITMO_NOV, unidades_mes: 6, time_unidades_mes: 10, faltam_para_proxima: 390 }, '2026-11-01');
+  assert.strictEqual(b[1], '📈 *Ritmo do mês* (dia 1 de 30)');
+  assert.ok(b.includes('Rodrigo: 6,0 pods/dia'), b.join('\n'));
+  assert.ok(b.includes('Equipe: 10,0 pods/dia'), b.join('\n'));
+  assert.ok(b.includes('No ritmo atual, a equipe fecha o mês com ~300 pods'), b.join('\n'));
+  assert.ok(b.includes('🎯 Para a próxima faixa (400 pods): faltam 390, ou 13,0 pods/dia até o fim do mês'), b.join('\n'));
+});
+
+teste('ritmo: no último dia tudo que falta cabe em hoje', async (ctx) => {
+  const b = ctx.mod.blocoRitmo({ ...RITMO_NOV, unidades_mes: 180, time_unidades_mes: 390, faltam_para_proxima: 10 }, '2026-11-30');
+  assert.strictEqual(b[1], '📈 *Ritmo do mês* (dia 30 de 30)');
+  assert.ok(b.includes('Rodrigo: 6,0 pods/dia'), b.join('\n'));
+  assert.ok(b.includes('Equipe: 13,0 pods/dia'), b.join('\n'));
+  assert.ok(b.includes('No ritmo atual, a equipe fecha o mês com ~390 pods'), b.join('\n'));
+  assert.ok(b.includes('🎯 Para a próxima faixa (400 pods): faltam 10, ou 10,0 pods/dia até o fim do mês'), b.join('\n'));
+});
+
+teste('ritmo: na faixa máxima não fala em próxima faixa', async (ctx) => {
+  const b = ctx.mod.blocoRitmo({ ...RITMO_NOV, faltam_para_proxima: null, proxima_taxa: null }, '2026-11-04');
+  assert.strictEqual(b[b.length - 1], '🔥 Equipe na faixa máxima');
+  assert.ok(!b.join('\n').includes('próxima faixa'), b.join('\n'));
+});
+
+teste('ritmo: sócio vê uma linha por vendedor; sem p_meta e restrito, só a equipe', async (ctx) => {
+  const time = { ok: true, mes: '01/11 → 30/11', unidades_mes: 48, unidades_hoje: 8, taxa_atual: 2, comissao: 96, faltam_para_proxima: 352, proxima_taxa: 2.5 };
+  const socio = ctx.mod.blocoRitmo({ ...time, vendedores: [{ nome: 'Rodrigo', unidades_mes: 30 }, { nome: 'Gabriel', unidades_mes: 18 }] }, '2026-11-04');
+  assert.ok(socio.includes('Rodrigo: 7,5 pods/dia') && socio.includes('Gabriel: 4,5 pods/dia'), socio.join('\n'));
+  const soTime = ctx.mod.blocoRitmo(time, '2026-11-04');
+  assert.ok(soTime.includes('Equipe: 12,0 pods/dia') && soTime.length === 5, soTime.join('\n'));
+  const restrito = ctx.mod.blocoRitmo({ ...time, restrito: true, unidades_mes: undefined, time_unidades_mes: 48 }, '2026-11-04');
+  assert.ok(restrito.includes('Equipe: 12,0 pods/dia') && restrito.length === 5, restrito.join('\n'));
+});
+
+teste('ritmo: fora do período da resposta não sai bloco', async (ctx) => {
+  assert.deepStrictEqual(ctx.mod.blocoRitmo(RITMO_NOV, '2026-12-01'), []);
+  assert.deepStrictEqual(ctx.mod.blocoRitmo({ ...RITMO_NOV, mes: 'sem período' }, '2026-11-04'), []);
+});
+
+teste('ritmo: entra no fim do /comissao de hoje, sem mudar o que já existia', async (ctx) => {
+  const hoje = ctx.mod.hojeISO();
+  const [ano, m] = hoje.split('-').map(Number);
+  const ultimo = new Date(Date.UTC(ano, m, 0)).getUTCDate();
+  const mm = String(m).padStart(2, '0');
+  const d = { ...RITMO_NOV, mes: `01/${mm} → ${ultimo}/${mm}` };
+  respostas.bot_comissao = { status: 200, body: d };
+  const [resp] = await mandar(ctx.webhook, updateDe('/comissao', GABRIEL));
+  const antes = resp.text.split('\n\n📈')[0];
+  assert.ok(resp.text.includes('📈 *Ritmo do mês*'), resp.text);
+  assert.ok(antes.includes('Sua comissão: *R$ 60,00*') && antes.includes('Faltam 352 pods do time'), resp.text);
+});
+
+teste('ritmo: resumo das 3h usa o dia que fechou; o fechamento não muda', async (ctx) => {
+  respostas.bot_comissao = { status: 200, body: { ok: true, mes: '01/11 → 30/11', unidades_mes: 48, unidades_hoje: 8, taxa_atual: 2, comissao: 96, faltam_para_proxima: 352, proxima_taxa: 2.5, fecha_hoje: false } };
+  const texto = await ctx.mod.textoComissaoRelatorio('2026-11-04');
+  assert.ok(texto.includes('*Ritmo do mês* (dia 4 de 30)'), texto);
+  respostas.bot_comissao = { status: 200, body: { ok: true, mes: '01/11 → 30/11', unidades_mes: 400, taxa_atual: 3, comissao: 1200, faltam_para_proxima: null, fecha_hoje: true } };
+  const fechamento = await ctx.mod.textoComissaoRelatorio('2026-11-30');
+  assert.ok(fechamento.includes('FECHAMENTO') && !fechamento.includes('Ritmo'), fechamento);
+});
+
 async function main() {
   const falsos = await subirFalsos();
 
