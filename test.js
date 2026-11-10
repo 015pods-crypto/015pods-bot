@@ -2395,6 +2395,32 @@ function updateArquivoDe(opts, from) {
   return u;
 }
 
+teste('/stories com foto: manda o print pro banco, fica pendente e não mostra valor no grupo', async (ctx) => {
+  respostas.bot_stories_registrar = { status: 200, body: { ok: true, id: 7, vendedor: 'Gabriel', valor: 15, pendentes: 1 } };
+  const [resp] = await mandar(ctx.webhook, updateArquivoDe({ caption: '/stories story da promo' }, GABRIEL));
+  const rpc = chamadas.filter(c => c.fn === 'bot_stories_registrar');
+  assert.strictEqual(rpc.length, 1, 'deveria registrar o stories uma vez');
+  assert.ok(rpc[0].body.p_imagem.startsWith('data:image/jpeg;base64,'), 'imagem em base64');
+  assert.strictEqual(rpc[0].body.p_meta.legenda, 'story da promo');
+  assert.strictEqual(rpc[0].body.p_meta.user_id, String(GABRIEL.id));
+  assert.ok(resp.text.includes('Stories recebido, Gabriel'), resp.text);
+  assert.strictEqual(chamadasGemini.length, 0, 'stories não é comprovante');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_comprovante_registrar').length, 0);
+  vendasSemValor();
+});
+
+teste('/stories sem foto: explica como mandar e não grava nada', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('/stories', { from: GABRIEL.id }));
+  assert.ok(resp.text.includes('print do stories'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_stories_registrar').length, 0);
+});
+
+teste('/stories de Telegram sem vendedor: mostra o erro do banco', async (ctx) => {
+  respostas.bot_stories_registrar = { status: 200, body: { ok: false, erro: 'Seu Telegram não está ligado a um vendedor. Mande /sou SeuNome.' } };
+  const [resp] = await mandar(ctx.webhook, updateArquivoDe({ caption: '/stories' }, { id: 4242 }));
+  assert.ok(resp.text.includes('/sou SeuNome'), resp.text);
+});
+
 teste('foto de comprovante: lida e registrada; leitura e total do dia só no faturamento', async (ctx) => {
   configComFaturamento();
   respostaGemini = {

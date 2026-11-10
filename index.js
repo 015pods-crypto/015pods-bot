@@ -43,7 +43,7 @@ const COMANDOS = [
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
   '/apagar', '/instrucoes', '/fechamento', '/consignado', '/troca', '/sou', '/meuid', '/idgrupo',
-  '/poddomes', '/poddomes_desfazer',
+  '/poddomes', '/poddomes_desfazer', '/stories',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -4761,6 +4761,50 @@ async function handleMotivoTroca(chatId, text, ids, chave) {
 const CORRECAO_LISTA_MS = 30 * 60 * 1000;
 const correcaoListada = new Map(); // `${chatId}:${userId}` -> { at, vendas: [{ sale_id, hora, itens }] }
 
+// /stories: o vendedor manda o PRINT do stories (foto) com /stories na legenda.
+// Fica pendente até um sócio aprovar no sistema (tela Bônus da equipe); aprovado,
+// soma o valor do stories no ganho do mês dele. No grupo de vendas não aparece valor.
+async function handleStories(chatId, msg) {
+  const arq = arquivoComprovante(msg);
+  if (!arq || !String(arq.mime).startsWith('image/')) {
+    await sendTelegram(chatId, '📸 Mande o print do stories como *foto*, com /stories na legenda.');
+    return;
+  }
+  if (arq.size > 2_000_000) {
+    await sendTelegram(chatId, '📸 Esse print ficou grande demais. Mande como foto normal (não como arquivo).');
+    return;
+  }
+  let imagem;
+  try {
+    const buf = await baixarArquivoTelegram(arq.fileId);
+    imagem = `data:${arq.mime};base64,${buf.toString('base64')}`;
+  } catch (e) {
+    console.error('stories: download', e.message);
+    await sendTelegram(chatId, '⚠️ Não consegui baixar o print. Mande de novo.');
+    return;
+  }
+  const legenda = String(msg.caption || '').replace(/^\/stories\S*\s*/i, '').trim();
+  let r;
+  try {
+    r = await callRpc('bot_stories_registrar', {
+      p_token: BOT_SYNC_TOKEN,
+      p_imagem: imagem,
+      p_meta: { chat_id: chatId, message_id: msg.message_id, legenda: legenda || undefined, ...metaUsuario(msg.from) },
+    });
+  } catch (e) {
+    console.error('stories: rpc', e.message);
+    await sendTelegram(chatId, '⚠️ Não consegui registrar o stories agora. Tente de novo em instantes.');
+    return;
+  }
+  if (!r || r.ok === false) {
+    await sendTelegram(chatId, `⚠️ ${(r && r.erro) || 'Não consegui registrar o stories.'}`);
+    return;
+  }
+  await sendTelegram(chatId,
+    `📸 Stories recebido, ${r.vendedor}! Fica pendente até um sócio aprovar no sistema.` +
+    ' Aprovado, entra no seu ganho do mês.');
+}
+
 function ehComandoCorrecao(cmd) {
   const c = String(cmd || '').normalize('NFD').replace(/[̀-ͯ]/g, '');
   return c === '/correcao' || c === '/corrigir';
@@ -4840,7 +4884,7 @@ async function handleCorrecao(chatId, text, from) {
     `_${Number(r.unidades) === 1 ? '1 item voltou' : `${Number(r.unidades) || 'Os'} itens voltaram`} pro estoque e saíram da comissão._`);
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n↩️ */desanular N* — Desfaz um /anular (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado` (quem marcou, o dono ou o Rodrigo)\n🛠️ */correção* — lista suas vendas de hoje; `/correção N` desfaz a venda N (volta pro estoque e sai da comissão)\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n🎁 */poddomes* `Ignite V55 Grape Ice` — seu pod grátis do mês (1 por mês, sem comissão). Sem produto: mostra se já usou\n↩️ */poddomes\\_desfazer* `Rodrigo` — desfaz o pod do mês (só sócios)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n↩️ */desanular N* — Desfaz um /anular (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado` (quem marcou, o dono ou o Rodrigo)\n🛠️ */correção* — lista suas vendas de hoje; `/correção N` desfaz a venda N (volta pro estoque e sai da comissão)\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 */stories* — mande o print do stories como foto, com /stories na legenda (vale bônus quando um sócio aprovar)\n🎁 */poddomes* `Ignite V55 Grape Ice` — seu pod grátis do mês (1 por mês, sem comissão). Sem produto: mostra se já usou\n↩️ */poddomes\\_desfazer* `Rodrigo` — desfaz o pod do mês (só sócios)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -5258,6 +5302,14 @@ app.post('/webhook', async (req, res) => {
         return;
       }
       if (body.message) await handlePodDoMesDesfazer(chatId, text, msg.from);
+      return;
+    }
+    if (cmd === '/stories') {
+      if (!isVendas && msg.chat.type !== 'private') {
+        await sendTelegram(chatId, '📸 O /stories é no grupo de VENDAS (ou no privado com o bot).');
+        return;
+      }
+      if (body.message) await handleStories(chatId, msg);
       return;
     }
     if (ehComandoCorrecao(cmd)) {
