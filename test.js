@@ -4658,6 +4658,60 @@ teste('/troca fora dos grupos de vendas e reposição é recusado', async (ctx) 
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_troca').length, 0);
 });
 
+// --- /correção --------------------------------------------------------------
+
+const VENDAS_CORRECAO = [
+  { sale_id: 'v-2', hora: '14:32', itens: '2x Ignite V55 Grape Ice', vendedor: 'Gabriel', atacado: false },
+  { sale_id: 'v-1', hora: '11:05', itens: '1x Elfbar 30000 Cherry', vendedor: 'Gabriel', atacado: false },
+];
+
+teste('/correção sozinho lista as vendas numeradas e não muda nada', async (ctx) => {
+  respostas.bot_correcao_lista = { status: 200, body: { ok: true, socio: false, vendas: VENDAS_CORRECAO } };
+  const [resp] = await mandar(ctx.webhook, update('/correção'));
+  mostrar('CORREÇÃO LISTA', resp.text);
+  assert.ok(resp.text.includes('*1.* 14:32 — 2x Ignite V55 Grape Ice'), resp.text);
+  assert.ok(resp.text.includes('*2.* 11:05 — 1x Elfbar 30000 Cherry'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_correcao_desfazer').length, 0);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
+teste('/correção N desfaz pelo id da lista (sem acento também vale)', async (ctx) => {
+  respostas.bot_correcao_lista = { status: 200, body: { ok: true, socio: false, vendas: VENDAS_CORRECAO } };
+  respostas.bot_correcao_desfazer = { status: 200, body: { ok: true, hora: '11:05', itens: '1x Elfbar 30000 Cherry', unidades: 1, modelos: [{ modelo: 'Elfbar 30000', qtd: 1 }] } };
+  await mandar(ctx.webhook, update('/correção'));
+  const [resp] = await mandar(ctx.webhook, update('/correcao 2'));
+  mostrar('CORREÇÃO DESFEITA', resp.text);
+  const rpc = chamadas.filter(c => c.fn === 'bot_correcao_desfazer');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_sale_id, 'v-1');
+  assert.ok(resp.text.startsWith('↩️ *Venda das 11:05 desfeita*'), resp.text);
+  assert.ok(resp.text.includes('1 item voltou pro estoque'), resp.text);
+});
+
+teste('/correção N sem lista aberta pede a lista; número fora da lista avisa', async (ctx) => {
+  const [semLista] = await mandar(ctx.webhook, update('/correção 1'));
+  assert.ok(semLista.text.includes('Mande `/correção` primeiro'), semLista.text);
+  respostas.bot_correcao_lista = { status: 200, body: { ok: true, socio: false, vendas: VENDAS_CORRECAO } };
+  await mandar(ctx.webhook, update('/correção'));
+  const [fora] = await mandar(ctx.webhook, update('/correção 5'));
+  assert.ok(fora.text.includes('Não existe o número 5'), fora.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_correcao_desfazer').length, 0);
+});
+
+teste('/correção: erro do banco (ex.: venda de outro vendedor) chega ao vendedor', async (ctx) => {
+  respostas.bot_correcao_lista = { status: 200, body: { ok: true, socio: false, vendas: VENDAS_CORRECAO } };
+  respostas.bot_correcao_desfazer = { status: 200, body: { ok: false, erro: 'Você só pode desfazer as suas vendas.' } };
+  await mandar(ctx.webhook, update('/correção'));
+  const [resp] = await mandar(ctx.webhook, update('/correção 1'));
+  assert.ok(resp.text.includes('Você só pode desfazer as suas vendas.'), resp.text);
+});
+
+teste('/correção fora do grupo de vendas é recusado', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, updateFat('/correção'));
+  assert.ok(resp.text.includes('O /correção é no grupo de VENDAS'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_correcao_lista').length, 0);
+});
+
 // --- /consignado ---------------------------------------------------------
 
 function consignadoOk(model, flavor, qty, before) {

@@ -38,7 +38,7 @@ const COMANDOS = [
   '/semana', '/reposicao', '/comissao', '/despesas', '/dinheiro', '/geral',
   '/anular', '/desanular', '/adicionar', '/refazerfechamento', '/versao',
   '/chatid', '/setgrupopedidos', '/fornecedor', '/apelido', '/pedido',
-  '/atacado', '/desatacado', '/caixa',
+  '/atacado', '/desatacado', '/caixa', '/correção', '/troca', '/consignado',
   '/setgrupofaturamento', '/faturamento', '/lembrete-teste',
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
@@ -235,6 +235,7 @@ async function palavrasDespesa() {
 function _resetEstadoTeste() {
   cacheConfig.clear();
   fornecedorPendente.clear();
+  correcaoListada.clear();
   ultimaMarcacao.clear();
   caixaListado.clear();
   lembreteChipsEnviado = '';
@@ -4549,7 +4550,98 @@ async function handleMotivoTroca(chatId, text, ids, chave) {
   await sendTelegram(chatId, `✅ Motivo da troca salvo: *${motivo === 'defeito' ? 'defeito' : 'outro'}*${detalhe ? ` (${escapeMd(detalhe)})` : ''}.`);
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
+// ---------------------------------------------------------------------------
+// /correção — desfazer uma venda lançada errado (grupo de vendas)
+//
+// "/correção" sozinho lista as vendas do dia de quem mandou (sócio vê as das
+// últimas 24h), numeradas. "/correção N" desfaz a venda N inteira: os itens
+// voltam pro estoque e a venda sai da comissão e do resumo do dia. Pra trocar
+// o sabor, desfaz e lança de novo. Sempre pelo id que veio da lista (igual ao
+// /caixa apagar): nunca "a última", que muda de alvo entre ler e digitar.
+// ---------------------------------------------------------------------------
+const CORRECAO_LISTA_MS = 30 * 60 * 1000;
+const correcaoListada = new Map(); // `${chatId}:${userId}` -> { at, vendas: [{ sale_id, hora, itens }] }
+
+function ehComandoCorrecao(cmd) {
+  const c = String(cmd || '').normalize('NFD').replace(/[̀-ͯ]/g, '');
+  return c === '/correcao' || c === '/corrigir';
+}
+
+function tirarDoResumoDoDia(modelos) {
+  for (const m of modelos || []) {
+    const k = m.modelo || '(sem modelo)';
+    if (vendasDoDia[k] == null) continue;
+    vendasDoDia[k] = Math.max(0, vendasDoDia[k] - (Number(m.qtd) || 0));
+    if (!vendasDoDia[k]) delete vendasDoDia[k];
+  }
+}
+
+async function handleCorrecao(chatId, text, from) {
+  const meta = metaUsuario(from);
+  const chave = `${chatId}:${meta.user_id}`;
+  const arg = (String(text || '').trim().split(/\s+/)[1] || '').trim();
+
+  if (!arg) {
+    let d;
+    try {
+      d = await callRpc('bot_correcao_lista', { p_token: BOT_SYNC_TOKEN, p_meta: meta });
+    } catch (err) {
+      console.error('bot_correcao_lista:', err.message);
+      await sendTelegram(chatId, rpcAusente(err.message)
+        ? '⚠️ A RPC `bot_correcao_lista` não existe no banco — falta rodar o db/correcao.sql.'
+        : '⚠️ Não consegui buscar as vendas. Tente de novo.');
+      return;
+    }
+    if (!d || d.ok === false) { await sendTelegram(chatId, `⚠️ ${escapeMd((d && d.erro) || 'Não consegui buscar as vendas.')}`); return; }
+    const vendas = Array.isArray(d.vendas) ? d.vendas : [];
+    if (!vendas.length) {
+      await sendTelegram(chatId, d.socio ? 'Nenhuma venda do bot nas últimas 24h.' : 'Você não tem venda lançada hoje.');
+      return;
+    }
+    correcaoListada.set(chave, { at: Date.now(), vendas });
+    const linhas = [d.socio ? '🛠️ *Vendas das últimas 24h*' : '🛠️ *Suas vendas de hoje*', ''];
+    vendas.forEach((v, i) => {
+      const quem = d.socio && v.vendedor ? ` · ${escapeMd(v.vendedor)}` : '';
+      linhas.push(`*${i + 1}.* ${escapeMd(String(v.hora || ''))}${quem} — ${escapeMd(String(v.itens || ''))}${v.atacado ? ' _(atacado)_' : ''}`);
+    });
+    linhas.push('', 'Pra desfazer uma venda lançada errado: `/correção N` (ex.: `/correção 1`).',
+      '_Os itens voltam pro estoque e saem da comissão. Depois é só lançar certo de novo._');
+    await sendTelegram(chatId, linhas.join('\n'));
+    return;
+  }
+
+  const n = /^\d+$/.test(arg) ? Number(arg) : NaN;
+  if (!n) {
+    await sendTelegram(chatId, 'Uso: `/correção` pra ver suas vendas de hoje, e `/correção N` pra desfazer a venda N.');
+    return;
+  }
+  const lista = correcaoListada.get(chave);
+  if (!lista || Date.now() - lista.at > CORRECAO_LISTA_MS) {
+    await sendTelegram(chatId, '⏳ Mande `/correção` primeiro pra ver a lista (ela vale 30 min).');
+    return;
+  }
+  const venda = lista.vendas[n - 1];
+  if (!venda) {
+    await sendTelegram(chatId, `❌ Não existe o número ${n} na lista. Mande \`/correção\` pra ver de novo.`);
+    return;
+  }
+  let r;
+  try {
+    r = await callRpc('bot_correcao_desfazer', { p_token: BOT_SYNC_TOKEN, p_sale_id: venda.sale_id, p_meta: meta });
+  } catch (err) {
+    console.error('bot_correcao_desfazer:', err.message);
+    await sendTelegram(chatId, '⚠️ Não consegui desfazer. Nada foi mudado; tente de novo.');
+    return;
+  }
+  if (!r || r.ok === false) { await sendTelegram(chatId, `⚠️ ${escapeMd((r && r.erro) || 'Não consegui desfazer.')}`); return; }
+  tirarDoResumoDoDia(r.modelos);
+  lista.vendas[n - 1] = { ...venda, desfeita: true, sale_id: null };
+  await sendTelegram(chatId,
+    `↩️ *Venda das ${escapeMd(String(r.hora || venda.hora || ''))} desfeita*\n${escapeMd(String(r.itens || venda.itens || ''))}\n` +
+    `_${Number(r.unidades) === 1 ? '1 item voltou' : `${Number(r.unidades) || 'Os'} itens voltaram`} pro estoque e saíram da comissão._`);
+}
+
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado`\n🛠️ */correção* — lista suas vendas de hoje; `/correção N` desfaz a venda N (volta pro estoque e sai da comissão)\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -4913,6 +5005,14 @@ app.post('/webhook', async (req, res) => {
         return;
       }
       await handleTraduzir(chatId, text.replace(/^\/traduzir(@\S+)?[ \t]*/i, ''));
+      return;
+    }
+    if (ehComandoCorrecao(cmd)) {
+      if (!isVendas && !isPrivadoLucas) {
+        await sendTelegram(chatId, '🛠️ O /correção é no grupo de VENDAS.');
+        return;
+      }
+      if (body.message) await handleCorrecao(chatId, text, msg.from);
       return;
     }
     if (cmd === '/troca') {
