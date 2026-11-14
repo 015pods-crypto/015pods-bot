@@ -250,12 +250,27 @@ function _esperarFixadaTeste() {
   return filaFixada;
 }
 
+// "+DESCONTO 20 cliente levou 5" (ou "+20 DESCONTO cliente levou 5"): desconto
+// combinado com o cliente na ÚLTIMA baixa de quem mandou. Só no "+" — no "-"
+// a linha continua sendo baixa/estorno como sempre.
+const RE_DESCONTO_1 = /^\+\s*DESCONTO\s*(\d+(?:[.,]\d{1,2})?)(?:\s+(.*\S))?\s*$/i;
+const RE_DESCONTO_2 = /^\+\s*(\d+(?:[.,]\d{1,2})?)\s+DESCONTO(?:\s+(.*\S))?\s*$/i;
+function parseDesconto(raw) {
+  if (!/^\+\s*(\d+(?:[.,]\d{1,2})?\s+)?DESCONTO\b/i.test(raw)) return null;
+  const m = raw.match(RE_DESCONTO_1) || raw.match(RE_DESCONTO_2);
+  const valor = m ? parseFloat(m[1].replace(',', '.')) : 0;
+  if (!m || !(valor > 0)) return { tipo: 'desconto', invalid: true, raw };
+  return { tipo: 'desconto', valor, motivo: (m[2] || '').trim(), raw };
+}
+
 // `palavras` é a lista já resolvida (o parser é síncrono de propósito: o
 // webhook busca a lista uma vez por mensagem e reusa em todas as linhas).
 function parseRegistroRod(line, palavras) {
   const raw = (line || '').trim();
   const sinal = raw.charAt(0);
   if (sinal !== '+' && sinal !== '-') return null;
+  const desconto = parseDesconto(raw);
+  if (desconto) return desconto;
   if (RE_DESPESA_ROD_SEM_DESC.test(raw)) return { invalid: true, raw };
 
   const m = raw.match(RE_VALOR_PALAVRA);
@@ -1176,6 +1191,93 @@ async function handleRegistrosRod(chatId, registros, meta) {
     }
   }
   if (respostas.length) await sendTelegram(chatId, respostas.join('\n'));
+}
+
+const USO_DESCONTO = 'Uso: `+DESCONTO 20 cliente levou 5`, logo depois da venda.';
+
+// +DESCONTO: liga o desconto à última baixa de quem mandou (o banco acha a
+// baixa, grava quem, quanto e o motivo). Sai da falta do Saiu x entrou.
+async function handleDescontos(chatId, itens, meta) {
+  const respostas = [];
+  for (const d of itens) {
+    if (d.invalid) { respostas.push(`❌ Não entendi \`${escapeMd(d.raw)}\`. ${USO_DESCONTO}`); continue; }
+    let r = null;
+    try {
+      r = await callRpc('bot_desconto_registrar', {
+        p_token: BOT_SYNC_TOKEN, p_valor: d.valor, p_motivo: d.motivo, p_meta: meta || {},
+      });
+    } catch (err) {
+      console.error('bot_desconto_registrar:', err.message);
+    }
+    if (r && r.ok) {
+      respostas.push(`🏷️ Desconto de R$ ${fmtValor(r.desconto)} anotado na venda das ${escapeMd(r.hora)} ` +
+        `(${escapeMd(r.descricao)}). A receber: R$ ${fmtValor(r.a_receber)}` +
+        (d.motivo ? ` · ${escapeMd(d.motivo)}` : ''));
+    } else if (r && r.erro === 'sem_baixa') {
+      respostas.push('⚠️ Não achei venda sua nas últimas 12 horas para pôr o desconto. Lance a venda primeiro.');
+    } else if (r && r.erro === 'maior') {
+      respostas.push(`⚠️ O desconto (R$ ${fmtValor(d.valor)}) é maior que a venda das ${escapeMd(r.hora)} (R$ ${fmtValor(r.valor_baixa)}). Nada foi anotado.`);
+    } else {
+      respostas.push(`⚠️ Não consegui anotar \`${escapeMd(d.raw)}\`. Tente de novo em instantes.`);
+    }
+  }
+  if (respostas.length) await sendTelegram(chatId, respostas.join('\n'));
+}
+
+// Cobrança no grupo: baixa com 60 min sem pagamento que bate. O banco devolve
+// cada uma UMA vez só (já marca como cobrada), então reinício ou dois
+// processos não repetem a mensagem — e pagamento que chega depois não gera nada.
+function textoCobranca(it) {
+  const quem = it.telegram_user_id
+    ? `[@${escapeMd(String(it.vendedor || 'vendedor'))}](tg://user?id=${it.telegram_user_id})`
+    : `@${escapeMd(String(it.vendedor || 'vendedor'))}`;
+  const venda = `${escapeMd(String(it.descricao || 'venda'))}, R$ ${fmtValor(it.valor)}`;
+  const situacao = it.status === 'parcial'
+    ? `ainda está com R$ ${fmtValor(it.falta)} sem pagamento`
+    : 'ainda está sem pagamento';
+  return `${quem}, a venda das ${escapeMd(it.hora)} (${venda}) ${situacao}. Manda o comprovante, o +DINHEIRO ou o +DESCONTO.`;
+}
+
+async function enviarCobrancas() {
+  let d = null;
+  try {
+    d = await callRpc('bot_cobrancas_pendentes', { p_token: BOT_SYNC_TOKEN });
+  } catch (err) {
+    console.error('bot_cobrancas_pendentes:', err.message);
+    return;
+  }
+  if (!d || d.ok === false || !Array.isArray(d.itens)) return;
+  for (const it of d.itens) {
+    if (!it.chat) continue;
+    try { await sendTelegram(it.chat, textoCobranca(it)); }
+    catch (err) { console.error('cobrança:', err.message); }
+  }
+}
+
+// Às 3h, só no grupo de faturamento (sócios): o que ficou sem pagamento no dia.
+async function enviarSemPagamentoDia(dia = ontemISO()) {
+  const grupo = await chatFaturamento();
+  if (!grupo) return;
+  let d = null;
+  try {
+    d = await callRpc('bot_sem_pagamento_dia', { p_token: BOT_SYNC_TOKEN, p_dia: dia });
+  } catch (err) {
+    console.error('bot_sem_pagamento_dia:', err.message);
+    return;
+  }
+  if (!d || d.ok === false || !Array.isArray(d.itens)) return;
+  const data = dia.split('-').reverse().slice(0, 2).join('/');
+  if (!d.itens.length) {
+    await sendTelegram(grupo, `✅ *Sem pagamento · ${data}*\nTodas as vendas do dia têm pagamento que bate.`);
+    return;
+  }
+  const linhas = [`🔴 *Ficou sem pagamento · ${data}*`, ''];
+  for (const it of d.itens) {
+    linhas.push(`${escapeMd(it.hora)} · ${escapeMd(String(it.vendedor))} · ${escapeMd(String(it.descricao || ''))} · ` +
+      `R$ ${fmtBR(it.valor)} (falta R$ ${fmtBR(it.falta)})`);
+  }
+  linhas.push('', `Total: *R$ ${fmtBR(d.total_falta)}* em ${d.itens.length} ${d.itens.length === 1 ? 'venda' : 'vendas'}`);
+  await sendTelegram(grupo, linhas.join('\n'));
 }
 
 // Lista de lançamentos de um tipo no ciclo vigente (/despesas e /dinheiro).
@@ -4885,7 +4987,7 @@ async function handleCorrecao(chatId, text, from) {
     `_${Number(r.unidades) === 1 ? '1 item voltou' : `${Number(r.unidades) || 'Os'} itens voltaram`} pro estoque e saíram da comissão._`);
 }
 
-const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n↩️ */desanular N* — Desfaz um /anular (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado` (quem marcou, o dono ou o Rodrigo)\n🛠️ */correção* — lista suas vendas de hoje; `/correção N` desfaz a venda N (volta pro estoque e sai da comissão)\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 */stories* — mande o print do stories como foto, com /stories na legenda (vale bônus quando um sócio aprovar)\n🎁 */poddomes* `Ignite V55 Grape Ice` — seu pod grátis do mês (1 por mês, sem comissão). Sem produto: mostra se já usou\n↩️ */poddomes\\_desfazer* `Rodrigo` — desfaz o pod do mês (só sócios)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
+const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n🏷️ *+DESCONTO 20 motivo* — Desconto combinado na sua última venda\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n↩️ */desanular N* — Desfaz um /anular (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado` (quem marcou, o dono ou o Rodrigo)\n🛠️ */correção* — lista suas vendas de hoje; `/correção N` desfaz a venda N (volta pro estoque e sai da comissão)\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 */stories* — mande o print do stories como foto, com /stories na legenda (vale bônus quando um sócio aprovar)\n🎁 */poddomes* `Ignite V55 Grape Ice` — seu pod grátis do mês (1 por mês, sem comissão). Sem produto: mostra se já usou\n↩️ */poddomes\\_desfazer* `Rodrigo` — desfaz o pod do mês (só sócios)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido 15000` · `/pedido 15000 8` — montar a compra (só sugestão)\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
 
 const vendasDoDia = {};
 
@@ -4953,6 +5055,16 @@ cron.schedule(CRON_RESUMO_VENDAS, async () => {
 cron.schedule(CRON_FATURAMENTO, async () => {
   try { await enviarFaturamentoDiario(ontemISO()); }
   catch (err) { console.error('Erro no faturamento diário:', err); }
+  try { await enviarSemPagamentoDia(ontemISO()); }
+  catch (err) { console.error('Erro na lista sem pagamento:', err); }
+}, { timezone: 'America/Sao_Paulo' });
+
+// Cobrança das vendas sem pagamento (60 min depois da baixa), nos horários em
+// que o serviço fica acordado.
+const CRON_COBRANCA = '*/5 0-3,10-23 * * *';
+cron.schedule(CRON_COBRANCA, async () => {
+  try { await enviarCobrancas(); }
+  catch (err) { console.error('Erro na cobrança:', err); }
 }, { timezone: 'America/Sao_Paulo' });
 
 cron.schedule(CRON_LEMBRETE_CHIPS, async () => {
@@ -5177,12 +5289,14 @@ app.post('/webhook', async (req, res) => {
         const d = parseRegistroRod(l, palavras);
         if (d) registros.push(d); else linhas.push(l);
       }
-      if (registros.length) {
-        await handleRegistrosRod(chatId, registros, {
-          chat_id: chatId, message_id: msg.message_id,
-          user_id: fromId, nome: nomeAutor(msg.from),
-        });
-      }
+      const descontos = registros.filter(r => r.tipo === 'desconto');
+      const doRod = registros.filter(r => r.tipo !== 'desconto');
+      const metaReg = {
+        chat_id: chatId, message_id: msg.message_id,
+        user_id: fromId, nome: nomeAutor(msg.from),
+      };
+      if (doRod.length) await handleRegistrosRod(chatId, doRod, metaReg);
+      if (descontos.length) await handleDescontos(chatId, descontos, metaReg);
 
       const baixas = linhas.filter(l => l.startsWith('-'));
       const entradas = linhas.filter(l => l.startsWith('+'));
@@ -5416,6 +5530,12 @@ if (require.main === module) {
 
 module.exports = {
   app,
+  parseDesconto,
+  handleDescontos,
+  textoCobranca,
+  enviarCobrancas,
+  enviarSemPagamentoDia,
+  CRON_COBRANCA,
   readEstoque,
   handleEstoque,
   palavrasNaoPods,

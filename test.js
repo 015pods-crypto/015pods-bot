@@ -727,6 +727,67 @@ teste('"+25 XYZ" (palavra fora da lista) vai pro estoque, não pra despesa', asy
   assert.ok(resp.text.includes('Produto não encontrado'), resp.text);
 });
 
+// --- +DESCONTO ---------------------------------------------------------------
+
+teste('"+DESCONTO 20 cliente levou 5" vai para a última baixa de quem mandou', async (ctx) => {
+  respostas.bot_desconto_registrar = {
+    status: 200, body: { ok: true, hora: '14h05', descricao: 'Ignite V400 Ice Menthol x2', desconto: 20, a_receber: 320 },
+  };
+  const [resp] = await mandar(ctx.webhook, update('+DESCONTO 20 cliente levou 5'));
+  const rpc = chamadas.filter(c => c.fn === 'bot_desconto_registrar');
+  assert.strictEqual(rpc.length, 1);
+  assert.strictEqual(rpc[0].body.p_valor, 20);
+  assert.strictEqual(rpc[0].body.p_motivo, 'cliente levou 5');
+  assert.ok(rpc[0].body.p_meta.user_id, 'precisa saber quem mandou');
+  assert.ok(resp.text.startsWith('🏷️ Desconto de R$ 20 anotado na venda das 14h05'), resp.text);
+  assert.ok(resp.text.includes('A receber: R$ 320'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0, 'desconto não é reposição');
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_despesa_rod_registrar').length, 0, 'desconto não é despesa');
+  assert.ok(!enviadas.some(e => e.text.includes('Reposição é no grupo de reposição')));
+});
+
+teste('"+20 DESCONTO" também vale; sem venda recente o bot avisa', async (ctx) => {
+  respostas.bot_desconto_registrar = { status: 200, body: { ok: false, erro: 'sem_baixa' } };
+  const [resp] = await mandar(ctx.webhook, update('+20,50 desconto'));
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_desconto_registrar').body.p_valor, 20.5);
+  assert.ok(resp.text.includes('Não achei venda sua'), resp.text);
+});
+
+teste('"+DESCONTO" sem valor explica o uso e não grava nada', async (ctx) => {
+  const [resp] = await mandar(ctx.webhook, update('+DESCONTO cliente amigo'));
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_desconto_registrar').length, 0);
+  assert.ok(resp.text.includes('+DESCONTO 20'), resp.text);
+});
+
+teste('cobrança: marca o vendedor no grupo da venda, uma mensagem por venda', async (ctx) => {
+  respostas.bot_cobrancas_pendentes = { status: 200, body: { ok: true, itens: [
+    { chat: '-4938589018', hora: '14h05', vendedor: 'Rodrigo', telegram_user_id: '5370689351',
+      descricao: 'Ignite V400 Ice Menthol x2', valor: 340, falta: 340, status: 'sem' },
+  ] } };
+  await ctx.mod.enviarCobrancas();
+  assert.strictEqual(enviadas.length, 1);
+  assert.strictEqual(String(enviadas[0].chat_id), '-4938589018');
+  assert.strictEqual(enviadas[0].text,
+    '[@Rodrigo](tg://user?id=5370689351), a venda das 14h05 (Ignite V400 Ice Menthol x2, R$ 340) ainda está sem pagamento. Manda o comprovante, o +DINHEIRO ou o +DESCONTO.');
+  respostas.bot_cobrancas_pendentes = { status: 200, body: { ok: true, itens: [] } };
+  await ctx.mod.enviarCobrancas();
+  assert.strictEqual(enviadas.length, 1, 'nada novo, nada enviado');
+  assert.strictEqual(ctx.mod.CRON_COBRANCA, '*/5 0-3,10-23 * * *');
+});
+
+teste('às 3h a lista do que ficou sem pagamento vai só pro grupo de faturamento', async (ctx) => {
+  configComFaturamento();
+  respostas.bot_sem_pagamento_dia = { status: 200, body: { ok: true, total_falta: 81, itens: [
+    { hora: '10h50', vendedor: 'Gabriel', descricao: 'Ignite V400 Mix x1', valor: 350, pago: 269, falta: 81 },
+  ] } };
+  await ctx.mod.enviarSemPagamentoDia('2026-11-13');
+  assert.strictEqual(enviadas.length, 1);
+  assert.strictEqual(String(enviadas[0].chat_id), String(GRUPO_FATURAMENTO));
+  assert.ok(enviadas[0].text.startsWith('🔴 *Ficou sem pagamento · 13/11*'), enviadas[0].text);
+  assert.ok(enviadas[0].text.includes('falta R$ 81,00'), enviadas[0].text);
+  assert.ok(!enviadas.some(e => String(e.chat_id) === String(GRUPO_VENDAS)));
+});
+
 // --- ESTORNO: mesmo formato no negativo ------------------------------------
 
 teste('"-50 DINHEIRO" estorna dinheiro em mãos (mesma RPC, valor negativo)', async (ctx) => {
