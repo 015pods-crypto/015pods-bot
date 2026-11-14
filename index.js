@@ -2932,7 +2932,8 @@ async function registrarComprovante(chatId, msg) {
       p_chat_id: chatId,
       p_message_id: msg.message_id,
       p_arquivo_id: arquivo.fileId,
-      p_bruto: lido,
+      // Quem mandou o comprovante: o banco divide o caixa por vendedor (Baixas x dinheiro).
+      p_bruto: { ...lido, enviado_por: metaUsuario(msg.from) },
     });
   } catch (err) {
     console.error('bot_comprovante_registrar:', err.message);

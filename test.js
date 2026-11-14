@@ -2449,6 +2449,7 @@ teste('foto de comprovante: lida e registrada; leitura e total do dia só no fat
   assert.strictEqual(rpc[0].body.p_banco, 'Nubank');
   assert.strictEqual(rpc[0].body.p_arquivo_id, 'foto-grande');
   assert.strictEqual(rpc[0].body.p_bruto.codigo, 'E12345ABC', 'p_bruto tem que levar o JSON inteiro');
+  assert.strictEqual(rpc[0].body.p_bruto.enviado_por.user_id, String(GABRIEL.id), 'p_bruto tem que dizer quem mandou o comprovante');
 
   assert.strictEqual(String(resp.chat_id), String(GRUPO_FATURAMENTO));
   assert.strictEqual(emVendas().length, 0, 'nada no grupo de vendas');
