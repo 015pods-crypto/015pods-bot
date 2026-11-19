@@ -43,7 +43,7 @@ const COMANDOS = [
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
   '/apagar', '/instrucoes', '/fechamento', '/consignado', '/troca', '/sou', '/meuid', '/idgrupo',
-  '/poddomes', '/poddomes_desfazer', '/stories', '/levar', '/tirar', '/setgrupoestoque2',
+  '/poddomes', '/poddomes_desfazer', '/stories', '/levar', '/tirar', '/setgrupoestoque2', '/contagem',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -5118,6 +5118,7 @@ const AJUDA_ESTOQUE2 = [
   '➖ Saída sem venda (defeito, erro de lançamento): `/tirar 2 Ignite V400 Ice Menthol`',
   '🚚 Levar pra loja: `/levar Ignite V400 Ice Menthol 3` (tira daqui e põe no estoque da loja)',
   '📋 Ver o que tem: `/estoque`',
+  '🧮 Contagem (substitui o saldo): `/contagem` e embaixo `Ignite 40K:` / `1 Blueberry` / `2 Grape + Menthol` (`ESGOTADO` zera o modelo)',
   '_Venda não é aqui: baixa (-) só no grupo de vendas._',
 ].join('\n');
 
@@ -5215,6 +5216,7 @@ async function handleGrupoEstoque2(chatId, text, cmd, msg) {
     return;
   }
   if (cmd === '/estoque' || cmd === '/estoque2') { await handleEstoque2Lista(chatId); return; }
+  if (cmd === '/contagem') { if (msg.message_id) await handleContagem(chatId, text, msg.from); return; }
   if (cmd === '/start' || cmd === '/ajuda') { await sendTelegram(chatId, AJUDA_ESTOQUE2); return; }
   if (cmd.startsWith('/')) {
     if (['/troca', '/consignado', '/poddomes', '/correção', '/correcao', '/atacado'].includes(cmd)) {
@@ -5435,6 +5437,88 @@ async function handleCallbackReposicao(cq) {
 // /fornecedor. Roda quando o sistema chama POST /fornecedor-fila e, de reserva,
 // a cada minuto.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// /contagem (grupo do Estoque 2): SUBSTITUI o saldo inteiro do Estoque 2.
+//   Ignite 40K:          <- título do modelo (termina com ":")
+//   1 Blueberry          <- quantidade na frente do sabor
+//   1 Grape + Menthol    <- dual flavor: "+" separa os dois sabores
+//   ESGOTADO             <- o modelo fica zerado
+//   ESTOQUE TOTAL ...    <- resumo no fim: ignorado (só serve de conferência)
+// Os nomes passam pela mesma ligação da lista do fornecedor. O que não for
+// reconhecido NÃO entra e aparece na resposta.
+// ---------------------------------------------------------------------------
+function parseContagem(texto) {
+  const itens = [];
+  const esgotados = [];
+  let modelo = null;
+  let totalLista = null;
+  for (const bruta of String(texto || '').replace(/^\/contagem(@\S+)?/i, '').split('\n')) {
+    const l = limparNome(bruta).replace(/^[•*\-–—]\s*/, '').trim();
+    if (!l) continue;
+    if (/^estoque\s+total/i.test(semAcento(l))) {
+      const n = l.match(/(\d+)/);
+      if (n) totalLista = parseInt(n[1], 10);
+      break;
+    }
+    if (/:\s*$/.test(l)) { modelo = l.replace(/:\s*$/, '').trim(); continue; }
+    if (/^esgotad[oa]s?$/i.test(l)) { if (modelo) esgotados.push(modelo); continue; }
+    const m = l.match(/^(\d+)\s*x?\s+(.*\S)$/i);
+    if (!m || !modelo) continue;
+    const sabor = m[2].replace(/\s*\+\s*/g, ' / ').trim();
+    itens.push({ modelo, sabor, qtd: parseInt(m[1], 10), linha: l });
+  }
+  return { itens, esgotados, totalLista };
+}
+
+async function handleContagem(chatId, text, from) {
+  const { itens, esgotados, totalLista } = parseContagem(text);
+  if (!itens.length && !esgotados.length) {
+    await sendTelegram(chatId, 'Uso: `/contagem` e embaixo a lista:\n`Ignite 40K:`\n`1 Blueberry`\n`2 Grape + Menthol`\n`ESGOTADO` zera o modelo. O saldo do Estoque 2 é SUBSTITUÍDO pela contagem.');
+    return;
+  }
+  const ligados = await ligarAoCadastro(itens.map(i => ({ modelo: i.modelo, sabor: i.sabor, qtd: i.qtd })), await lerCadastro(), await lerApelidos());
+  const pItens = [];
+  const naoReconhecidos = [];
+  ligados.forEach((it, k) => {
+    if (it.sistema) pItens.push({ modelo: it.sistema.modelo, sabor: it.sistema.sabor, qtd: itens[k].qtd });
+    else naoReconhecidos.push(`${itens[k].modelo}: ${itens[k].linha}`);
+  });
+  const d = await callRpc('bot_estoque2_contagem', { p_token: BOT_SYNC_TOKEN, p_itens: pItens, p_meta: metaUsuario(from) });
+  if (!d || d.ok === false) { await sendTelegram(chatId, `⚠️ ${(d && d.erro) || 'Não consegui gravar a contagem.'}`); return; }
+  for (const x of d.nao_encontrados || []) naoReconhecidos.push(`${x.modelo}: ${x.qtd} ${x.sabor}`);
+  const lidas = itens.reduce((a, i) => a + i.qtd, 0);
+  const linhas = [
+    `📦 *Contagem do Estoque 2 gravada:* ${d.total} unidades em ${d.modelos} modelos (${d.sabores} sabores).`,
+    '_O saldo anterior foi substituído. O estoque da loja não mudou._',
+  ];
+  if (totalLista != null && totalLista !== d.total) linhas.push(`⚠️ A lista dizia ESTOQUE TOTAL ${totalLista}; as linhas somam ${lidas}.`);
+  if (esgotados.length) linhas.push(`Esgotado: ${esgotados.map(escapeMd).join(', ')}`);
+  if (naoReconhecidos.length) {
+    const n = naoReconhecidos.length;
+    linhas.push('', `❓ *Não reconheci (${n}) — não entraram:*`, ...naoReconhecidos.slice(0, 40).map(x => `• ${escapeMd(x)}`));
+    if (n > 40) linhas.push(`… e mais ${n - 40}`);
+  }
+  for (const p of splitMessage(linhas.join('\n'))) await sendTelegram(chatId, p);
+}
+
+// Fila de mensagens do banco (bot_mensagens_fila): avisos que o sistema ou o
+// Claude deixam para o bot mandar num grupo. Olhada a cada minuto.
+async function enviarFilaMensagens() {
+  let lista = [];
+  try {
+    lista = await callRpc('bot_mensagens_pegar', { p_token: BOT_SYNC_TOKEN });
+  } catch (err) {
+    if (!rpcAusente(err.message)) console.error('bot_mensagens_pegar:', err.message);
+    return;
+  }
+  for (const m of Array.isArray(lista) ? lista : []) {
+    let destino = m.chat_id;
+    if (!destino && m.config_key) destino = (await lerConfig(m.config_key)).trim();
+    if (destino) await sendTelegram(destino, m.texto);
+  }
+}
+
 let filaFornecedorRodando = false;
 async function processarFilaFornecedor() {
   if (filaFornecedorRodando) return;
@@ -5993,7 +6077,7 @@ if (require.main === module) {
   // Depois de subir: garante que o webhook recebe os botões (callback_query) e
   // a entrada do bot em grupo (my_chat_member), e guarda o nome dos grupos.
   // Reserva da lista colada no sistema (o normal é o POST /fornecedor-fila).
-  cron.schedule('* * * * *', () => { processarFilaFornecedor(); }, { timezone: 'America/Sao_Paulo' });
+  cron.schedule('* * * * *', () => { processarFilaFornecedor(); enviarFilaMensagens(); }, { timezone: 'America/Sao_Paulo' });
   setTimeout(() => {
     garantirUpdatesWebhook().catch(err => console.error('webhook updates:', err.message));
     registrarChatsConhecidos().catch(err => console.error('chats conhecidos:', err.message));
@@ -6001,6 +6085,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  parseContagem,
+  handleContagem,
   parseLevar,
   tituloEhEstoque2,
   handleGrupoEstoque2,

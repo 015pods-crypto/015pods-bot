@@ -3696,6 +3696,32 @@ teste('nomes do grupo do Estoque 2: maiúscula, acento e emoji não atrapalham',
   assert.ok(!ctx.mod.tituloEhEstoque2('REPOSIÇÃO RODRIGO'));
 });
 
+
+teste('parseContagem: títulos, dual flavor com +, ESGOTADO e ESTOQUE TOTAL ignorado', async (ctx) => {
+  const r = ctx.mod.parseContagem('/contagem\nIgnite 40K:\n1 Blueberry\n2 Cherry Watermelon\n\nBlack Sheep 40K:\n1 Grape + Menthol\n\nElfbar BC Create 40K:\nESGOTADO\n\nESTOQUE TOTAL: 4 unidades\n9 Lixo');
+  assert.deepStrictEqual(r.itens.map(i => [i.modelo, i.sabor, i.qtd]), [
+    ['Ignite 40K', 'Blueberry', 1], ['Ignite 40K', 'Cherry Watermelon', 2], ['Black Sheep 40K', 'Grape / Menthol', 1]]);
+  assert.deepStrictEqual(r.esgotados, ['Elfbar BC Create 40K']);
+  assert.strictEqual(r.totalLista, 4);
+});
+
+teste('/contagem no Estoque 2 grava o que reconheceu e lista o resto', async (ctx) => {
+  configComE2();
+  respostas.bot_ler_estoque = { status: 200, body: [
+    { modelo: 'Ignite 40000 Ice(V400Ice)', sabores: [{ sabor: 'Blueberry', qty: 0 }, { sabor: 'Grape', qty: 0 }] },
+    { modelo: 'Ignite 40000 Mix (V400Mix)', sabores: [{ sabor: 'Banana Cherry/Grape Ice', qty: 0 }] },
+  ] };
+  respostas.bot_estoque2_contagem = (body) => ({ status: 200, body: { ok: true, total: body.p_items ? 0 : body.p_itens.reduce((a, i) => a + i.qtd, 0), modelos: 1, sabores: body.p_itens.length, nao_encontrados: [] } });
+  const msgs = await mandarTudo(ctx.webhook, updateE2('/contagem\nIgnite 40000 Ice:\n2 Blueberry\n1 Sabor Que Nao Existe\n\nESTOQUE TOTAL 3'));
+  const b = chamadas.find(c => c.fn === 'bot_estoque2_contagem').body;
+  assert.deepStrictEqual(b.p_itens, [{ modelo: 'Ignite 40000 Ice(V400Ice)', sabor: 'Blueberry', qtd: 2 }]);
+  const texto = msgs.map(m => m.text).join('\n');
+  assert.ok(texto.includes('Contagem do Estoque 2 gravada:* 2 unidades'), texto);
+  assert.ok(texto.includes('Não reconheci (1)'), texto);
+  assert.ok(texto.includes('Sabor Que Nao Existe'), texto);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
+});
+
 teste('parseLevar aceita quantidade no fim, no começo e sem número', async (ctx) => {
   assert.deepStrictEqual(ctx.mod.parseLevar('/levar Ignite V400 Ice Menthol 3'), [{ produto: 'Ignite V400 Ice Menthol', qty: 3 }]);
   assert.deepStrictEqual(ctx.mod.parseLevar('/levar 2 Elfbar 30000 Cherry'), [{ produto: 'Elfbar 30000 Cherry', qty: 2 }]);
