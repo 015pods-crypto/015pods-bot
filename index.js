@@ -43,7 +43,7 @@ const COMANDOS = [
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
   '/apagar', '/instrucoes', '/fechamento', '/consignado', '/troca', '/sou', '/meuid', '/idgrupo',
-  '/poddomes', '/poddomes_desfazer', '/stories', '/levar', '/tirar',
+  '/poddomes', '/poddomes_desfazer', '/stories', '/levar', '/tirar', '/setgrupoestoque2',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -5081,7 +5081,9 @@ cron.schedule('*/10 0-3,10-23 * * *', async () => {
 // /levar (Estoque 2 -> loja). Venda (-) é recusada: nada aqui vira comissão.
 // ---------------------------------------------------------------------------
 
-const NOME_GRUPO_ESTOQUE2 = 'estoque atualizado';
+// Nomes aceitos (sem maiúscula, acento nem emoji). O grupo real se chama
+// "Estoque secundario"; "estoque atualizado" era como foi pedido.
+const NOMES_GRUPO_ESTOQUE2 = ['estoque atualizado', 'estoque secundario', 'estoque 2'];
 
 // "2026-11-19T02:46:00Z" -> "18/11" (dia em São Paulo).
 function dataSP(valor) {
@@ -5091,7 +5093,8 @@ function dataSP(valor) {
 }
 
 function tituloEhEstoque2(titulo) {
-  return semAcento(String(titulo || '')).toLowerCase().replace(/\s+/g, ' ').includes(NOME_GRUPO_ESTOQUE2);
+  const t = semAcento(String(titulo || '')).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  return NOMES_GRUPO_ESTOQUE2.some(n => t.includes(n));
 }
 
 // true quando este chat é o grupo do Estoque 2. `conhecidos` = ids dos outros
@@ -5577,6 +5580,13 @@ app.post('/webhook', async (req, res) => {
     }
     if (cmd === '/setgrupopedidos') {
       if (ehDono(fromId)) { await handleSetGrupoPedidos(chatId, text, msg.from); return; }
+      return;
+    }
+    if (cmd === '/setgrupoestoque2') {
+      if (ehDono(fromId) && msg.chat.type !== 'private') {
+        const ok = await gravarConfig(CONFIG_GRUPO_ESTOQUE2, String(chatId));
+        await sendTelegram(chatId, ok ? '✅ Este grupo agora é o *Estoque 2*.\n\n' + AJUDA_ESTOQUE2 : '⚠️ Não consegui gravar. Tente de novo.');
+      }
       return;
     }
     if (cmd === '/setgrupofaturamento') {

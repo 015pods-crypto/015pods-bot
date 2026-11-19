@@ -3689,6 +3689,13 @@ teste('/levar no grupo de vendas é recusado', async (ctx) => {
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_estoque2_levar').length, 0);
 });
 
+teste('nomes do grupo do Estoque 2: maiúscula, acento e emoji não atrapalham', async (ctx) => {
+  assert.ok(ctx.mod.tituloEhEstoque2('Estoque secundario'));
+  assert.ok(ctx.mod.tituloEhEstoque2('📦 ESTOQUE SECUNDÁRIO'));
+  assert.ok(ctx.mod.tituloEhEstoque2('Estoque Atualizado!'));
+  assert.ok(!ctx.mod.tituloEhEstoque2('REPOSIÇÃO RODRIGO'));
+});
+
 teste('parseLevar aceita quantidade no fim, no começo e sem número', async (ctx) => {
   assert.deepStrictEqual(ctx.mod.parseLevar('/levar Ignite V400 Ice Menthol 3'), [{ produto: 'Ignite V400 Ice Menthol', qty: 3 }]);
   assert.deepStrictEqual(ctx.mod.parseLevar('/levar 2 Elfbar 30000 Cherry'), [{ produto: 'Elfbar 30000 Cherry', qty: 2 }]);
