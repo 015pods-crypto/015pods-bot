@@ -3648,12 +3648,49 @@ teste('Estoque 2: entrada com e sem "+" mexe só no Estoque 2', async (ctx) => {
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_reposicao_chegou').length, 1);
 });
 
-teste('Estoque 2: venda (-) é recusada e não registra nada', async (ctx) => {
+teste('Estoque 2: "-" desconta do Estoque 2 sem virar venda', async (ctx) => {
   configComE2();
-  const msgs = await mandarTudo(ctx.webhook, updateE2('-1 Ignite V400 Ice Menthol'));
-  assert.ok(msgs[0].text.includes('Venda é só no grupo de VENDAS'), msgs[0].text);
+  respostas.bot_estoque2_mover = { status: 200, body: { resultados: [{ status: 'ok', direction: 'saida', model: 'Ignite V400', flavor: 'Ice Menthol', qty: 1, saldo: 14 }] } };
+  const [resp] = await mandar(ctx.webhook, updateE2('-1 Ignite V400 Ice Menthol'));
+  assert.strictEqual(resp.text, '✅ Estoque 2: Ignite V400 Ice Menthol agora tem 14 (-1)');
+  assert.deepStrictEqual(chamadas.find(c => c.fn === 'bot_estoque2_mover').body.p_items, [{ produto: 'Ignite V400 Ice Menthol', qty: -1 }]);
   assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 0);
-  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_estoque2_mover').length, 0);
+});
+
+teste('Estoque 2: /levar em várias linhas (formato da contagem) e aviso no grupo de reposição', async (ctx) => {
+  configComE2();
+  respostas.bot_ler_estoque = { status: 200, body: [
+    { modelo: 'Ignite 40000 Ice(V400Ice)', sabores: [{ sabor: 'Blueberry', qty: 0 }, { sabor: 'Grape', qty: 0 }] },
+  ] };
+  respostas.bot_estoque2_levar = (body) => ({ status: 200, body: { resultados: body.p_items.map(i => ({ status: 'ok', model: i.modelo, flavor: i.sabor, qty: i.qty, loja: i.qty, estoque2: 0 })) } });
+  const msgs = await mandarTudo(ctx.webhook, updateE2('/levar\nIgnite 40000 Ice:\n1 Blueberry\n2 Grape'));
+  assert.deepStrictEqual(chamadas.find(c => c.fn === 'bot_estoque2_levar').body.p_items, [
+    { modelo: 'Ignite 40000 Ice(V400Ice)', sabor: 'Blueberry', qty: 1 }, { modelo: 'Ignite 40000 Ice(V400Ice)', sabor: 'Grape', qty: 2 }]);
+  const resumo = msgs.find(m => String(m.chat_id) === String(GRUPO_E2));
+  assert.ok(resumo.text.includes('Levado do Estoque 2 pra loja:* 3 un'), resumo.text);
+  const aviso = msgs.find(m => String(m.chat_id) === String(process.env.REPOSICAO_CHAT_ID));
+  assert.ok(aviso && aviso.text.includes('Chegou do Estoque 2* — 3 un'), JSON.stringify(msgs.map(m => [m.chat_id, m.text])));
+});
+
+teste('Estoque 2: /atualizar define o saldo', async (ctx) => {
+  configComE2();
+  respostas.bot_estoque2_definir = { status: 200, body: { status: 'ok', model: 'Ignite V400', flavor: 'Ice Menthol', antes: 3, saldo: 10 } };
+  const [resp] = await mandar(ctx.webhook, updateE2('/atualizar Ignite V400 Ice Menthol 10'));
+  const b = chamadas.find(c => c.fn === 'bot_estoque2_definir').body;
+  assert.deepStrictEqual([b.p_item, b.p_qtd], [{ produto: 'Ignite V400 Ice Menthol' }, 10]);
+  assert.strictEqual(resp.text, '✅ Estoque 2: Ignite V400 Ice Menthol agora tem 10 (antes 3)');
+});
+
+teste('Estoque 2: /correção lista e /correção 1 desfaz', async (ctx) => {
+  configComE2();
+  respostas.bot_estoque2_movimentos = { status: 200, body: [{ id: 77, quando: '2026-11-19T15:00:00Z', modelo: 'Ignite V400', sabor: 'Ice Menthol', delta: 5, saldo: 5, tipo: 'entrada', quem: 'Rodrigo', desfeito: false }] };
+  respostas.bot_estoque2_desfazer = { status: 200, body: { ok: true, modelo: 'Ignite V400', sabor: 'Ice Menthol', delta: 5, saldo: 0 } };
+  const [lista] = await mandar(ctx.webhook, updateE2('/correção'));
+  assert.ok(lista.text.includes('1. 12:00 +5 Ignite V400 Ice Menthol'), lista.text);
+  const [r] = await mandar(ctx.webhook, updateE2('/correção 1'));
+  assert.strictEqual(chamadas.find(c => c.fn === 'bot_estoque2_desfazer').body.p_mov, 77);
+  assert.ok(r.text.includes('Desfeito: +5 Ignite V400 Ice Menthol. Estoque 2 agora tem 0'), r.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_correcao_listar' || c.fn === 'bot_movimentar_estoque').length, 0);
 });
 
 teste('Estoque 2: /tirar é saída sem venda', async (ctx) => {

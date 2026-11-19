@@ -43,7 +43,7 @@ const COMANDOS = [
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
   '/apagar', '/instrucoes', '/fechamento', '/consignado', '/troca', '/sou', '/meuid', '/idgrupo',
-  '/poddomes', '/poddomes_desfazer', '/stories', '/levar', '/tirar', '/setgrupoestoque2', '/contagem',
+  '/poddomes', '/poddomes_desfazer', '/stories', '/levar', '/tirar', '/setgrupoestoque2', '/contagem', '/atualizar',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -5113,13 +5113,14 @@ async function ehGrupoEstoque2(chat, conhecidos) {
 }
 
 const AJUDA_ESTOQUE2 = [
-  '📦 *Estoque 2 — comandos*',
+  '📦 *Estoque 2 — comandos* (mexem só no Estoque 2; nada aqui é venda nem comissão)',
   '➕ Entrada: `+5 Ignite V400 Ice Menthol` (ou `Ignite V400 Ice Menthol 5`)',
-  '➖ Saída sem venda (defeito, erro de lançamento): `/tirar 2 Ignite V400 Ice Menthol`',
-  '🚚 Levar pra loja: `/levar Ignite V400 Ice Menthol 3` (tira daqui e põe no estoque da loja)',
-  '📋 Ver o que tem: `/estoque`',
-  '🧮 Contagem (substitui o saldo): `/contagem` e embaixo `Ignite 40K:` / `1 Blueberry` / `2 Grape + Menthol` (`ESGOTADO` zera o modelo)',
-  '_Venda não é aqui: baixa (-) só no grupo de vendas._',
+  '➖ Descontar: `-2 Ignite V400 Ice Menthol` (ou `/tirar 2 Ignite V400 Ice Menthol`)',
+  '✏️ Atualizar o saldo: `/atualizar Ignite V400 Ice Menthol 10`',
+  '🚚 Levar pra loja: `/levar Ignite V400 Ice Menthol 3` — ou várias linhas no formato da contagem',
+  '🧮 Contagem (substitui o saldo): `/contagem` + `Ignite 40K:` / `1 Blueberry` / `2 Grape + Menthol` (`ESGOTADO` zera o modelo)',
+  '📋 Ver: `/estoque` · `/zerados` · `/baixo` · `/reposicao` (entradas dos últimos 30 min)',
+  '🛠️ Corrigir: `/correção` lista os lançamentos de hoje; `/correção 3` desfaz o 3',
 ].join('\n');
 
 function msgFalhaProduto(r) {
@@ -5170,80 +5171,169 @@ function parseLevar(texto) {
   return itens.filter(i => i.produto && i.qty > 0);
 }
 
-async function handleLevar(chatId, text, from) {
-  const itens = parseLevar(text);
-  if (!itens.length) {
-    await sendTelegram(chatId, 'Uso: `/levar Ignite V400 Ice Menthol 3` — tira do Estoque 2 e põe na loja.');
-    return;
-  }
-  const d = await callRpc('bot_estoque2_levar', { p_token: BOT_SYNC_TOKEN, p_items: itens, p_meta: metaUsuario(from) });
-  const linhas = [];
-  for (const r of (d && d.resultados) || []) {
-    if (r.status === 'ok') {
-      linhas.push(`✅ ${r.model} ${r.flavor}: ${r.qty} do Estoque 2 pra loja. Loja agora tem ${r.loja} · Estoque 2 agora tem ${r.estoque2}`);
-    } else if (r.status === 'erro') {
-      linhas.push(`❌ ${r.model} ${r.flavor}: ${r.erro}`);
-    } else {
-      linhas.push(`❌ ${msgFalhaProduto(r)}`);
-    }
-  }
-  await sendTelegram(chatId, linhas.join('\n'));
+// /levar em várias linhas no formato da contagem ("Modelo:" + "N sabor"), ou
+// uma linha por item ("Modelo Sabor N"). Devolve { itens, naoReconhecidos }.
+async function itensDoLevar(text) {
+  const corpo = String(text || '').replace(/^\/levar(@\S+)?/i, '');
+  if (!corpo.split('\n').some(l => /:\s*$/.test(l.trim()))) return { itens: parseLevar(text), naoReconhecidos: [] };
+  const { itens } = parseContagem(corpo);
+  const ligados = await ligarAoCadastro(itens.map(i => ({ modelo: i.modelo, sabor: i.sabor, qtd: i.qtd })), await lerCadastro(), await lerApelidos());
+  const out = [];
+  const nao = [];
+  ligados.forEach((it, k) => {
+    if (it.sistema) out.push({ modelo: it.sistema.modelo, sabor: it.sistema.sabor, qty: itens[k].qtd });
+    else nao.push(`${itens[k].modelo}: ${itens[k].linha}`);
+  });
+  return { itens: out, naoReconhecidos: nao };
 }
 
-async function handleEstoque2Lista(chatId) {
-  const lista = await callRpc('bot_estoque2_ler', { p_token: BOT_SYNC_TOKEN });
-  if (!Array.isArray(lista) || !lista.length) { await sendTelegram(chatId, '📦 O Estoque 2 está vazio.'); return; }
+// Avisa o grupo de entradas da loja (REPOSIÇÃO) o que chegou do Estoque 2.
+async function avisarReposicaoLevado(chatOrigem, levados, por) {
+  if (!levados.length || String(chatOrigem) === REPOSICAO_CHAT_ID) return;
+  const total = levados.reduce((a, r) => a + (Number(r.qtd) || 0), 0);
+  const linhas = [`🚚 *Chegou do Estoque 2* — ${total} un${por ? ` (por ${escapeMd(por)})` : ''}`,
+    ...levados.map(r => `• ${r.qtd} ${escapeMd(r.modelo)} ${escapeMd(r.sabor)} — loja agora tem ${r.loja}`)];
+  for (const p of splitMessage(linhas.join('\n'))) await sendTelegram(REPOSICAO_CHAT_ID, p);
+}
+
+async function handleLevar(chatId, text, from) {
+  const { itens, naoReconhecidos } = await itensDoLevar(text);
+  if (!itens.length && !naoReconhecidos.length) {
+    await sendTelegram(chatId, 'Uso: `/levar Ignite V400 Ice Menthol 3` — ou `/levar` e embaixo `Ignite 40K:` / `2 Blueberry`. Tira do Estoque 2 e põe na loja.');
+    return;
+  }
+  const d = itens.length ? await callRpc('bot_estoque2_levar', { p_token: BOT_SYNC_TOKEN, p_items: itens, p_meta: metaUsuario(from) }) : { resultados: [] };
+  const ok = [];
+  const erros = [];
+  for (const r of (d && d.resultados) || []) {
+    if (r.status === 'ok') ok.push({ modelo: r.model, sabor: r.flavor, qtd: r.qty, loja: r.loja, estoque2: r.estoque2 });
+    else if (r.status === 'erro') erros.push(`${r.model} ${r.flavor}: ${r.erro}`);
+    else erros.push(msgFalhaProduto(r));
+  }
+  for (const x of naoReconhecidos) erros.push(`Não reconheci: ${x}`);
+  const linhas = [];
+  if (ok.length === 1 && !erros.length) {
+    const r = ok[0];
+    linhas.push(`✅ ${r.modelo} ${r.sabor}: ${r.qtd} do Estoque 2 pra loja. Loja agora tem ${r.loja} · Estoque 2 agora tem ${r.estoque2}`);
+  } else {
+    if (ok.length) {
+      linhas.push(`🚚 *Levado do Estoque 2 pra loja:* ${ok.reduce((a, r) => a + r.qtd, 0)} un`);
+      for (const r of ok) linhas.push(`✅ ${r.qtd} ${r.modelo} ${r.sabor} — loja ${r.loja} · Estoque 2 ${r.estoque2}`);
+    }
+    if (erros.length) linhas.push(...(ok.length ? [''] : []), '❌ *Não passou:*', ...erros.map(e => `• ${e}`));
+  }
+  for (const p of splitMessage(linhas.join('\n'))) await sendTelegram(chatId, p);
+  await avisarReposicaoLevado(chatId, ok, nomeAutor(from));
+}
+
+async function handleEstoque2Lista(chatId, filtro) {
+  const todos = await callRpc('bot_estoque2_ler', { p_token: BOT_SYNC_TOKEN });
+  const lista = (Array.isArray(todos) ? todos : []).filter(it => filtro === 'zerados' ? it.qtd <= 0 : filtro === 'baixo' ? it.qtd === 1 : it.qtd > 0);
+  if (!lista.length) {
+    await sendTelegram(chatId, filtro === 'zerados' ? '📦 Nenhum sabor zerado no Estoque 2.' : filtro === 'baixo' ? '📦 Nenhum sabor com 1 no Estoque 2.' : '📦 O Estoque 2 está vazio.');
+    return;
+  }
   const grupos = new Map();
   for (const it of lista) {
     if (!grupos.has(it.modelo)) grupos.set(it.modelo, []);
     grupos.get(it.modelo).push(it);
   }
   const total = lista.reduce((a, it) => a + (Number(it.qtd) || 0), 0);
-  const blocos = [`📦 *ESTOQUE 2* — ${lista.length} sabores · ${total} un`];
+  const titulo = filtro === 'zerados' ? `🔴 *ESTOQUE 2 — zerados* (${lista.length})`
+    : filtro === 'baixo' ? `🟡 *ESTOQUE 2 — só 1* (${lista.length})`
+      : `📦 *ESTOQUE 2* — ${lista.length} sabores · ${total} un em ${grupos.size} modelos`;
+  const blocos = [titulo];
   for (const [modelo, its] of grupos) {
-    blocos.push(`*${escapeMd(modelo)}*\n` + its.map(it => `${it.qtd} ${escapeMd(it.sabor)}`).join('\n'));
+    blocos.push(`*${escapeMd(modelo)}*\n` + its.map(it => filtro === 'zerados' ? escapeMd(it.sabor) : `${it.qtd} ${escapeMd(it.sabor)}`).join('\n'));
   }
   for (const parte of dividirBlocos(blocos)) await sendTelegram(chatId, parte);
 }
 
-// Mensagem do grupo do Estoque 2 (texto já sem o caso de comando global).
+const ROTULO_MOV_E2 = { entrada: 'entrada', saida: 'saída', ajuste: 'atualizar', para_loja: 'levado p/ loja', planilha: 'contagem' };
+const correcaoE2 = new Map(); // chatId -> [ids na ordem da lista]
+
+async function handleCorrecaoEstoque2(chatId, text, from) {
+  const n = parseInt((text.split(/\s+/)[1] || ''), 10);
+  if (!n) {
+    const movs = (await callRpc('bot_estoque2_movimentos', { p_token: BOT_SYNC_TOKEN, p_minutos: null })) || [];
+    const vivos = movs.filter(m => !m.desfeito);
+    if (!vivos.length) { await sendTelegram(chatId, '🛠️ Nenhum lançamento no Estoque 2 hoje.'); return; }
+    correcaoE2.set(String(chatId), vivos.map(m => m.id));
+    const linhas = ['🛠️ *Lançamentos de hoje no Estoque 2*'];
+    vivos.forEach((m, i) => {
+      const hora = new Date(m.quando).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' });
+      linhas.push(`${i + 1}. ${hora} ${m.delta > 0 ? '+' : ''}${m.delta} ${escapeMd(m.modelo)} ${escapeMd(m.sabor)} _(${ROTULO_MOV_E2[m.tipo] || m.tipo}${m.quem ? `, ${escapeMd(m.quem)}` : ''})_`);
+    });
+    linhas.push('', '_Para desfazer: /correção N_');
+    for (const p of splitMessage(linhas.join('\n'))) await sendTelegram(chatId, p);
+    return;
+  }
+  const ids = correcaoE2.get(String(chatId));
+  if (!ids) { await sendTelegram(chatId, 'Mande `/correção` primeiro para ver a lista numerada.'); return; }
+  const id = ids[n - 1];
+  if (!id) { await sendTelegram(chatId, `❌ Não existe o número ${n} na lista. Mande /correção de novo.`); return; }
+  const d = await callRpc('bot_estoque2_desfazer', { p_token: BOT_SYNC_TOKEN, p_mov: id, p_meta: metaUsuario(from) });
+  if (!d || d.ok === false) { await sendTelegram(chatId, `❌ ${(d && d.erro) || 'Não consegui desfazer.'}`); return; }
+  await sendTelegram(chatId, `↩️ Desfeito: ${d.delta > 0 ? '+' : ''}${d.delta} ${d.modelo} ${d.sabor}. Estoque 2 agora tem ${d.saldo}.`);
+}
+
+async function handleReposicaoEstoque2(chatId) {
+  const movs = ((await callRpc('bot_estoque2_movimentos', { p_token: BOT_SYNC_TOKEN, p_minutos: 30 })) || [])
+    .filter(m => m.tipo === 'entrada' && !m.desfeito);
+  if (!movs.length) { await sendTelegram(chatId, 'Nenhuma entrada no Estoque 2 nos últimos 30 minutos.'); return; }
+  const linhas = ['📦 *ENTRADAS NO ESTOQUE 2 (últimos 30 min)*', ...movs.map(m => `+${m.delta} ${escapeMd(m.modelo)} ${escapeMd(m.sabor)} (fica ${m.saldo})`)];
+  for (const p of splitMessage(linhas.join('\n'))) await sendTelegram(chatId, p);
+}
+
+async function handleAtualizarEstoque2(chatId, text, from) {
+  const [it] = parseLevar(text.replace(/^\/atualizar(@\S+)?/i, '/levar'));
+  const m = String(text).trim().match(/\s(\d+)\s*$/);
+  if (!it || !m) { await sendTelegram(chatId, 'Uso: `/atualizar Ignite V400 Ice Menthol 10` — o Estoque 2 passa a ter 10 desse sabor.'); return; }
+  const r = await callRpc('bot_estoque2_definir', { p_token: BOT_SYNC_TOKEN, p_item: { produto: it.produto }, p_qtd: parseInt(m[1], 10), p_meta: metaUsuario(from) });
+  if (!r || r.status !== 'ok') { await sendTelegram(chatId, `❌ ${msgFalhaProduto(r || {})}`); return; }
+  await sendTelegram(chatId, `✅ Estoque 2: ${r.model} ${r.flavor} agora tem ${r.saldo} (antes ${r.antes})`);
+}
+
+// Mensagem do grupo do Estoque 2. Mesma escrita do grupo principal, mas só
+// mexe no Estoque 2: nada aqui é venda, comissão ou faturamento.
 async function handleGrupoEstoque2(chatId, text, cmd, msg) {
   if (cmd === '/levar') { await handleLevar(chatId, text, msg.from); return; }
   if (cmd === '/tirar') {
     const itens = parseLevar(text.replace(/^\/tirar(@\S+)?/i, '/levar'));
-    if (!itens.length) { await sendTelegram(chatId, 'Uso: `/tirar 2 Ignite V400 Ice Menthol` — saída do Estoque 2 que não é venda.'); return; }
+    if (!itens.length) { await sendTelegram(chatId, 'Uso: `/tirar 2 Ignite V400 Ice Menthol` — desconta do Estoque 2 (não é venda).'); return; }
     await moverEstoque2(chatId, itens.map(i => ({ produto: i.produto, qty: -i.qty })), msg.from);
     return;
   }
+  if (cmd === '/atualizar') { await handleAtualizarEstoque2(chatId, text, msg.from); return; }
+  if (cmd === '/contagem') { await handleContagem(chatId, text, msg.from); return; }
   if (cmd === '/estoque' || cmd === '/estoque2') { await handleEstoque2Lista(chatId); return; }
-  if (cmd === '/contagem') { if (msg.message_id) await handleContagem(chatId, text, msg.from); return; }
+  if (cmd === '/zerados') { await handleEstoque2Lista(chatId, 'zerados'); return; }
+  if (cmd === '/baixo') { await handleEstoque2Lista(chatId, 'baixo'); return; }
+  if (cmd === '/reposicao') { await handleReposicaoEstoque2(chatId); return; }
+  if (ehComandoCorrecao(cmd)) { await handleCorrecaoEstoque2(chatId, text, msg.from); return; }
   if (cmd === '/start' || cmd === '/ajuda') { await sendTelegram(chatId, AJUDA_ESTOQUE2); return; }
   if (cmd.startsWith('/')) {
-    if (['/troca', '/consignado', '/poddomes', '/correção', '/correcao', '/atacado'].includes(cmd)) {
-      await sendTelegram(chatId, '⛔ Esse comando não vale no Estoque 2 (aqui não tem venda). Use o grupo de vendas.');
+    if (['/troca', '/consignado', '/poddomes', '/atacado', '/comissao', '/caixa', '/faturamento'].includes(cmd)) {
+      await sendTelegram(chatId, '⛔ Esse comando não vale no Estoque 2 (aqui não tem venda). Use o grupo de vendas ou de reposição.');
     }
     return;
   }
 
-  const linhas = text.split('\n').map(l => l.trim()).filter(Boolean);
+  // "+N produto", "-N produto" e "produto N" — uma por linha.
   const itens = [];
-  let venda = false;
-  for (const l of linhas) {
-    if (/^-\s*\d/.test(l) || /^-\s*\S/.test(l)) { venda = true; continue; }
-    if (l.startsWith('+')) {
-      const m = l.match(/^\+\s*(\d+)\s+(.+)$/);
-      if (m && parseInt(m[1], 10) > 0) itens.push({ produto: extrairAtacado(m[2].trim()).desc, qty: parseInt(m[1], 10) });
-      else itens.push({ produto: l.slice(1).trim(), qty: 0 });
+  for (const l of text.split('\n').map(x => x.trim()).filter(Boolean)) {
+    const m = l.match(/^([+-])\s*(\d+)\s+(.+)$/);
+    if (m) {
+      const q = parseInt(m[2], 10);
+      if (q > 0) itens.push({ produto: extrairAtacado(m[3].trim()).desc, qty: m[1] === '-' ? -q : q });
       continue;
     }
+    if (/^[+-]/.test(l)) { itens.push({ produto: l.slice(1).trim(), qty: 0 }); continue; }
     const sem = parseLinhaReposicaoSemPrefixo(l);
     if (sem) {
-      const m = sem.match(/^\+(\d+)\s+(.+)$/);
-      itens.push({ produto: m[2], qty: parseInt(m[1], 10) });
+      const k = sem.match(/^\+(\d+)\s+(.+)$/);
+      itens.push({ produto: k[2], qty: parseInt(k[1], 10) });
     }
-  }
-  if (venda) {
-    await sendTelegram(chatId, '⛔ Venda é só no grupo de VENDAS. Aqui é o Estoque 2: nada foi registrado como venda. (Para tirar sem venda: `/tirar 2 Modelo Sabor`)');
   }
   await moverEstoque2(chatId, itens, msg.from);
 }
@@ -5417,6 +5507,7 @@ async function handleCallbackReposicao(cq) {
     for (const it of d.levados || []) linhas.push(`✅ ${escapeMd(it.modelo)} ${escapeMd(it.sabor)}: ${it.qtd} — loja agora tem ${it.loja} · Estoque 2 agora tem ${it.estoque2}`);
     for (const it of d.falhou || []) linhas.push(`❌ ${escapeMd(it.modelo)} ${escapeMd(it.sabor)}: ${escapeMd(it.erro || 'não deu')}`);
     for (const p of splitMessage(linhas.join('\n'))) await sendTelegram(chatId, p);
+    await avisarReposicaoLevado(chatId, d.levados || [], por);
     return;
   }
 
