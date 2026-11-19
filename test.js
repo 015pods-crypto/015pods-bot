@@ -400,7 +400,8 @@ teste('entrada (+) não ganha linha de vendedor, mas leva o p_meta', async (ctx)
 teste('/meuid responde o id de quem mandou, em qualquer chat', async (ctx) => {
   const [resp] = await mandar(ctx.webhook, updateDe('/meuid', GABRIEL, { chat: -999999 }));
   assert.strictEqual(resp.text, 'Seu ID do Telegram: `777`');
-  assert.strictEqual(chamadas.length, 0);
+  // Só o registro do nome do grupo (bot_chat_visto) pode ter ido ao banco.
+  assert.strictEqual(chamadas.filter(c => c.fn !== 'bot_chat_visto').length, 0);
 });
 
 teste('/sou Gabriel liga o Telegram e conta as vendas passadas', async (ctx) => {

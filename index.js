@@ -1977,6 +1977,8 @@ async function enviarRelatorioSemanal() {
 // ---------------------------------------------------------------------------
 
 const CONFIG_GRUPO_PEDIDOS = 'telegram_grupo_pedidos';
+// Grupo do Estoque 2 ("estoque atualizado"): achado pelo nome, ver grupoEstoque2.
+const CONFIG_GRUPO_ESTOQUE2 = 'telegram_grupo_estoque2';
 
 // Chat de pedidos configurado ('' quando ainda não foi). Cacheado junto com o
 // resto da config.
@@ -5104,12 +5106,72 @@ cron.schedule('*/10 0-3,10-23 * * *', async () => {
 
 const processedIds = new Set();
 
+// Nome de cada grupo em que o bot está (tabela bot_chats). É por ele que se
+// acha um grupo pelo nome ("estoque atualizado") sem ninguém mandar /chatid.
+// Grava no máximo uma vez a cada 10 min por chat; falha nunca para a mensagem.
+const CHAT_VISTO_MS = 10 * 60 * 1000;
+const chatVisto = new Map(); // chatId -> { at, titulo }
+async function registrarChat(chat) {
+  if (!chat || chat.id == null || chat.type === 'private') return;
+  const id = String(chat.id);
+  const titulo = String(chat.title || '');
+  const antes = chatVisto.get(id);
+  if (antes && antes.titulo === titulo && Date.now() - antes.at < CHAT_VISTO_MS) return;
+  chatVisto.set(id, { at: Date.now(), titulo });
+  try {
+    await callRpc('bot_chat_visto', { p_token: BOT_SYNC_TOKEN, p_chat_id: id, p_titulo: titulo, p_tipo: chat.type || '' });
+  } catch (err) {
+    console.error('bot_chat_visto:', err.message);
+  }
+}
+
+// O webhook pode ter sido criado com uma lista fechada de tipos de update; sem
+// callback_query os botões não fazem nada. Só mexe se faltar algum.
+const UPDATES_NECESSARIOS = ['message', 'edited_message', 'callback_query', 'my_chat_member'];
+async function garantirUpdatesWebhook() {
+  const info = await telegramApi('getWebhookInfo', {});
+  if (!info || !info.ok || !info.result || !info.result.url) return;
+  const atuais = info.result.allowed_updates;
+  if (!Array.isArray(atuais) || !atuais.length) {
+    // Lista vazia = padrão do Telegram (todos menos chat_member etc.): já
+    // inclui callback_query e my_chat_member.
+    return;
+  }
+  const faltam = UPDATES_NECESSARIOS.filter(u => !atuais.includes(u));
+  if (!faltam.length) return;
+  const r = await telegramApi('setWebhook', { url: info.result.url, allowed_updates: [...new Set([...atuais, ...faltam])] });
+  console.log(`webhook: acrescentei ${faltam.join(', ')} -> ${r && r.ok ? 'ok' : (r && r.description)}`);
+}
+
+// Na subida: o nome dos grupos que o bot já conhece pelo id.
+async function registrarChatsConhecidos() {
+  const ids = new Set([VENDAS_CHAT_ID, REPOSICAO_CHAT_ID]);
+  for (const k of ['telegram_grupo_pedidos', 'telegram_grupo_faturamento', 'telegram_grupo_traducao', 'tarefas_grupo', CONFIG_GRUPO_ESTOQUE2]) {
+    const v = (await lerConfig(k)).trim();
+    if (v) ids.add(v);
+  }
+  for (const id of ids) {
+    try {
+      const r = await telegramApi('getChat', { chat_id: id });
+      if (r && r.ok && r.result) await registrarChat(r.result);
+    } catch (err) {
+      console.error(`getChat ${id}:`, err.message);
+    }
+  }
+}
+
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
     const body = req.body;
+    // Bot adicionado/promovido num grupo: guarda o nome já aí.
+    if (body.my_chat_member && body.my_chat_member.chat) {
+      await registrarChat(body.my_chat_member.chat);
+      return;
+    }
     const msg = body.message || body.edited_message;
     if (!msg) return;
+    await registrarChat(msg.chat);
 
     const updateId = body.update_id;
     if (processedIds.has(updateId)) return;
@@ -5526,6 +5588,12 @@ if (require.main === module) {
   try { require('./tarefas').ligar(app); } catch (err) { console.error('bot de tarefas não ligou:', err); }
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`Bot rodando na porta ${PORT}`));
+  // Depois de subir: garante que o webhook recebe os botões (callback_query) e
+  // a entrada do bot em grupo (my_chat_member), e guarda o nome dos grupos.
+  setTimeout(() => {
+    garantirUpdatesWebhook().catch(err => console.error('webhook updates:', err.message));
+    registrarChatsConhecidos().catch(err => console.error('chats conhecidos:', err.message));
+  }, 3000);
 }
 
 module.exports = {
