@@ -97,7 +97,7 @@ const GRUPOS = [
       ['💳 Pagamento', [
         { nome: '/caixa', desc: 'dinheiro que entrou no dia', ex: '/caixa 15/09', chaves: ['/caixa'] },
         { nome: '/caixa corrigir', desc: 'lista numerada pra apagar ou mudar valor', ex: '/caixa valor 2 235', chaves: ['/caixa'] },
-        { nome: 'Sem pagamento (3h)', desc: 'lista automática do que ficou sem pagar', ex: '(automático)', chaves: ['auto:sem_pagamento'] },
+        { nome: 'Sem pagamento (3h)', desc: 'lista automática do que ficou sem pagar', ex: '(automático)', chaves: ['auto:sem_pagamento'], desligavel: 'sem_pagamento' },
       ]],
       ['🛠️ Correção', [
         { nome: '/refazerfechamento', desc: 'recalcula o fechamento de um ciclo (sócios)', ex: '/refazerfechamento 30/09', chaves: ['/refazerfechamento'] },

@@ -3758,11 +3758,12 @@ teste('/ajuda mostra o mesmo que /comandos; no Estoque 2, a lista do Estoque 2',
 });
 
 teste('/comandos tudo: sócio vê todos os grupos e os erros da semana; funcionário não', async (ctx) => {
-  respostas.bot_comandos_status = { status: 200, body: { socio: true, desligados: ['cobranca'], erros: [{ chave: '/caixa', n: 3 }, { chave: 'baixa', n: 1 }] } };
+  respostas.bot_comandos_status = { status: 200, body: { socio: true, desligados: ['cobranca', 'sem_pagamento'], erros: [{ chave: '/caixa', n: 3 }, { chave: 'baixa', n: 1 }] } };
   const msgs = await mandarTudo(ctx.webhook, update('/comandos tudo'));
   const t = msgs.map(m => m.text).join('\n');
   for (const g of ['VENDAS', 'ENTRADAS', 'ESTOQUE SECUNDÁRIO', 'PEDIDOS', 'FATURAMENTO']) assert.ok(t.includes(g), g);
   assert.ok(t.includes('⚠️ /caixa — 3x'), t);
+  assert.ok(t.includes('⛔ *Sem pagamento (3h)*'), t);
   assert.ok(t.includes('⚠️ Baixa (-) — 1x'), t);
   respostas.bot_comandos_status = { status: 200, body: { socio: false, desligados: [], erros: [] } };
   const m2 = await mandarTudo(ctx.webhook, update('/comandos tudo', { from: FUNCIONARIO }));
