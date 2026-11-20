@@ -1,5 +1,30 @@
 const express = require('express');
 const cron = require('node-cron');
+const { AsyncLocalStorage } = require('async_hooks');
+const { montarComandos, chaveDaMensagem } = require('./comandos');
+
+// Registro de erros por comando (para o /comandos mostrar ⚠️). Cada update do
+// webhook e cada rotina automática roda com uma "chave" (o comando, "baixa",
+// "cobranca"...); um console.error dentro dela grava UMA linha em bot_erros.
+const contextoErro = new AsyncLocalStorage();
+const consoleErrorOriginal = console.error.bind(console);
+let errosGravando = 0;
+console.error = (...args) => {
+  consoleErrorOriginal(...args);
+  const ctx = contextoErro.getStore();
+  if (!ctx || !ctx.chave || ctx.registrado || errosGravando > 20) return;
+  const texto = args.map(a => (a instanceof Error ? a.message : typeof a === 'string' ? a : (() => { try { return JSON.stringify(a); } catch (e) { return String(a); } })())).join(' ');
+  // Markdown recusado é refeito em texto puro: não é falha do comando.
+  if (/^sendTelegram markdown falhou/.test(texto)) return;
+  ctx.registrado = true;
+  errosGravando++;
+  contextoErro.run(null, () => callRpc('bot_erro_registrar', { p_token: BOT_SYNC_TOKEN, p_chave: ctx.chave, p_chat: ctx.chat ? String(ctx.chat) : null, p_erro: texto.slice(0, 500) }))
+    .catch(() => {})
+    .finally(() => { errosGravando--; });
+};
+function comChave(chave, fn) {
+  return contextoErro.run({ chave }, fn);
+}
 const { Anthropic } = require('@anthropic-ai/sdk');
 
 const app = express();
@@ -43,7 +68,7 @@ const COMANDOS = [
   '/setgrupotraducao', '/traduzir',
   '/setgrupoatualizacoes', '/nova', '/lista', '/feito', '/feitas', '/reabrir',
   '/apagar', '/instrucoes', '/fechamento', '/consignado', '/troca', '/sou', '/meuid', '/idgrupo',
-  '/poddomes', '/poddomes_desfazer', '/stories', '/levar', '/tirar', '/setgrupoestoque2', '/contagem', '/atualizar',
+  '/poddomes', '/poddomes_desfazer', '/stories', '/levar', '/tirar', '/setgrupoestoque2', '/contagem', '/atualizar', '/comandos',
 ];
 
 // Estoque agora vive no Supabase. Toda leitura/escrita passa por RPCs:
@@ -4958,6 +4983,36 @@ async function handleCorrecao(chatId, text, from) {
 
 const AJUDA = '👋 *Bot de Estoque – 015 Pods*\n\n📦 */estoque* — Pods por modelo (acompanhamentos separados)\n🔎 */estoque detalhado* — Com os sabores de cada modelo\n🔴 */zerados* — Sem estoque\n🟡 */baixo* — Estoque = 1\n📊 */relatorio* — Resumo\n📅 */semana* — Relatório da semana (auto: domingo 14h)\n♻️ */reposicao* — Reposição (30 min)\n💰 */comissao* — Sua comissão do mês\n🙋 */sou Nome* — Liga seu Telegram ao vendedor (uma vez só)\n🆔 */meuid* — Seu ID do Telegram\n🛵 */despesas* — Entregas/despesas do Rod no ciclo\n💵 */dinheiro* — Dinheiro em mãos no ciclo\n🏷️ *+DESCONTO 20 motivo* — Desconto combinado na sua última venda\n✂️ */anular N* — Desconta N da sua comissão (`/anular 2 Gabriel`: sócio lança no nome de outro)\n➕ */adicionar N* — Soma N na comissão (só o dono; aceita nome no fim)\n↩️ */desanular N* — Desfaz um /anular (só o dono)\n\n➖ *Baixa (grupo de vendas):* `-1 Ignite 5500 Grape Ice`\n🏷️ *Atacado:* `-6 Elfbar 30000 Cherry atacado`, ou `/atacado` numa linha com o pedido colado embaixo\n↩️ *Desfazer atacado:* `/desatacado` (quem marcou, o dono ou o Rodrigo)\n🛠️ */correção* — lista suas vendas de hoje; `/correção N` desfaz a venda N (volta pro estoque e sai da comissão)\n↩️ */troca defeito* + itens embaixo — troca de cliente: tira do estoque, não é venda nem comissão (motivo: `defeito` ou `outro: ...`)\n📦 */consignado* `2 Ignite V50 Grape` — tira do estoque sem virar venda (vendas ou reposição; `/consignado pra João` + itens embaixo)\n📸 */stories* — mande o print do stories como foto, com /stories na legenda (vale bônus quando um sócio aprovar)\n🎁 */poddomes* `Ignite V55 Grape Ice` — seu pod grátis do mês (1 por mês, sem comissão). Sem produto: mostra se já usou\n↩️ */poddomes\\_desfazer* `Rodrigo` — desfaz o pod do mês (só sócios)\n📸 *Comprovante:* mande a foto/PDF no grupo de vendas — a leitura vai pro grupo de faturamento\n➕ *Entrada (grupo de reposição):* `+1 Ignite 5500 Grape Ice`\n🚚 */levar* `Ignite V400 Ice Menthol 3` — tira do Estoque 2 e põe na loja (reposição ou estoque atualizado)\n🛵 *Despesa do Rod:* `+25 ENTREGA` (ou `+18 UBER centro`)\n💵 *Dinheiro recebido:* `+100 DINHEIRO`\n↩️ *Estorno (lançou errado):* mesmo formato no negativo — `-25 ENTREGA`, `-50 DINHEIRO`\n\n📋 *Pedidos (grupo de pedidos):*\n`/fornecedor` — importar a lista do fornecedor\n`/apelido TE 30K = Elfbar 30000` — casar nome do fornecedor com o do sistema\n`/pedido` · `/pedido detalhe` — 3 partes: buscar no Estoque 2, pedido ao fornecedor (com botões) e ninguém tem\n`/traduzir` + a lista do fornecedor — devolve no formato da reposição (não dá entrada)\n\n💰 *Faturamento (grupo de faturamento):*\n`/faturamento` — resumo do mês (auto: 3h, o dia que fechou)\n`/faturamento 09/2026` — de um mês específico\n`/caixa` · `/caixa 15/09` — o que entrou de dinheiro no dia\n`/caixa corrigir` — lista numerada pra `/caixa apagar N` ou `/caixa valor N 235`\n`/geral` · `/fechamento` — painel e parcial do ciclo (só sócios)\n`/relatorio mes` — dia a dia do mês';
 
+// Qual grupo é este chat, para o /comandos. null = chat que o bot não atende.
+async function grupoDoChat(chat) {
+  const k = String(chat.id);
+  if (k === VENDAS_CHAT_ID) return 'vendas';
+  if (k === REPOSICAO_CHAT_ID) return 'reposicao';
+  const [ped, fat, trad, atu, e2] = await Promise.all([chatPedidos(), chatFaturamento(), chatTraducao(), chatAtualizacoes(), lerConfig(CONFIG_GRUPO_ESTOQUE2)]);
+  if (ped && k === String(ped)) return 'pedidos';
+  if (fat && k === String(fat)) return 'faturamento';
+  if (trad && k === String(trad)) return 'traducao';
+  if (atu && k === String(atu)) return 'atualizacoes';
+  if ((e2 && k === String(e2).trim()) || (chat.type !== 'private' && tituloEhEstoque2(chat.title))) return 'estoque2';
+  return null;
+}
+
+async function handleComandos(chatId, text, msg) {
+  const grupo = await grupoDoChat(msg.chat);
+  const privado = msg.chat.type === 'private';
+  const fromId = msg.from && msg.from.id;
+  if (!grupo && !privado) return;
+  let st = {};
+  try { st = (await callRpc('bot_comandos_status', { p_token: BOT_SYNC_TOKEN, p_meta: metaUsuario(msg.from), p_dias: 7 })) || {}; }
+  catch (err) { console.error('bot_comandos_status:', err.message); }
+  const socio = !!st.socio || ehDono(fromId);
+  const pediuTudo = /^tud[oa]$/i.test((String(text).split(/\s+/)[1] || '').trim());
+  const tudo = socio && (pediuTudo || (privado && !grupo));
+  const msgs = montarComandos(tudo ? null : grupo, st, { tudo });
+  if (pediuTudo && !socio) msgs.push('🔒 A lista de todos os grupos é só para os sócios.');
+  for (const m of msgs) for (const p of splitMessage(m)) await sendTelegram(chatId, p);
+}
+
 const vendasDoDia = {};
 
 function registrarVenda(modelo, qtd) {
@@ -5022,19 +5077,23 @@ cron.schedule(CRON_RESUMO_VENDAS, async () => {
 }, { timezone: 'America/Sao_Paulo' });
 
 cron.schedule(CRON_FATURAMENTO, async () => {
-  try { await enviarFaturamentoDiario(ontemISO()); }
-  catch (err) { console.error('Erro no faturamento diário:', err); }
-  try { await enviarSemPagamentoDia(ontemISO()); }
-  catch (err) { console.error('Erro na lista sem pagamento:', err); }
+  await comChave('auto:faturamento', async () => {
+    try { await enviarFaturamentoDiario(ontemISO()); }
+    catch (err) { console.error('Erro no faturamento diário:', err); }
+  });
+  await comChave('auto:sem_pagamento', async () => {
+    try { await enviarSemPagamentoDia(ontemISO()); }
+    catch (err) { console.error('Erro na lista sem pagamento:', err); }
+  });
 }, { timezone: 'America/Sao_Paulo' });
 
 // Cobrança das vendas sem pagamento (60 min depois da baixa), nos horários em
 // que o serviço fica acordado.
 const CRON_COBRANCA = '*/5 0-3,10-23 * * *';
-cron.schedule(CRON_COBRANCA, async () => {
+cron.schedule(CRON_COBRANCA, () => comChave('cobranca', async () => {
   try { await enviarCobrancas(); }
   catch (err) { console.error('Erro na cobrança:', err); }
-}, { timezone: 'America/Sao_Paulo' });
+}), { timezone: 'America/Sao_Paulo' });
 
 cron.schedule(CRON_LEMBRETE_CHIPS, async () => {
   try { await enviarLembreteChips(); }
@@ -5692,8 +5751,12 @@ async function registrarChatsConhecidos() {
   }
 }
 
-app.post('/webhook', async (req, res) => {
+app.post('/webhook', (req, res) => {
   res.sendStatus(200);
+  return contextoErro.run({ chave: 'webhook', chat: null }, () => processarWebhook(req));
+});
+
+async function processarWebhook(req) {
   try {
     const body = req.body;
     // Bot adicionado/promovido num grupo: guarda o nome já aí.
@@ -5704,6 +5767,8 @@ app.post('/webhook', async (req, res) => {
     // Botões (inline keyboard) do /pedido.
     if (body.callback_query) {
       const cq = body.callback_query;
+      const ctxCq = contextoErro.getStore();
+      if (ctxCq) { ctxCq.chave = 'botao:pedido'; ctxCq.chat = cq.message && cq.message.chat && cq.message.chat.id; }
       if (processedIds.has(body.update_id)) return;
       processedIds.add(body.update_id);
       if (String(cq.data || '').startsWith('rp:')) await handleCallbackReposicao(cq);
@@ -5740,6 +5805,14 @@ app.post('/webhook', async (req, res) => {
 
     const chatKey = String(chatId);
     const fromId = msg.from && msg.from.id;
+    const ctxErro = contextoErro.getStore();
+    if (ctxErro) { ctxErro.chat = chatKey; ctxErro.chave = chaveDaMensagem(text, cmd, { arquivo: !!arquivoComprovante(msg) }); }
+
+    // /comandos (e /ajuda): em qualquer grupo do bot, a lista do que vale ali.
+    if (cmd === '/comandos' || cmd === '/ajuda' || cmd === '/start') {
+      if (body.message) await handleComandos(chatId, text, msg);
+      return;
+    }
 
     // BOOTSTRAP: estes dois valem em QUALQUER chat, porque são o que permite
     // configurar um grupo que o bot ainda não atende. Seguros por serem só do
@@ -5804,6 +5877,7 @@ app.post('/webhook', async (req, res) => {
       .filter(Boolean).map(String);
     const isEstoque2 = !isPrivadoLucas && await ehGrupoEstoque2(msg.chat, conhecidos);
     if (!isVendas && !isReposicao && !isPrivadoLucas && !isPedidos && !isFaturamento && !isTraducao && !isEstoque2) return;
+    if (ctxErro) ctxErro.chave = chaveDaMensagem(text, cmd, { arquivo: !!arquivoComprovante(msg), reposicao: isReposicao, traducao: isTraducao, estoque2: isEstoque2 });
 
     // Grupo do Estoque 2: só mexe no Estoque 2 (nunca na loja, nunca venda).
     if (isEstoque2) {
@@ -6135,7 +6209,7 @@ app.post('/webhook', async (req, res) => {
       console.error('falha ao avisar o chat sobre o erro:', err2.message);
     }
   }
-});
+}
 
 app.get('/', (req, res) => res.send('015 Pods Bot online!'));
 app.get('/ping', (req, res) => res.status(200).send('OK'));
@@ -6168,7 +6242,7 @@ if (require.main === module) {
   // Depois de subir: garante que o webhook recebe os botões (callback_query) e
   // a entrada do bot em grupo (my_chat_member), e guarda o nome dos grupos.
   // Reserva da lista colada no sistema (o normal é o POST /fornecedor-fila).
-  cron.schedule('* * * * *', () => { processarFilaFornecedor(); enviarFilaMensagens(); }, { timezone: 'America/Sao_Paulo' });
+  cron.schedule('* * * * *', () => { comChave('fila:fornecedor', () => processarFilaFornecedor()); enviarFilaMensagens(); }, { timezone: 'America/Sao_Paulo' });
   setTimeout(() => {
     garantirUpdatesWebhook().catch(err => console.error('webhook updates:', err.message));
     registrarChatsConhecidos().catch(err => console.error('chats conhecidos:', err.message));

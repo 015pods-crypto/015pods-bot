@@ -3734,6 +3734,52 @@ teste('nomes do grupo do Estoque 2: maiúscula, acento e emoji não atrapalham',
 });
 
 
+
+teste('/comandos no grupo de vendas: só o que vale ali, com status (⛔ cobrança, ⚠️ com erro)', async (ctx) => {
+  respostas.bot_comandos_status = { status: 200, body: { socio: false, desligados: ['cobranca'], erros: [{ chave: '/troca', n: 2 }] } };
+  const msgs = await mandarTudo(ctx.webhook, update('/comandos', { from: FUNCIONARIO }));
+  const t = msgs.map(m => m.text).join('\n');
+  assert.ok(t.includes('Grupo de VENDAS'), t);
+  assert.ok(t.includes('⛔ *Cobrança*'), t);
+  assert.ok(t.includes('⚠️ */troca*'), t);
+  assert.ok(t.includes('✅ *Baixa*'), t);
+  assert.ok(!t.includes('Estoque 2'), t);
+});
+
+teste('/ajuda mostra o mesmo que /comandos; no Estoque 2, a lista do Estoque 2', async (ctx) => {
+  configComE2();
+  respostas.bot_comandos_status = { status: 200, body: { socio: false, desligados: [], erros: [{ chave: 'e2:/levar', n: 1 }] } };
+  const msgs = await mandarTudo(ctx.webhook, updateE2('/ajuda'));
+  const t = msgs.map(m => m.text).join('\n');
+  assert.ok(t.includes('ESTOQUE SECUNDÁRIO'), t);
+  assert.ok(t.includes('⚠️ */levar*'), t);
+  assert.ok(t.includes('✅ */contagem*'), t);
+  assert.ok(!t.includes('Grupo de VENDAS'), t);
+});
+
+teste('/comandos tudo: sócio vê todos os grupos e os erros da semana; funcionário não', async (ctx) => {
+  respostas.bot_comandos_status = { status: 200, body: { socio: true, desligados: ['cobranca'], erros: [{ chave: '/caixa', n: 3 }, { chave: 'baixa', n: 1 }] } };
+  const msgs = await mandarTudo(ctx.webhook, update('/comandos tudo'));
+  const t = msgs.map(m => m.text).join('\n');
+  for (const g of ['VENDAS', 'ENTRADAS', 'ESTOQUE SECUNDÁRIO', 'PEDIDOS', 'FATURAMENTO']) assert.ok(t.includes(g), g);
+  assert.ok(t.includes('⚠️ /caixa — 3x'), t);
+  assert.ok(t.includes('⚠️ Baixa (-) — 1x'), t);
+  respostas.bot_comandos_status = { status: 200, body: { socio: false, desligados: [], erros: [] } };
+  const m2 = await mandarTudo(ctx.webhook, update('/comandos tudo', { from: FUNCIONARIO }));
+  const t2 = m2.map(m => m.text).join('\n');
+  assert.ok(t2.includes('só para os sócios'), t2);
+  assert.ok(!t2.includes('Grupo de PEDIDOS'), t2);
+});
+
+teste('erro dentro de um comando é gravado em bot_erros com a chave do comando', async (ctx) => {
+  respostas.bot_ler_estoque = { status: 500, body: { message: 'caiu' } };
+  await mandarTudo(ctx.webhook, update('/zerados'));
+  await new Promise(r => setTimeout(r, 50));
+  const reg = chamadas.filter(c => c.fn === 'bot_erro_registrar');
+  assert.ok(reg.length >= 1, JSON.stringify(chamadas.map(c => c.fn)));
+  assert.strictEqual(reg[0].body.p_chave, '/zerados');
+});
+
 teste('parseContagem: títulos, dual flavor com +, ESGOTADO e ESTOQUE TOTAL ignorado', async (ctx) => {
   const r = ctx.mod.parseContagem('/contagem\nIgnite 40K:\n1 Blueberry\n2 Cherry Watermelon\n\nBlack Sheep 40K:\n1 Grape + Menthol\n\nElfbar BC Create 40K:\nESGOTADO\n\nESTOQUE TOTAL: 4 unidades\n9 Lixo');
   assert.deepStrictEqual(r.itens.map(i => [i.modelo, i.sabor, i.qtd]), [
