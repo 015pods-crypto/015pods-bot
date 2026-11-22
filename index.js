@@ -4721,6 +4721,9 @@ async function handleConsignado(chatId, text) {
 //   /troca outro: cliente não gostou do sabor
 //   1 Ignite V50 Grape
 //
+//   /troca ENTREGA ERRADA MOTOBOY      (motivo livre: vira "outro" com o texto)
+//   -1 Elfbar 10000 Touch Miami Mint
+//
 // Sem motivo, o bot pergunta: responder a mensagem dele com "defeito" ou
 // "outro ..." grava o motivo. O jeito antigo continua: /consignado com a
 // palavra "troca" vira troca (vai para a mesma RPC, origem 'consignado').
@@ -4757,7 +4760,16 @@ function parseTroca(texto) {
   const p = limpar(primeira);
   const mPessoa = p.match(RE_CONSIGNADO_PESSOA);
   if (mPessoa) detalhe = [detalhe, `para ${mPessoa[1].trim()}`].filter(Boolean).join(' · ');
-  else if (p) candidatas.push(p);
+  else if (p) {
+    // Primeira linha sem quantidade na frente é o MOTIVO, com quantas palavras
+    // for ("/troca ENTREGA ERRADA MOTOBOY"), e não um produto.
+    const mi = p.match(RE_CONSIGNADO_ITEM);
+    if (mi && parseInt(mi[1], 10) > 0) candidatas.push(p);
+    else {
+      detalhe = [detalhe, p].filter(Boolean).join(' · ');
+      if (!motivo) motivo = 'outro';
+    }
+  }
   for (const l of resto) { const t = limpar(l); if (t) candidatas.push(t); }
 
   const itens = [];

@@ -4955,6 +4955,12 @@ teste('parseTroca: motivo na primeira linha, no item, "outro" com detalhe e jeit
   assert.strictEqual(antigo.motivo, null);
   assert.deepStrictEqual(antigo.itens, [{ produto: 'Ignite V50 Grape', qty: 1 }]);
   assert.deepStrictEqual(p('/consignado 1 Ignite V50 Grape troca').itens, [{ produto: 'Ignite V50 Grape', qty: 1 }]);
+  // motivo livre com várias palavras na primeira linha
+  assert.deepStrictEqual(p('/troca ENTREGA ERRADA MOTOBOY\n-1 elfbar 10000 touch miami mint'),
+    { motivo: 'outro', detalhe: 'ENTREGA ERRADA MOTOBOY', itens: [{ produto: 'elfbar 10000 touch miami mint', qty: 1 }], invalidas: [] });
+  const d = p('/troca defeito tela apagada\n1 Ignite V50 Grape');
+  assert.strictEqual(d.motivo, 'defeito');
+  assert.strictEqual(d.detalhe, 'tela apagada');
 });
 
 teste('/troca defeito: chama bot_troca com o motivo e não faz baixa de venda', async (ctx) => {
