@@ -4941,6 +4941,13 @@ function trocaOk(model, flavor, qty, before, id) {
     model, flavor, stock_before: before, stock_after: before - qty, troca_id: id };
 }
 
+teste('fora de linha: modelo desativado avisa e não lança', async (ctx) => {
+  const m = ctx.mod.mapResultado({ input: 'oxbar 10000 x', status: 'nao_encontrado', fora_de_linha: 'Oxbar 10000' }, 'baixa');
+  assert.strictEqual(m.ok, false);
+  assert.ok(/modelo fora de linha \(Oxbar 10000\)/.test(m.msg));
+  assert.strictEqual(ctx.mod.mapResultado({ input: 'abc', status: 'nao_encontrado' }, 'baixa').msg, 'Produto não encontrado: "abc"');
+});
+
 teste('parseTroca: motivo na primeira linha, no item, "outro" com detalhe e jeito antigo', async (ctx) => {
   const p = ctx.mod.parseTroca;
   assert.deepStrictEqual(p('/troca defeito\n1 Ignite V50 Grape'),

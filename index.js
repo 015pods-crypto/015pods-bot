@@ -419,6 +419,12 @@ function buildResumoMulti(results) {
 // builders de resposta (buildResumoSingle/Multi) consomem. `opFallback` é a
 // operação que o usuário digitou (baixa/entrada), usada quando o resultado de
 // erro não traz a direção.
+// Modelo desativado no sistema (fora de linha): o banco devolve nao_encontrado
+// com fora_de_linha = nome do modelo. Nada é lançado.
+function msgForaDeLinha(input, modelo) {
+  return `"${input}": modelo fora de linha (${modelo}). Nada foi lançado.`;
+}
+
 function mapResultado(r, opFallback) {
   const status = r && r.status;
   const input = (r && r.input) || '(item)';
@@ -436,6 +442,7 @@ function mapResultado(r, opFallback) {
     };
   }
   if (status === 'nao_encontrado') {
+    if (r.fora_de_linha) return { ok: false, op: opFallback, msg: msgForaDeLinha(input, r.fora_de_linha) };
     return { ok: false, op: opFallback, msg: `Produto não encontrado: "${input}"` };
   }
   if (status === 'ambiguo') {
@@ -5196,7 +5203,10 @@ const AJUDA_ESTOQUE2 = [
 
 function msgFalhaProduto(r) {
   const input = r.input || '(item)';
-  if (r.status === 'nao_encontrado') return `Produto não encontrado: "${input}"`;
+  if (r.status === 'nao_encontrado') {
+    if (r.fora_de_linha) return msgForaDeLinha(input, r.fora_de_linha);
+    return `Produto não encontrado: "${input}"`;
+  }
   if (r.status === 'ambiguo') {
     const ops = (r.matches || []).slice(0, 8).map(m => `• ${m.model} – ${m.flavor}`).join('\n');
     return `"${input}" bate com mais de um produto. Seja mais específico:\n${ops}`;
