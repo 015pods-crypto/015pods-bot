@@ -9,11 +9,20 @@ const { montarComandos, chaveDaMensagem } = require('./comandos');
 const contextoErro = new AsyncLocalStorage();
 const consoleErrorOriginal = console.error.bind(console);
 let errosGravando = 0;
+// O endereço da API do Telegram leva o token ("/bot123:ABC/sendMessage"), e o
+// node-fetch põe esse endereço na mensagem de erro. Tudo que vira texto de
+// erro (log, bot_erros, chat) passa por aqui antes.
+function semToken(texto) {
+  let t = String(texto ?? '');
+  const tk = process.env.TELEGRAM_TOKEN;
+  if (tk) t = t.split(tk).join('<token>');
+  return t.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot<token>');
+}
 console.error = (...args) => {
-  consoleErrorOriginal(...args);
+  consoleErrorOriginal(...args.map(a => (a instanceof Error ? semToken(a.stack || a.message) : typeof a === 'string' ? semToken(a) : a)));
   const ctx = contextoErro.getStore();
   if (!ctx || !ctx.chave || ctx.registrado || errosGravando > 20) return;
-  const texto = args.map(a => (a instanceof Error ? a.message : typeof a === 'string' ? a : (() => { try { return JSON.stringify(a); } catch (e) { return String(a); } })())).join(' ');
+  const texto = semToken(args.map(a => (a instanceof Error ? a.message : typeof a === 'string' ? a : (() => { try { return JSON.stringify(a); } catch (e) { return String(a); } })())).join(' '));
   // Markdown recusado é refeito em texto puro: não é falha do comando.
   if (/^sendTelegram markdown falhou/.test(texto)) return;
   ctx.registrado = true;
@@ -105,8 +114,12 @@ function splitMessage(text, max = 3800) {
   if (text.length <= max) return [text];
   const parts = [];
   let buf = '';
-  for (const line of text.split('\n')) {
-    if ((buf + '\n' + line).length > max) {
+  const linhas = [];
+  for (const l of text.split('\n')) {
+    for (let i = 0; i < l.length || i === 0; i += max) linhas.push(l.slice(i, i + max));
+  }
+  for (const line of linhas) {
+    if (buf && (buf + '\n' + line).length > max) {
       parts.push(buf);
       buf = line;
     } else {
@@ -121,25 +134,40 @@ function escapeMd(s) {
   return (s || '').toString().replace(/([_*`\[\]])/g, '\\$1');
 }
 
-async function sendTelegram(chatId, text) {
+// Falha de CONEXÃO (sem resposta nenhuma do Telegram: "request to ... failed,
+// reason: ") é passageira: tenta de novo 3 vezes, com 1 s e 3 s de espera.
+// O erro que sobra não leva o endereço (que tem o token).
+const ESPERAS_TELEGRAM_MS = [1000, 3000];
+async function postTelegram(metodo, corpo) {
   const fetch = (await import('node-fetch')).default;
+  for (let tentativa = 0; ; tentativa++) {
+    try {
+      return await fetch(`${TELEGRAM_API}/${metodo}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(corpo),
+      });
+    } catch (err) {
+      if (tentativa >= ESPERAS_TELEGRAM_MS.length) {
+        const e = new Error(`Telegram ${metodo} sem conexão após ${tentativa + 1} tentativas: ${semToken(err.code || err.message)}`);
+        e.semConexaoTelegram = true;
+        throw e;
+      }
+      await new Promise(r => setTimeout(r, ESPERAS_TELEGRAM_MS[tentativa]));
+    }
+  }
+}
+
+async function sendTelegram(chatId, text) {
   for (const chunk of splitMessage(text)) {
-    const resp = await fetch(`${TELEGRAM_API}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: chunk, parse_mode: 'Markdown' }),
-    });
+    const resp = await postTelegram('sendMessage', { chat_id: chatId, text: chunk, parse_mode: 'Markdown' });
     if (!resp.ok) {
       // Markdown malformado derruba o envio: reenvia como texto puro. Os dois
       // erros agora VÃO PRO LOG — antes sumiam em silêncio, e o bot mudo não
       // deixava rastro nenhum pra investigar.
       const motivo = await resp.text().catch(() => '');
       console.error(`sendTelegram markdown falhou (${resp.status}): ${motivo.slice(0, 200)}`);
-      const retry = await fetch(`${TELEGRAM_API}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text: chunk }),
-      });
+      const retry = await postTelegram('sendMessage', { chat_id: chatId, text: chunk });
       if (!retry.ok) {
         const motivo2 = await retry.text().catch(() => '');
         console.error(`sendTelegram texto puro falhou (${retry.status}): ${motivo2.slice(0, 200)}`);
@@ -574,7 +602,18 @@ async function handleMovimentos(chatId, lines, messageId, forcarAtacado, msgComp
 
   if (avisoComp) linhasMsg.push('', avisoComp);
 
-  await sendTelegram(chatId, linhasMsg.join('\n'));
+  try {
+    await sendTelegram(chatId, linhasMsg.join('\n'));
+  } catch (err) {
+    // O estoque JÁ foi lançado: a resposta é que não saiu. O detalhe vai só
+    // pro bot_erros; no chat, um aviso simples (sem endereço, sem token). E o
+    // resto (chegada do fornecedor, comprovante) continua.
+    console.error('resposta da movimentação não enviada:', err.message);
+    const okEnt = results.some(r => r.ok && r.op === 'entrada');
+    const okBai = results.some(r => r.ok && r.op === 'baixa');
+    const oque = okEnt && okBai ? 'Movimentação registrada' : okEnt ? 'Entrada registrada' : okBai ? 'Baixa registrada' : 'Recebi a mensagem';
+    try { await sendTelegram(chatId, `⚠️ ${oque}, mas não consegui responder aqui. Confira no sistema.`); } catch (_) { /* segue mudo; já está no bot_erros */ }
+  }
 
   // Entrada de mercadoria: marca o que chegou dos pedidos feitos ao fornecedor.
   const entradasOk = results.filter(r => r.ok && r.op === 'entrada' && r.flavorId);
@@ -4082,7 +4121,7 @@ async function telegramApi(metodo, corpo) {
     if (!resp.ok) data.ok = false;
     return data;
   } catch (err) {
-    return { ok: false, description: err.message };
+    return { ok: false, description: semToken(err.message) };
   }
 }
 
@@ -6224,7 +6263,11 @@ async function processarWebhook(req) {
     console.error(err);
     try {
       const chatId = (req.body.message || req.body.edited_message || {}).chat?.id;
-      if (chatId) await sendTelegram(chatId, `❌ Erro: ${err.message}`);
+      if (chatId) {
+        await sendTelegram(chatId, err && err.semConexaoTelegram
+          ? '⚠️ Não consegui responder aqui. Confira no sistema.'
+          : `❌ Erro: ${semToken(err && err.message)}`);
+      }
     } catch (err2) {
       // Aqui o bot fica mudo de verdade (nem o aviso de erro saiu): logar é a
       // única pista que sobra.
@@ -6272,6 +6315,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  semToken,
+  splitMessage,
+  // Teste: esperas curtas entre as tentativas de envio.
+  _esperasTelegramTeste: (ms) => ESPERAS_TELEGRAM_MS.splice(0, ESPERAS_TELEGRAM_MS.length, ...ms),
   parseContagem,
   handleContagem,
   parseLevar,

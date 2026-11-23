@@ -47,6 +47,7 @@ function servidorFalso(handler) {
   });
 }
 
+let derrubarTelegram = 0;
 async function subirFalsos() {
   const telegram = await servidorFalso((req, raw, res) => {
     const url = req.url || '';
@@ -63,8 +64,11 @@ async function subirFalsos() {
     }
     let corpo;
     try { corpo = JSON.parse(raw); } catch (_) { corpo = { text: raw }; }
-    enviadas.push(corpo);
     const metodo = url.split('/').pop();
+    // Queda de conexão: fecha sem responder (o node-fetch dá "request to ...
+    // failed, reason: "). `derrubarTelegram` = quantos envios derrubar.
+    if (derrubarTelegram > 0) { derrubarTelegram--; req.socket.destroy(); return; }
+    enviadas.push(corpo);
     chamadasTelegram.push({ metodo, body: corpo });
     // Resposta por método (ex.: editMessageText falhando); padrão = ok com um
     // message_id novo, que é o que a lista fixada precisa pra se lembrar.
@@ -5283,6 +5287,44 @@ teste('ritmo: resumo das 3h usa o dia que fechou; o fechamento não muda', async
   assert.ok(fechamento.includes('FECHAMENTO') && !fechamento.includes('Ritmo'), fechamento);
 });
 
+const ENTRADA_OK = (sabor, q, total) => ({ status: 'ok', direction: 'entrada', model: 'Ignite 15500 (V155)', flavor: sabor, qty: q, stock_after: total, flavor_id: 'f-' + sabor, input: 'v155 ' + sabor });
+
+teste('resposta: queda de conexão passageira → tenta de novo e a resposta sai', async (ctx) => {
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [ENTRADA_OK('Menthol', 3, 3), ENTRADA_OK('Grape Ice', 1, 1)] } };
+  derrubarTelegram = 2;
+  const [resp] = await mandar(ctx.webhook, updateDe('+3 v155 menthol\n+1 v155 grape ice', GABRIEL, { chat: GRUPO_REPOSICAO }));
+  assert.ok(resp.text.includes('✅ *Entradas registradas:*') && resp.text.includes('Grape Ice: +1'), resp.text);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1);
+});
+
+teste('resposta: Telegram fora → aviso simples, sem token, detalhe só no bot_erros, sem lançar de novo', async (ctx) => {
+  respostas.bot_movimentar_estoque = { status: 200, body: { resultados: [ENTRADA_OK('Menthol', 3, 3)] } };
+  derrubarTelegram = 3; // as 3 tentativas da resposta caem; o aviso simples passa
+  const [resp] = await mandar(ctx.webhook, updateDe('+3 v155 menthol\n+1 v155 grape ice', GABRIEL, { chat: GRUPO_REPOSICAO }));
+  assert.strictEqual(resp.text, '⚠️ Entrada registrada, mas não consegui responder aqui. Confira no sistema.');
+  await new Promise(r => setTimeout(r, 50));
+  const reg = chamadas.filter(c => c.fn === 'bot_erro_registrar');
+  assert.strictEqual(reg.length, 1, JSON.stringify(reg));
+  assert.ok(reg[0].body.p_erro.includes('sem conexão') && !reg[0].body.p_erro.includes('token-de-teste') && !reg[0].body.p_erro.includes('/bot'), reg[0].body.p_erro);
+  assert.strictEqual(chamadas.filter(c => c.fn === 'bot_movimentar_estoque').length, 1);
+  assert.ok(enviadas.every(m => !String(m.text).includes('token-de-teste') && !String(m.text).includes('api.telegram')), JSON.stringify(enviadas));
+});
+
+teste('erro de outro comando também não mostra o token no chat', async (ctx) => {
+  respostas.bot_ler_estoque = { status: 500, body: { message: 'falhou em https://api.telegram.org/bot123456:ABCdef_ghi/sendMessage e token-de-teste' } };
+  const msgs = await mandarTudo(ctx.webhook, update('/zerados'));
+  const t = msgs.map(m => m.text).join('\n');
+  assert.ok(!t.includes('ABCdef_ghi') && !t.includes('token-de-teste'), t);
+});
+
+teste('semToken e splitMessage: tira o token; corta resposta grande em partes < 4096', async (ctx) => {
+  assert.strictEqual(ctx.mod.semToken('request to https://api.telegram.org/bot123:AbC-d_9/sendMessage failed, reason: '), 'request to https://api.telegram.org/bot<token>/sendMessage failed, reason: ');
+  const grande = Array.from({ length: 300 }, (_, i) => `📦 Elfbar 40000 Create – Sabor número ${i}: +2 (total: 2)`).join('\n') + '\n' + 'x'.repeat(9000);
+  const partes = ctx.mod.splitMessage(grande);
+  assert.ok(partes.length >= 5 && partes.every(p => p.length <= 3800), partes.map(p => p.length).join(','));
+  assert.strictEqual(partes.join('\n').replace(/\n/g, ''), grande.replace(/\n/g, ''));
+});
+
 async function main() {
   const falsos = await subirFalsos();
 
@@ -5302,6 +5344,7 @@ async function main() {
   process.env.REPOSICAO_CHAT_ID = String(GRUPO_REPOSICAO);
 
   const mod = require('./index.js');
+  mod._esperasTelegramTeste([5, 5]);
   const { app } = mod;
   const server = await new Promise(resolve => {
     const s = app.listen(0, '127.0.0.1', () => resolve(s));
@@ -5320,6 +5363,7 @@ async function main() {
     respostaClaude = null;
     respostas = {};
     respostasTelegram = {};
+    derrubarTelegram = 0;
     respostaGemini = null;
     mod._resetEstadoTeste(); // config, fornecedor pendente e marcação de atacado
     try {
